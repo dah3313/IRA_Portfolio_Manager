@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://irapm/state.schema.json",
+  "title": "IRAPM Operating State File",
+  "description": "JSON Schema for the persistent operating state file (§6.7). This is the current-state snapshot needed to resume operation. Append-only logs (CB transitions, annual reviews, cycles, alerts, coordination, token checks) are SEPARATE files with their own schemas — not part of this document. Per §9.4.1, the file is written atomically at end of cycle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "last_cycle_id",
+    "last_cycle_at",
+    "phase",
+    "income_state",
+    "cb_machine",
+    "guards",
+    "lookback_signal",
+    "buffer_state",
+    "operational_pause",
+    "withdrawal_capacity_exhausted",
+    "coordination"
+  ],
+  "properties": {
+
+    "schema_version": {
+      "description": "Schema version of this state file. Loader checks this on read; mismatch triggers controlled migration or refusal to start.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "examples": ["1.0"]
+    },
+
+    "last_cycle_id": {
+      "description": "UUID of the most recent cycle that wrote this file. Pairs with cycle log entries for forensic lookup.",
+      "type": "string",
+      "format": "uuid"
+    },
+
+    "last_cycle_at": {
+      "description": "Wall-clock timestamp when the cycle that wrote this file completed. UTC, ISO 8601 with timezone.",
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "phase": {
+      "description": "Current phase. PHASE_3 is a permanent latch — once set, never changes.",
+      "type": "string",
+      "enum": ["PHASE_1", "PHASE_2", "PHASE_3"]
+    },
+
+    "phase3_grace_window_start": {
+      "description": "Timestamp when Phase 3 grace window started (all four Phase 3 tokens observed removed on both boxes). Null when not in grace window. Cleared when grace expires (latch) or abort commits.",
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "format": "date-time"}
+      ]
+    },
+
+    "phase3_grace_pending_abort": {
+      "description": "Set when a token re-insertion is observed during the grace window but persistence has not yet been confirmed across one full daily-token cycle (§10.6.2 Pattern A). On the next daily-token cycle, the system checks if re-insertion persists — if yes, abort commits and grace window clears; if no (transient glitch), this flag clears and grace continues. Null when not in candidate-abort state.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["observed_at", "tokens_observed"],
+          "additionalProperties": false,
+          "properties": {
+            "observed_at": {
+              "description": "Timestamp of the first re-insertion observation that started the candidate abort.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "tokens_observed": {
+              "description": "Counts observed on each box at the candidate-abort observation.",
+              "type": "object",
+              "required": ["box_a_count", "box_b_count"],
+              "additionalProperties": false,
+              "properties": {
+                "box_a_count": {"type": "integer", "minimum": 0, "maximum": 2},
+                "box_b_count": {"type": "integer", "minimum": 0, "maximum": 2}
+              }
+            }
+          }
+        }
+      ]
+    },
+
+    "income_state": {
+      "description": "Orthogonal to phase. Controls whether scheduled withdrawals execute. Phase 2 ignores this flag (no scheduled withdrawals exist), but state changes are still logged.",
+      "type": "string",
+      "enum": ["ACTIVE", "PAUSED"]
+    },
+
+    "income_state_changed_at": {
+      "description": "Timestamp of the most recent income_state transition. Used by stopincome_stuck_alert logic to compute paused-duration.",
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "cb_machine": {
+      "description": "Circuit breaker state and associated timing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "cb1_active_timer_started_at"],
+      "properties": {
+        "state": {
+          "description": "Current CB state. CB1-extended is derived (CB1 + cb1_active_timer >= cb1_extended_trigger_days) and is NOT persisted here — code computes it each cycle from state + timer.",
+          "type": "string",
+          "enum": ["CB_INACTIVE", "CB1", "CB2"]
+        },
+        "cb1_active_timer_started_at": {
+          "description": "Timestamp when current CB1 episode began. Null when state is CB_INACTIVE or CB2 (timer not running). When set, code derives cb1_active_days = now - this timestamp; cb1_extended status is cb1_active_days >= cb1_extended_trigger_days.",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "format": "date-time"}
+          ]
+        },
+        "pending_transitions": {
+          "description": "Per-direction confirmation counters for in-progress CB transitions. Each entry tracks how many consecutive weekly cycles the trigger condition has held. A counter reaching confirmation_window_weeks (default 2) commits the transition.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["from_state", "to_state", "cycles_confirmed", "first_observed_at"],
+            "additionalProperties": false,
+            "properties": {
+              "from_state": {"type": "string", "enum": ["CB_INACTIVE", "CB1", "CB2"]},
+              "to_state": {"type": "string", "enum": ["CB_INACTIVE", "CB1", "CB2"]},
+              "cycles_confirmed": {"type": "integer", "minimum": 0},
+              "first_observed_at": {"type": "string", "format": "date-time"}
+            }
+          }
+        }
+      }
+    },
+
+    "guards": {
+      "description": "Independent guard states. Each guard tracks its on/off status and last-activation timestamp for alert cadence management.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fi_depleted", "portfolio_depleted"],
+      "properties": {
+        "fi_depleted": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["active"],
+          "properties": {
+            "active": {"type": "boolean"},
+            "activated_at": {
+              "description": "Timestamp of most recent activation. Null if guard has never activated.",
+              "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+            },
+            "last_alert_at": {
+              "description": "Timestamp of last weekly re-alert while active. Used to enforce weekly cadence on persistent alerts.",
+              "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+            }
+          }
+        },
+        "portfolio_depleted": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["active"],
+          "properties": {
+            "active": {"type": "boolean"},
+            "activated_at": {
+              "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+            },
+            "last_alert_at": {
+              "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+            }
+          }
+        }
+      }
+    },
+
+    "lookback_signal": {
+      "description": "Most recent Synthetic Growth Lookback signal value. For reporting only — CB transitions key off the per-cycle freshly-computed value, not this stored value. This persistence is for the weekly summary alert and operator inspection.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "description": "AVAILABLE means value field holds the most recent successful computation; UNAVAILABLE means signal failed (stale data or coverage gate) on the most recent cycle.",
+          "type": "string",
+          "enum": ["AVAILABLE", "UNAVAILABLE"]
+        },
+        "value_pct": {
+          "description": "Signal value as percent (e.g., -10.5 for -10.5%). Decimal-as-string per §2.8 money discipline (though this is a percentage, not money, same rationale applies for float-precision avoidance).",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?$"}
+          ]
+        },
+        "computed_at": {
+          "description": "Timestamp of the cycle that computed value_pct. Null when no successful computation has ever happened.",
+          "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+        }
+      }
+    },
+
+    "schedule_state": {
+      "description": "Per-phase schedule_state per §3.13. Phase 1 instance exists from program start. Phase 3 instance is null until Phase 3 triggers. Each schedule_state contains the starting income, trigger year, CPI rate, and frozen_years list.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase1": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/scheduleStateInstance"}
+          ]
+        },
+        "phase3": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/scheduleStateInstance"}
+          ]
+        }
+      }
+    },
+
+    "buffer_state": {
+      "description": "Recomputed annual values for SGOV buffer and cash buffer. Set during phase transitions and annual reviews. Code reads from here each cycle rather than recomputing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sgov_target_dollars", "monthly_refill_rate_dollars", "cash_target_dollars", "recomputed_at"],
+      "properties": {
+        "sgov_target_dollars": {
+          "description": "Current SGOV buffer target in dollars (Decimal-as-string). Updated at phase transitions and annual reviews (Phase 1, Phase 3); frozen in Phase 2.",
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "monthly_refill_rate_dollars": {
+          "description": "Monthly SGOV refill rate = sgov_target / 12. Updated alongside sgov_target.",
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "cash_target_dollars": {
+          "description": "Current cash buffer target = current_monthly_withdrawal + cash_buffer_offset_dollars. In Phase 2, current_monthly_withdrawal is 0, so target = offset only.",
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "recomputed_at": {
+          "description": "Timestamp of most recent recompute (phase transition or annual review).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "refill_delay_started_at": {
+          "description": "Timestamp when the post-cascade-recovery refill delay timer started. Null when no delay is active. Set when any cascade-triggering condition clears (CB2 → CB1, CB1-extended → CB1, FI-depleted → off, Portfolio-depleted → off). Cleared when delay elapses or any cascade condition re-activates.",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "format": "date-time"}
+          ]
+        },
+        "last_refill_at": {
+          "description": "Timestamp of most recent buffer refill batch. Enforces monthly cadence (no more than one refill per calendar month).",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "format": "date-time"}
+          ]
+        }
+      }
+    },
+
+    "operational_pause": {
+      "description": "Per §11.3, the auto-resuming pause framework. When paused == true, cycles still run but abort after step 1 without entering decision/action layers. Auto-resumes after pause_auto_resume_hours.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["paused"],
+      "properties": {
+        "paused": {"type": "boolean"},
+        "pause_reason": {
+          "description": "Identifier for the pause cause. Enum matches the §11.3 catalog. Null when paused == false.",
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "string",
+              "enum": [
+                "partial_phase_transition",
+                "order_rejection",
+                "disk_full",
+                "internal_consistency_violation"
+              ]
+            }
+          ]
+        },
+        "pause_started_at": {
+          "description": "Timestamp when current pause began. Auto-resume fires at pause_started_at + pause_auto_resume_hours. Null when paused == false.",
+          "oneOf": [{"type": "null"}, {"type": "string", "format": "date-time"}]
+        },
+        "consecutive_pause_count": {
+          "description": "How many consecutive pauses have fired for the same pause_reason. Incremented when a new pause has the same reason as the immediately prior pause. Resets to 0 when a successful cycle runs OR when a pause has a different reason. At >= pause_consecutive_escalation_count (default 4), alert severity escalates.",
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    },
+
+    "withdrawal_capacity_exhausted": {
+      "description": "Permanent-halt flag for cascade-exhausted withdrawals (§11.2.7). When true, future withdrawal cycles are suppressed. All other system functions continue. Auto-clears only if portfolio recovers enough to fund a hypothetical withdrawal.",
+      "type": "boolean",
+      "default": false
+    },
+
+    "coordination": {
+      "description": "Master/slave coordination state (§9.4.2). The role field is per-box local-only and NOT serialized into the rsync'd state file — but the other fields are written by master and read by slave.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["master_box_id", "last_master_write_timestamp", "master_ipv4_last_octet"],
+      "properties": {
+        "master_box_id": {
+          "description": "Identifier of the box that is currently master. Slave reads this to determine whether it should promote when master goes stale.",
+          "type": "string"
+        },
+        "last_master_write_timestamp": {
+          "description": "Wall-clock timestamp of the master's most recent state-file write. Slave compares this to current time to compute staleness.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "master_ipv4_last_octet": {
+          "description": "Last octet of master's IPv4 address. Used in the split-brain tiebreak rule (§9.4.3): lower-octet wins.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "scheduleStateInstance": {
+      "description": "A schedule_state per §3.13 — represents the inflation-adjusted withdrawal schedule for a phase. The tuple (I_0, trigger_year, cpi, frozen_years) determines what the scheduled monthly withdrawal is for any given calendar year.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["i_0_dollars", "trigger_year", "cpi_rate", "frozen_years"],
+      "properties": {
+        "i_0_dollars": {
+          "description": "Starting monthly income in dollars (Decimal-as-string). For Phase 1 this is phase1_initial_monthly_dollars in 2027 USD. For Phase 3 this is the computed I_0 from §4.1.1 at trigger.",
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "trigger_year": {
+          "description": "Calendar year when this schedule_state was initialized. Phase 1: 2027 (program start). Phase 3: year of Phase 3 latch event.",
+          "type": "integer",
+          "minimum": 2020,
+          "maximum": 2100
+        },
+        "cpi_rate": {
+          "description": "Annual CPI rate compounded into the schedule (Decimal-as-string). Phase 1: phase1_inflation_rate (default 0.03). Phase 3: phase3_cpi_post (default 0.04).",
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?$"
+        },
+        "frozen_years": {
+          "description": "List of calendar years for which the annual CPI raise was frozen by the freeze evaluation (§7.6.1). Frozen years never apply their raise; they're permanently excluded from the n_raises_applied count in the schedule formula.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 2020,
+            "maximum": 2100
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

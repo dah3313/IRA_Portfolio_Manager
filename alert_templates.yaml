@@ -1,0 +1,1259 @@
+# =============================================================================
+# IRAPM Alert Templates
+# =============================================================================
+# Human-facing message text for every alert IRAPM dispatches. The system
+# code references alerts by `alert_id` (the top-level key); the actual
+# subject/body/SMS strings are loaded from this file at runtime.
+#
+# Editing:
+#   - The operator edits this file to refine wording, tone, or detail level
+#     in any alert. Changes do NOT affect system behavior — only message
+#     content. Editing this file is safe at any time.
+#   - Take care to preserve `{placeholders}` exactly — the code substitutes
+#     runtime values into them. Removing a placeholder leaves it as literal
+#     text in the dispatched message; adding an unknown placeholder causes
+#     the message to fall back to a generic format.
+#   - Multi-line bodies use YAML's `|` literal-block operator. Leading
+#     whitespace inside the block is preserved literally (after the
+#     indentation marker).
+#
+# Audience: the survivor is the read-of-last-resort. Per spec §1.4 / §14.4,
+# the survivor scenario expects someone who inherits a running system with
+# no programming background. Write subjects and bodies as if explaining to
+# someone seeing the system for the first time. Avoid jargon, abbreviations,
+# and assumed context.
+#
+# Placeholders commonly available across alerts:
+#   {timestamp}        ISO datetime, e.g. "2027-03-15 10:00 ET"
+#   {cycle_id}         Short cycle UUID (first 8 chars)
+#   {box_id}           CL260 box identifier (hostname or UUID)
+#   {phase}            Current phase: PHASE_1, PHASE_2, PHASE_3
+#   {cb_state}         Current CB state: CB_INACTIVE, CB1, CB2
+#   Per-alert placeholders documented at each entry.
+#
+# SMS length budget: aim ≤140 chars per `sms` template. Carriers split
+# longer messages into multiple segments; segments may arrive out of order
+# on some networks. One-segment messages arrive reliably.
+#
+# Channel discipline: **all alerts dispatch via BOTH email AND SMS**, no
+# exceptions. The operator may be in locations with cell coverage but no
+# WiFi or data plan (rural travel, cabins, cruise ships in port). SMS uses
+# the cellular voice/text network which has fundamentally wider coverage
+# than internet-based email delivery. For a system whose purpose is to
+# keep operating unattended during long absences, "operator reachable by
+# cell but not internet" is a real and common scenario.
+#
+# Implication: SMS templates must be self-sufficient. A survivor or
+# operator reading only the SMS should know what happened and what
+# (if anything) to do. The email body is rich-context backup with the
+# same information plus details. Both fields are mandatory for every
+# alert entry.
+#
+# This is a deliberate departure from spec §12.6's per-alert channel
+# routing — see DECISIONS.md entry D-AT-1.
+#
+# Section ordering matches §12.6's grouping.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Phase and transition alerts
+# -----------------------------------------------------------------------------
+
+large_rebalance:
+  # Fires on every phase transition plan generation.
+  # Placeholders: {timestamp}, {from_phase}, {to_phase}, {plan_summary},
+  #               {residual_exceptions} (formatted list or "none")
+  subject: "IRAPM: Large rebalance — {from_phase} → {to_phase}"
+  body: |
+    A large rebalance is executing as part of the {from_phase} → {to_phase}
+    transition at {timestamp}.
+
+    Plan summary:
+    {plan_summary}
+
+    Positions skipped because they were already at or below the residual
+    floor ($1,500 minimum):
+    {residual_exceptions}
+
+    No action required. The system handles phase transitions automatically.
+    This alert is informational so you can see what the system is doing.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: {from_phase}→{to_phase} rebalance running. See email for details."
+
+phase3_activation:
+  # Fires when Phase 3 latches (24h grace window expired with tokens still
+  # removed). This is the most significant single event in the system's
+  # lifetime — message should be unmissable.
+  # Placeholders: {timestamp}
+  subject: "IRAPM CRITICAL: Income Mode LATCHED at {timestamp}"
+  body: |
+    Income Mode has activated.
+
+    The four Income Mode Inhibit hardware tokens were removed and remained removed
+    through the 24-hour grace window. The system has now permanently
+    latched into Income Mode (survivor income mode).
+
+    What happens next:
+    - On the next weekly cycle (within the next 7 days, typically within
+      24-48 hours), the system will execute the Income Mode transition:
+      asset reallocation to Income Mode target weights, and calculation of
+      the survivor's starting monthly income (I_0) based on current
+      portfolio value.
+    - After the transition cycle completes, scheduled monthly withdrawals
+      to the operator's external bank account will continue at the new
+      Income Mode amount.
+    - You will receive a follow-up alert when the transition cycle
+      completes, confirming the new monthly income amount.
+
+    This latch is permanent. Re-inserting the Income Mode Inhibit tokens will NOT
+    return the system to its previous phase. Income Mode is the system's
+    final operating mode.
+
+    If this activation was triggered in error (tokens removed accidentally
+    during the 24-hour grace window without intervention), contact the
+    IRAPM operational runbook for recovery procedures.
+
+    Latched at: {timestamp}
+  sms: "IRAPM CRITICAL: Income Mode LATCHED at {timestamp}. Transition cycle within 7 days. See email."
+
+phase3_grace_started:
+  # Fires when daily-token cycle observes all four Phase 3 tokens removed
+  # on both boxes. Starts the 24h grace window.
+  # Per §10.6.2 (v1.4 rule): any token re-insertion on either box aborts
+  # the activation (with one-cycle persistence confirmation to defend
+  # against transient glitches). Lower barrier to abort than the earlier
+  # all-four-required rule, on the asymmetry-of-consequences principle.
+  # Placeholders: {timestamp}, {grace_expires_at}
+  subject: "IRAPM CRITICAL: Income Mode activation pending — re-insert any token before {grace_expires_at}"
+  body: |
+    The system has detected that all four Income Mode Inhibit hardware tokens have
+    been removed from both CL260 boxes.
+
+    A 24-hour grace window is now running. If no tokens are re-inserted
+    before {grace_expires_at}, the system will permanently latch into
+    Income Mode (Survivor Income Mode) and execute a major reallocation of
+    the portfolio. Income Mode latch is IRREVOCABLE.
+
+    If you did NOT intend to activate Income Mode:
+    - Re-insert ONE OR MORE Income Mode Inhibit tokens into either CL260 box before
+      {grace_expires_at}. Any nonzero count of inserted tokens, on
+      either box, will abort the activation.
+    - Spare tokens are stored in chargers adjacent to each box. Any
+      spare can substitute for a primary that has failed.
+    - The system requires the re-insertion to persist across one
+      daily-token cycle (roughly 24 hours of observation) before
+      committing the abort. This is a safeguard against momentary
+      USB-read glitches. In practice, once you've inserted a token,
+      leave it inserted until you receive the "Phase 3 activation
+      aborted" confirmation alert.
+
+    If you DID intend to activate Income Mode (the IRAPM administrator has passed and
+    Income Mode should latch), no action needed. The grace window will
+    expire and the system will latch automatically.
+
+    Grace window started: {timestamp}
+    Grace window expires: {grace_expires_at}
+  sms: "IRAPM URGENT: Income Mode pending. Re-insert 1+ tokens to abort. {grace_expires_at} then IRREVOCABLE."
+
+phase3_grace_pending_abort:
+  # Fires on first observation of token re-insertion during grace window,
+  # before persistence confirmation. The system waits for the next
+  # daily-token cycle to confirm; if re-insertion persists, abort
+  # commits and phase3_grace_aborted fires. If re-insertion was a
+  # transient glitch (tokens back to all-removed on next cycle), this
+  # alert is followed silently by continued grace-window operation.
+  # Per §10.6.2 Pattern A.
+  # Placeholders: {timestamp}, {grace_expires_at}, {tokens_observed}
+  subject: "IRAPM: Income Mode grace — token re-insertion observed, pending confirmation"
+  body: |
+    During the active Income Mode grace window, the system observed one or
+    more tokens re-inserted ({tokens_observed}) at {timestamp}.
+
+    This is a candidate abort signal. To defend against transient
+    USB-read glitches, the system requires the re-insertion to persist
+    across one full daily-token cycle before committing the abort.
+
+    Expected outcomes:
+    - If the tokens remain inserted through the next daily-token cycle
+      (within ~24 hours), the abort commits and you will receive a
+      "Phase 3 activation aborted" confirmation alert.
+    - If the tokens are absent on the next daily-token cycle (suggesting
+      the first observation was a transient glitch), the grace window
+      continues toward latch normally.
+
+    If you intend to abort: leave the inserted token(s) in place. Do
+    NOT remove them or attempt to re-seat them — just wait for the
+    confirmation alert.
+
+    Grace window still expires at: {grace_expires_at}
+  sms: "IRAPM: Income Mode Aborted — tokens re-inserted. Confirmation within ~24h. LEAVE TOKENS IN PLACE."
+
+phase3_grace_aborted:
+  # Fires when token re-insertion observed during grace window persists
+  # across one full daily-token cycle (per §10.6.2 v1.4 rule).
+  # Placeholders: {timestamp}, {grace_started_at}, {tokens_observed}
+  #   {tokens_observed}: human-readable summary like "2 tokens on Box A"
+  subject: "IRAPM: Income Mode Abort Confirmed — tokens re-inserted"
+  body: |
+    The Income Mode activation that began at {grace_started_at} has been
+    cancelled.
+
+    At {timestamp}, the system confirmed that one or more Income Mode
+    tokens have been re-inserted ({tokens_observed}). The re-insertion
+    persisted across a full daily-token cycle, ruling out a transient
+    hardware glitch, so the system has committed the abort.
+
+    No further action needed. The system has returned to normal
+    operation in its previous phase.
+
+    If the original token removal was unintentional (e.g., a cable
+    knocked loose), you may want to verify the physical token chaining
+    and connections to avoid a repeat.
+  sms: "IRAPM: Income Mode Aborted Confirm — tokens re-inserted at {timestamp}. System resumed previous phase."
+
+
+# -----------------------------------------------------------------------------
+# Circuit breaker and guard alerts
+# -----------------------------------------------------------------------------
+
+cb_transition:
+  # Fires on any CB state change: CB_INACTIVE↔CB1, CB1↔CB2.
+  # CB1 → CB2 has two trigger paths: signal-based (drawdown depth) or
+  # timer-based (CB1 has been active ≥ cb1_to_cb2_timer_days). The
+  # {trigger_reason} placeholder is one of:
+  #   - "signal_threshold" (signal hit cb2_threshold_rate × 2 cycles)
+  #   - "cb1_timer_expired" (CB1 has been active for 90 days)
+  #   - "signal_recovery" (recovery transitions)
+  # Placeholders: {timestamp}, {from_state}, {to_state}, {signal_value},
+  #               {confirmation_weeks}, {trigger_reason}, {consequence_summary}
+  subject: "IRAPM: Circuit Breaker {from_state} → {to_state}"
+  body: |
+    The system's Circuit Breaker state has changed.
+
+    Transition: {from_state} → {to_state}
+    Trigger: {trigger_reason}
+    Signal at transition: {signal_value}
+    At: {timestamp}
+
+    What this means in practice:
+    {consequence_summary}
+
+    No action required. The CB framework is automatic — it adjusts the
+    system's behavior based on market conditions to protect the
+    portfolio from forced selling at depressed prices. The transition
+    will reverse automatically when market conditions improve and the
+    recovery threshold is met (also with confirmation).
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: CB {from_state}→{to_state} ({trigger_reason}) at signal {signal_value}."
+
+fi_low_alert:
+  # Fires when FI bucket value falls below fi_low_alert_threshold_months
+  # of current monthly withdrawal. Replaces the prior fi_depleted guard,
+  # which has been demoted to a simple alert (no cascade routing).
+  # Re-fires weekly while condition persists; stops firing when FI
+  # recovers above threshold. The operational pause framework + position
+  # residual minimums handle actual sale-prevention at the depletion edge.
+  # Placeholders: {timestamp}, {fi_value_dollars}, {threshold_dollars},
+  #               {months_of_coverage}
+  subject: "IRAPM WARNING: FI bucket low — {months_of_coverage} months of withdrawals"
+  body: |
+    The Fixed-Income bucket has fallen below the early-warning threshold
+    at {timestamp}.
+
+    FI bucket value: ${fi_value_dollars}
+    Threshold: ${threshold_dollars}
+    Coverage: {months_of_coverage} months of current scheduled withdrawals
+
+    No immediate action required. This is an early-warning alert — the
+    system continues normal operation. If FI continues to deplete, the
+    position_residual_minimum_dollars floor (default $1,500/symbol) will
+    eventually prevent further FI sales, and the operational pause
+    framework will halt withdrawals if all sources are residual-locked.
+
+    The alert will stop firing automatically when FI recovers above
+    the threshold. No deactivation alert is sent.
+
+    This alert re-fires weekly while the condition persists.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: FI low. ${fi_value_dollars} = {months_of_coverage}mo coverage. See email."
+
+portfolio_low_alert:
+  # Fires when total core (Growth + FI, excluding buffer and cash) falls
+  # below max(portfolio_low_alert_floor_dollars,
+  #          portfolio_low_alert_floor_months × monthly_withdrawal).
+  # Replaces the prior portfolio_depleted guard. Same alert-cadence and
+  # auto-clearing semantics as fi_low_alert.
+  # Placeholders: {timestamp}, {core_value_dollars}, {threshold_dollars},
+  #               {months_of_coverage}
+  subject: "IRAPM WARNING: Portfolio low — {months_of_coverage} months of withdrawals"
+  body: |
+    The total core portfolio has fallen below the early-warning threshold
+    at {timestamp}.
+
+    Core portfolio value: ${core_value_dollars}
+    Threshold: ${threshold_dollars}
+    Coverage: {months_of_coverage} months of current scheduled withdrawals
+
+    No immediate action required. This is an early-warning alert — the
+    system continues normal operation. If the portfolio continues to
+    deplete, the position_residual_minimum_dollars floors will prevent
+    sales below residual, and the operational pause framework will halt
+    withdrawals if needed.
+
+    The alert will stop firing automatically when the portfolio recovers
+    above the threshold. No deactivation alert is sent.
+
+    This alert re-fires weekly while the condition persists.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Portfolio low. ${core_value_dollars} = {months_of_coverage}mo coverage. See email."
+
+
+# -----------------------------------------------------------------------------
+# Phase 2 rebalancing alerts
+# -----------------------------------------------------------------------------
+
+phase2_opportunistic_deploy:
+  # Fires when Phase 2 swing crosses into deployed state (signal ≤ -10%
+  # for 2 weeks).
+  # Placeholders: {timestamp}, {signal_value}, {gbil_sold_dollars},
+  #               {growth_bought_summary}
+  subject: "IRAPM: Dry Powder Deployed — deploying GBIL into Growth"
+  body: |
+    The Dry Powder Reallocation has triggered. The Synthetic Growth
+    Lookback signal is at {signal_value} (≤ -10% for 2 confirmed weekly
+    cycles), indicating Growth is depressed enough to deploy the GBIL
+    "dry powder" into Growth positions.
+
+    Execution at {timestamp}:
+    - Sold GBIL: ${gbil_sold_dollars}
+    - Bought Growth: {growth_bought_summary}
+
+    GBIL is held at residual minimum ($1,500 floor per I12). The system
+    is now in deployed state. It will return to steady state when the
+    signal recovers to +2% or higher (absolute), confirmed for 2 weeks.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Dry Powder deployed. GBIL→Growth ${gbil_sold_dollars}. See email."
+
+phase2_opportunistic_recover:
+  # Fires when Phase 2 swing crosses back to steady state (signal ≥ +2%
+  # for 2 weeks).
+  # Placeholders: {timestamp}, {signal_value}, {growth_sold_summary},
+  #               {gbil_bought_dollars}
+  subject: "IRAPM: Dry Powder Recovered — recovering to steady state"
+  body: |
+    The Dry Powder Reallocation has recovered. The Synthetic Growth
+    Lookback signal is at {signal_value} (≥ +2% for 2 confirmed weekly
+    cycles), indicating Growth has recovered sufficiently to scrape
+    profits back into the GBIL dry-powder bucket.
+
+    Execution at {timestamp}:
+    - Sold Growth: {growth_sold_summary}
+    - Bought GBIL: ${gbil_bought_dollars}
+
+    The system is now in steady state (90% Growth, 10% GBIL). The next
+    opportunistic deployment will fire if the signal drops back to -10%
+    for 2 weeks.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Dry Powder recovered. Growth→GBIL ${gbil_bought_dollars}. See email."
+
+phase2_semi_annual_reallocation:
+  # Fires on Phase 2 semi-annual reallocation dates (Jan 15, Jul 15 by
+  # default).
+  # Placeholders: {timestamp}, {trades_summary}
+  subject: "IRAPM: Maximum Growth Mode semi-annual reallocation"
+  body: |
+    The Maximum Growth Mode semi-annual reallocation has executed at {timestamp}.
+    This routine maintenance event scrapes accumulated dividend drift
+    back to target weights (FBCG/AVUV/GBIL 45/45/10 in steady state).
+
+    Trades executed:
+    {trades_summary}
+
+    No action required. Next semi-annual reallocation is six months
+    from today.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Maximum Growth Mode semi-annual reallocation at {timestamp}. Routine maintenance."
+
+
+# -----------------------------------------------------------------------------
+# Withdrawal alerts
+# -----------------------------------------------------------------------------
+
+withdrawal_executed:
+  # Fires on successful monthly withdrawal completion. The withdrawal is
+  # placed as a date-gated step within the weekly cycle (§6.5.1) rather
+  # than a separate monthly cycle.
+  # Placeholders: {timestamp}, {amount_dollars}, {source_breakdown},
+  #               {ach_settlement_date}
+  subject: "IRAPM: Monthly withdrawal executed — ${amount_dollars}"
+  body: |
+    The monthly withdrawal completed successfully at {timestamp}.
+
+    Amount: ${amount_dollars}
+    Source breakdown:
+    {source_breakdown}
+
+    Funds will arrive in your external bank account on approximately
+    {ach_settlement_date}, subject to broker and bank processing times.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Withdrawal ${amount_dollars} executed. ACH arrives ~{ach_settlement_date}."
+
+withdrawal_failed:
+  # Fires when withdrawal SELL or ACH fails. The withdrawal is a step
+  # within the weekly cycle (§6.5.1).
+  # Placeholders: {timestamp}, {amount_dollars}, {failure_reason},
+  #               {failed_at_stage}
+  subject: "IRAPM CRITICAL: Monthly withdrawal FAILED — ${amount_dollars}"
+  body: |
+    The monthly withdrawal FAILED at {timestamp}.
+
+    Intended amount: ${amount_dollars}
+    Failed at stage: {failed_at_stage}
+    Failure reason: {failure_reason}
+
+    The operational pause framework has been engaged. The
+    system will auto-retry on the next cycle after 48 hours. If the
+    underlying issue resolves in that window (broker transient, network
+    issue), the next cycle will execute the withdrawal cleanly. If the
+    issue persists across four consecutive auto-retries (~28 days of
+    failure), the alert severity will escalate.
+
+    You should NOT need to manually edit the state file. The system
+    handles its own resume logic.
+
+    If you can identify and resolve the underlying issue (e.g., contact
+    IBKR if the broker rejected the order), the next auto-resume cycle
+    will succeed naturally.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Monthly withdrawal FAILED at {failed_at_stage}. Auto-retry in 48h. See email."
+
+monthly_payment_ceiling_bound:
+  # PHASE 3 ONLY. Fires when the scheduled monthly withdrawal would exceed
+  # the 7.5% portfolio-value-based ceiling and is clamped down to the
+  # ceiling. Notice severity — informational, not a failure. The ceiling
+  # is a safety clamp against the portfolio being too small to sustain
+  # the scheduled withdrawal at any given moment.
+  # Placeholders: {timestamp}, {scheduled_amount_dollars},
+  #               {ceiling_amount_dollars}, {portfolio_value_dollars},
+  #               {amount_paid_dollars}
+  subject: "IRAPM Notice: Phase 3 withdrawal capped at ceiling — ${amount_paid_dollars}"
+  body: |
+    The Phase 3 monthly withdrawal was capped by the portfolio-value
+    ceiling at {timestamp}.
+
+    Scheduled withdrawal: ${scheduled_amount_dollars}
+    Ceiling (portfolio × 7.5% ÷ 12): ${ceiling_amount_dollars}
+    Current portfolio value: ${portfolio_value_dollars}
+    Amount paid: ${amount_paid_dollars} (= ceiling)
+
+    The ceiling clamp protects the corpus by limiting the monthly
+    payment to 7.5% annualized of current portfolio value. If the
+    portfolio has drawn down, or the scheduled raises have outpaced
+    portfolio growth, the ceiling can bind and reduce the payment.
+
+    No automatic state change. The ceiling binding does NOT trigger a
+    freeze (freezes are decided independently at annual review based on
+    prior-year CB activity). The schedule continues unchanged; the next
+    month's calculation runs the same clamp again.
+
+    If the ceiling binds repeatedly, the operator/survivor should
+    consider whether the scheduled withdrawal level remains appropriate.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Ph3 withdrawal capped. Paid ${amount_paid_dollars} (sched ${scheduled_amount_dollars}). See email."
+
+cascade_growth_source:
+  # Fires when cascade sourcing reaches Growth stage (§7.3.2 step 3).
+  # Distinct from withdrawal_capacity_exhausted — the withdrawal succeeded
+  # but at the deepest cascade level. Alarming signal that the portfolio
+  # is near absolute floor.
+  # Placeholders: {timestamp}, {amount_dollars}, {growth_sold_summary},
+  #               {sgov_at_residual}, {fi_at_residual}
+  subject: "IRAPM CRITICAL: Withdrawal cascade reached Growth — portfolio near floor"
+  body: |
+    The withdrawal cycle at {timestamp} required selling Growth positions
+    to meet demand. This is the deepest cascade level the system can
+    reach while still completing a withdrawal.
+
+    Withdrawal amount: ${amount_dollars}
+    SGOV buffer: at residual floor
+    FI bucket: at residual floor
+    Growth sold to make up demand:
+    {growth_sold_summary}
+
+    The withdrawal succeeded — funds will be delivered as scheduled.
+    However, the portfolio is now near its absolute floor. If withdrawals
+    continue to draw from Growth, the next cycle may trigger cascade
+    exhaustion (permanent halt of withdrawals — see §11.2.7).
+
+    Operator review recommended. Possible actions:
+    - Review the operator's separate runbook for portfolio-near-floor
+      scenarios
+    - Consider pausing withdrawals via STOP INCOME tokens if appropriate
+    - Consider depositing external funds if available
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Cascade reached Growth. Portfolio near floor. See email."
+
+withdrawal_capacity_exhausted:
+  # Fires when cascade exhaustion sets withdrawal_capacity_exhausted: true
+  # (§11.2.7). PERMANENT HALT for withdrawals. Re-fires every weekly cycle
+  # while the flag is set.
+  # Placeholders: {timestamp}, {portfolio_value}, {monthly_withdrawal},
+  #               {months_realert_count}
+  subject: "IRAPM CRITICAL: Withdrawal capacity EXHAUSTED — portfolio cannot fund demand"
+  body: |
+    The portfolio has reached cascade exhaustion at {timestamp}.
+
+    Portfolio value: ${portfolio_value}
+    Scheduled monthly withdrawal: ${monthly_withdrawal}
+    Alert count since exhaustion: {months_realert_count}
+
+    All three cascade stages (SGOV buffer, FI bucket, Growth bucket)
+    have reached residual floor. The portfolio cannot fund the
+    scheduled withdrawal demand. This is a PERMANENT HALT for
+    withdrawals.
+
+    The system has set the `withdrawal_capacity_exhausted` flag.
+    Future withdrawal attempts are suppressed (no point in trying).
+    All other system functions continue normally:
+    - Circuit breaker monitoring
+    - Signal computation
+    - Weekly summary alerts (you are reading one now)
+    - Any remaining position dividends accrue normally
+
+    External operator action is required. Possible paths:
+    - Deposit external funds to restore portfolio above thresholds
+      (the flag will auto-clear when capacity returns)
+    - Close the IRAPM account and transition to other income sources
+    - Reduce the scheduled withdrawal amount (operator must edit
+      ruleset.yaml — but note the system cannot change the IBKR-side
+      recurring ACH without a successful withdrawal cycle, so this
+      requires manual intervention via the IBKR Portal as well)
+
+    See spec §11.2.7 and §11.3 for the full mechanism. The runbook
+    (§14.4) contains the survivor-facing procedures.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: WITHDRAWAL CAPACITY EXHAUSTED. Portfolio cannot fund withdrawals. See email — external action required."
+
+
+# -----------------------------------------------------------------------------
+# Large cash deployment
+# -----------------------------------------------------------------------------
+
+large_cash_deployment:
+  # Fires when §7.7.1 large-deployment plan executes.
+  # Placeholders: {timestamp}, {cash_deployed_dollars}, {trigger_threshold},
+  #               {deployment_summary}
+  subject: "IRAPM: Large cash deployment — ${cash_deployed_dollars}"
+  body: |
+    A large cash deployment executed at {timestamp}.
+
+    Cash deployed: ${cash_deployed_dollars}
+    Trigger: surplus exceeded ${trigger_threshold} (the larger of the
+    fixed dollar threshold and 5% of portfolio value)
+
+    Deployment breakdown:
+    {deployment_summary}
+
+    This mechanic handles bulk inflows (planned annual Roth conversions,
+    large deposits) by allocating the cash across active core positions
+    in proportion to the current phase's target weights — i.e., each
+    position receives cash_deployed × target_weight[symbol]. No reading
+    of current position values; no proportional-to-deficit math.
+
+    Any resulting drift is handled by the next cycle's 5/25 rebalance
+    evaluation (Phase 1/3) or the next semi-annual reallocation (Phase 2).
+
+    No action required.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Large cash deployment ${cash_deployed_dollars}. See email for breakdown."
+
+
+# -----------------------------------------------------------------------------
+# Annual review alerts
+# -----------------------------------------------------------------------------
+
+annual_review_completed:
+  # Fires on Jan 15 annual review cycle completion (Phase 1, Phase 3).
+  # Phase 2 annual reviews are no-ops and do NOT emit this alert.
+  # Placeholders: {timestamp}, {phase}, {year}, {new_monthly_withdrawal},
+  #               {new_buffer_target}, {new_refill_rate},
+  #               {new_cash_target}, {freeze_decision_summary}
+  subject: "IRAPM: {year} annual review completed"
+  body: |
+    The annual review for calendar year {year} completed at {timestamp}
+    in {phase}.
+
+    {freeze_decision_summary}
+
+    Updated values for {year}:
+    - Monthly scheduled withdrawal: ${new_monthly_withdrawal}
+    - SGOV buffer target: ${new_buffer_target}
+    - Monthly refill rate: ${new_refill_rate}
+    - Cash buffer target: ${new_cash_target}
+
+    These values take effect immediately and apply to the rest of {year}.
+    The next annual review runs on Jan 15 of next year.
+
+    No action required.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: {year} annual review done. New monthly withdrawal ${new_monthly_withdrawal}. See email."
+
+freeze_decision:
+  # PHASE 3 ONLY. Fires when annual review's freeze evaluation runs in
+  # Phase 3. Phase 1 has no freeze mechanism (removed in simplification
+  # batch). Always emitted in Phase 3 — both freeze-fired and no-freeze
+  # cases. Distinct alert from annual_review_completed because the freeze
+  # decision is a substantive signal worth surfacing on its own.
+  # Placeholders: {timestamp}, {year}, {prior_year}, {cb_days},
+  #               {threshold_days}, {decision}, {decision_summary}
+  subject: "IRAPM: {prior_year} freeze decision — {decision}"
+  body: |
+    The annual review's freeze evaluation for prior calendar year
+    {prior_year} completed at {timestamp}.
+
+    Prior-year CB activity: {cb_days} days at CB1 or worse
+    Freeze threshold: {threshold_days} days
+    Decision: {decision}
+
+    {decision_summary}
+
+    The freeze decision is recorded permanently in the system's
+    schedule_state. If the year was frozen, its CPI raise will never
+    apply (the year does not "stack" with subsequent raises).
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: {prior_year} freeze decision: {decision}. {cb_days}/{threshold_days} CB days. See email."
+
+
+# -----------------------------------------------------------------------------
+# Token alerts
+# -----------------------------------------------------------------------------
+
+token_state_change:
+  # Fires on valid Phase 3 or STOP INCOME state transitions (all-removed
+  # ↔ all-inserted, confirmed across both boxes). Does NOT fire on
+  # partial/invalid states — those use token_invalid_state.
+  # Placeholders: {timestamp}, {token_type}, {from_state}, {to_state}
+  subject: "IRAPM: {token_type} tokens {from_state} → {to_state}"
+  body: |
+    A valid {token_type} token state change has been observed at
+    {timestamp}.
+
+    From: {from_state}
+    To: {to_state}
+
+    The change was confirmed on both CL260 boxes (AND semantics per
+    §10.5). System behavior shifts accordingly:
+
+    For STOP INCOME tokens:
+    - Inserted → Income state PAUSED, scheduled withdrawals zeroed,
+      broker-side ACH updated to $0
+    - Removed → Income state ACTIVE, scheduled withdrawals resume at
+      current schedule_state amount
+
+    For Income Mode tokens (normally inserted):
+    - Removed → Income Mode grace window starts (separate alert)
+    - Inserted (returning from removed) → no system-level effect after
+      latch; before latch, see Phase 3 grace alerts
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: {token_type} {from_state}→{to_state} at {timestamp}."
+
+token_invalid_state:
+  # Fires when token observations show partial/asymmetric/mismatch states
+  # (per §10.5). Escalates to Critical after token_mismatch_critical_cycles
+  # consecutive daily cycles.
+  # Placeholders: {timestamp}, {box_a_counts}, {box_b_counts}, {cycle_count}
+  subject: "IRAPM WARNING: Token state invalid — Box A {box_a_counts}, Box B {box_b_counts}"
+  body: |
+    The daily-token cycle observed an invalid token state at {timestamp}.
+
+    Box A: {box_a_counts}
+    Box B: {box_b_counts}
+
+    Valid states require both boxes to report matching counts:
+    - Phase 3: both report 2 tokens (normal) OR both report 0 (triggered)
+    - STOP INCOME: both report 0 (active) OR both report ≥1 (paused)
+
+    Anything else is an invalid intermediate state. The system is holding
+    the previous valid state until consistency returns.
+
+    Consecutive invalid cycles: {cycle_count}
+
+    Likely causes (most → least common):
+    - Asynchronous detection during a real state change (one box's
+      daily cycle ran before the other's; resolves within 1-2 cycles)
+    - A token has failed (UNAVAILABLE-style fault) on one box only
+    - Physical tampering or partial removal
+
+    If this state persists for more than 2 consecutive cycles
+    (`token_mismatch_critical_cycles` default), severity escalates to
+    Critical and you should investigate the physical token state.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Tokens invalid. A:{box_a_counts} B:{box_b_counts}. Cycle {cycle_count}/2. See email."
+
+token_unavailable:
+  # Fires when daily-token cycle fails to enumerate USB devices on a box.
+  # Escalates per §10.4 (Notice → Warning → Critical).
+  # Placeholders: {timestamp}, {box_id}, {consecutive_cycles}, {severity}
+  subject: "IRAPM {severity}: Token unavailable on {box_id}"
+  body: |
+    The daily-token cycle on {box_id} failed to enumerate USB devices
+    at {timestamp}.
+
+    Consecutive failed cycles: {consecutive_cycles}
+    Current severity: {severity}
+
+    Token state holds at the previous observed value. The system cannot
+    determine Phase 3 or STOP INCOME state from this box until the
+    failure resolves.
+
+    Likely causes (most → least common):
+    - USB driver hang or transient fault
+    - Hardware failure (USB controller, USB hub, port)
+    - Recent OS update affecting USB enumeration
+
+    Recovery: operator investigates the affected box. Reboot may
+    resolve transient driver issues; hardware replacement may be
+    needed for persistent failures.
+
+    Note: while one box is UNAVAILABLE, the other box's token state is
+    used for system-level determination (the unavailable box is treated
+    as if its observations are stale).
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM {severity}: Token enumeration failed on {box_id}. Cycle {consecutive_cycles}. See email."
+
+stopincome_stuck_alert:
+  # Fires when STOP INCOME has been paused for ≥ 12 months
+  # (stopincome_stuck_alert_months). Re-alerts every 3 months thereafter
+  # (stopincome_stuck_realert_months).
+  # Placeholders: {timestamp}, {pause_started_at}, {months_paused},
+  #               {realert_count}
+  subject: "IRAPM: STOP INCOME paused for {months_paused} months — review needed"
+  body: |
+    The STOP INCOME tokens have been inserted (income paused) since
+    {pause_started_at} — {months_paused} months ago.
+
+    This alert exists because long-duration pauses may not be
+    intentional. The operator may have inserted STOP INCOME tokens
+    for a temporary purpose and forgotten to remove them; or in the
+    survivor scenario, a survivor may not realize income remains
+    paused.
+
+    The system has continued to operate during the pause: rebalancing
+    runs, the CB machine evaluates, the SGOV buffer is maintained,
+    and annual reviews fire. Only scheduled withdrawals are zeroed.
+
+    To resume income: remove the STOP INCOME tokens from both CL260
+    boxes (return them to their charger slots). On the next daily-token
+    cycle, the system observes both boxes report `stopincome_count == 0`
+    and transitions Income state back to ACTIVE.
+
+    If the pause is intentional and ongoing, no action needed. This
+    alert will re-fire every 3 months while the pause continues so
+    the situation remains visible.
+
+    Re-alert count since stuck threshold reached: {realert_count}
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: STOP INCOME paused {months_paused}mo. Remove tokens to resume, or ignore if intentional."
+
+
+# -----------------------------------------------------------------------------
+# Operational pause alerts (per §11.3)
+# -----------------------------------------------------------------------------
+
+pause_initiated:
+  # Fires on first cycle that sets operational_pause: true.
+  # Placeholders: {timestamp}, {pause_reason}, {reason_detail},
+  #               {auto_resume_at}
+  subject: "IRAPM: Operational pause — {pause_reason}"
+  body: |
+    The system has entered an operational pause at {timestamp}.
+
+    Pause reason: {pause_reason}
+    Detail: {reason_detail}
+    Auto-resume scheduled for: {auto_resume_at} (48 hours from pause)
+
+    Cycle execution is suspended. Each scheduled cycle while paused
+    runs only through input refresh, then aborts without entering the
+    decision or action layers. Alerts continue to dispatch normally.
+
+    Per §11.3, this pause WILL auto-resume after 48 hours. The next
+    cycle reads fresh broker state and produces a fresh plan. You
+    should NOT need to manually edit the state file. If the underlying
+    issue has resolved (broker transient, network issue, etc.), the
+    next cycle will execute cleanly. If the issue persists, the
+    system will pause again and the consecutive-pause counter will
+    increment.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: PAUSED — {pause_reason}. Auto-resume in 48h. See email."
+
+pause_re_alert:
+  # Fires on each subsequent cycle while paused, until auto-resume or
+  # consecutive escalation.
+  # Placeholders: {timestamp}, {pause_reason}, {hours_remaining},
+  #               {consecutive_pause_count}
+  subject: "IRAPM: Still paused — {pause_reason} ({hours_remaining}h until auto-resume)"
+  body: |
+    The system remains paused at {timestamp}.
+
+    Pause reason: {pause_reason}
+    Hours until auto-resume: {hours_remaining}
+    Consecutive pauses for this reason: {consecutive_pause_count}
+
+    No new action required. The system will auto-resume at the
+    scheduled time and re-evaluate. This alert exists to confirm the
+    pause is still ongoing — its absence would indicate the system
+    has unexpectedly stopped emitting alerts.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Still paused ({pause_reason}). Auto-resume in {hours_remaining}h."
+
+pause_auto_resumed:
+  # Fires when auto-resume cycle clears the pause and proceeds.
+  # Placeholders: {timestamp}, {pause_reason_was}, {pause_duration_hours}
+  subject: "IRAPM: Pause auto-resumed — system back in operation"
+  body: |
+    The operational pause has cleared at {timestamp}.
+
+    Reason that triggered the pause: {pause_reason_was}
+    Pause duration: {pause_duration_hours} hours
+
+    The system has read fresh broker state and is now operating
+    normally. The next cycle will produce a plan based on current
+    state, not the state at the time of the pause.
+
+    If the underlying issue has actually resolved, you'll see normal
+    cycle alerts going forward. If the issue persists, the next cycle
+    may fail and re-enter pause; the consecutive-pause counter would
+    then increment.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Pause cleared. System operating after {pause_duration_hours}h pause for {pause_reason_was}."
+
+pause_consecutive_escalation:
+  # Fires when consecutive_pause_count reaches 4 for the same pause_reason.
+  # Severity escalates to Warning so a returning operator sees an
+  # unmissable pattern.
+  # Placeholders: {timestamp}, {pause_reason}, {consecutive_count}
+  subject: "IRAPM WARNING: Pause has recurred {consecutive_count} times — {pause_reason}"
+  body: |
+    The system has entered the same operational pause {consecutive_count}
+    times in a row, all for reason: {pause_reason}.
+
+    Each pause has auto-resumed after 48 hours per the normal
+    mechanism. However, the persistent recurrence indicates the
+    underlying issue is NOT being resolved by retry alone — operator
+    intervention is likely needed.
+
+    Common reasons this pattern occurs:
+    - Order rejection: broker-side flag or permission issue that
+      retry cannot resolve
+    - Partial phase transition: a malformed transition plan that
+      the system keeps reproducing
+    - Disk full: log rotation isn't reclaiming enough space, or a
+      runaway log file
+    - State file or filesystem corruption that intermittently
+      surfaces
+
+    The system continues to operate — it will keep auto-retrying.
+    But the alert pattern is now visibly louder so the returning
+    operator cannot miss it. Manual investigation is warranted.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Pause recurred {consecutive_count}x for {pause_reason}. Manual review warranted."
+
+
+# -----------------------------------------------------------------------------
+# ACH and broker alerts
+# -----------------------------------------------------------------------------
+
+ach_update_failed:
+  # Fires on first ACHScheduleUpdate failure.
+  # Placeholders: {timestamp}, {target_amount}, {prior_amount},
+  #               {failure_reason}
+  subject: "IRAPM: ACH update failed — broker-side amount unchanged"
+  body: |
+    An ACHScheduleUpdate failed at {timestamp}.
+
+    Target amount: ${target_amount}
+    Current broker-side amount (unchanged): ${prior_amount}
+    Failure reason: {failure_reason}
+
+    The system will continue operating at the prior broker-side ACH
+    amount until the update succeeds. Withdrawals (and any other
+    scheduled ACH operations) will use the prior amount until the
+    broker accepts the update.
+
+    The next cycle that emits an ACHScheduleUpdate will retry. If
+    the next attempt fails again, severity escalates to Warning.
+
+    This alert does NOT halt the system. ACH update failures are an
+    external integration issue (IBKR-side); the rest of IRAPM continues
+    normal operation.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: ACH update failed. Broker amount unchanged at ${prior_amount}. Will retry next cycle."
+
+ach_update_warning:
+  # Fires after ach_update_warning_threshold_cycles (default 3) consecutive
+  # ACH update failures. Severity Warning, no halt.
+  # Placeholders: {timestamp}, {target_amount}, {prior_amount},
+  #               {consecutive_failures}, {ibkr_portal_steps}
+  subject: "IRAPM WARNING: ACH update failed {consecutive_failures} times — manual intervention needed"
+  body: |
+    ACH update has failed {consecutive_failures} consecutive times,
+    as of {timestamp}.
+
+    Target amount: ${target_amount}
+    Current broker-side amount: ${prior_amount}
+
+    Withdrawals continue at the prior amount. The system is operating
+    normally — only the broker-side recurring ACH amount is stale.
+
+    To resolve manually (operator action required):
+    {ibkr_portal_steps}
+
+    Once you update the broker-side amount manually to match the
+    target, the system's next ACH attempt will succeed naturally
+    (it will find the amount already correct and continue without
+    issue).
+
+    This alert does NOT halt the system. IRAPM continues to manage
+    the portfolio. The risk is bounded — at worst, withdrawals
+    continue at last-year's amount until you address this.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: ACH update failed {consecutive_failures}x. Manual IBKR update needed. See email."
+
+broker_disconnect:
+  # Fires when cycle aborts at input refresh due to broker connection
+  # failure. Critical-transient (auto-recovers; no operational_pause).
+  # Placeholders: {timestamp}, {cycle_type}, {error_detail}
+  subject: "IRAPM CRITICAL: Broker connection failure — cycle aborted"
+  body: |
+    A {cycle_type} cycle failed at input refresh at {timestamp} due to
+    broker connection failure.
+
+    Error: {error_detail}
+
+    The cycle aborted before any decisions or actions. State file is
+    unchanged. The next scheduled cycle (typically next day) will
+    attempt to reconnect.
+
+    This is a Critical-transient failure: the underlying condition is
+    expected to resolve naturally on subsequent cycles (broker
+    reconnects, network heals). NO operational_pause is set; the
+    system retries naturally.
+
+    If this alert persists across multiple cycles, investigate broker
+    status (IBKR system status page, account access, network
+    connectivity from the CL260 boxes).
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Broker disconnect ({cycle_type}). Auto-retry next cycle. See email."
+
+
+# -----------------------------------------------------------------------------
+# Master/slave alerts
+# -----------------------------------------------------------------------------
+
+slave_promotion_pending:
+  # Fires when slave observes master staleness ≥ slave_wake_staleness_hours
+  # (72h default). Starts 48h grace before promotion.
+  # Placeholders: {timestamp}, {staleness_hours}, {promotion_at}, {box_id}
+  subject: "IRAPM CRITICAL: Master heartbeat stale — slave promotion pending"
+  body: |
+    The slave box ({box_id}) has observed that the master's heartbeat
+    is stale at {timestamp}.
+
+    Master heartbeat staleness: {staleness_hours} hours
+    Threshold for promotion: 72 hours
+    Auto-promotion will complete at: {promotion_at} (48 hours from
+    now, the grace window)
+
+    Likely causes:
+    - Master box has failed (power, hardware, OS crash)
+    - Network partition between the two boxes
+    - Master process crashed but hardware is still up
+    - Cron job on master failed to run (less likely given 72h
+      threshold)
+
+    If master returns to operation during the 48h grace window, this
+    promotion will be cancelled (you'll receive a
+    `slave_promotion_cancelled` alert).
+
+    If master does NOT return within the 48h grace window, the slave
+    will auto-promote to master and the system will continue operating.
+    No data is lost — the slave has up to 72h-old portfolio state from
+    rsync, and the broker query at the slave's first cycle will refresh
+    actual positions.
+
+    No operator action required for the auto-promotion. You may want
+    to investigate why the master became unreachable.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Master stale {staleness_hours}h. Slave auto-promotes in 48h unless master returns."
+
+slave_promoted:
+  # Fires when slave auto-promotion completes.
+  # Placeholders: {timestamp}, {new_master_box_id}, {stale_total_hours}
+  subject: "IRAPM CRITICAL: Slave has been promoted to master"
+  body: |
+    Auto-promotion has completed at {timestamp}.
+
+    New master: {new_master_box_id}
+    Master heartbeat was stale for: {stale_total_hours} hours total
+    (72h threshold + 48h grace window)
+
+    The system now operates on a single box. The new master is
+    handling all cycle execution; there is no slave until the original
+    master is repaired or replaced.
+
+    The old master, if it returns to operation, will detect the new
+    master via rsync and automatically take the slave role. This is
+    "role-swap, not failback" — the system does not return to the
+    original master/slave assignment, but the redundancy is restored.
+
+    Operator action recommended:
+    - Investigate why the original master failed
+    - Repair or replace as needed
+    - Confirm the new (now original-slave) master is operating
+      normally via the weekly summary alerts
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Slave promoted to master. Single-box operation. Repair other box when possible."
+
+slave_promotion_cancelled:
+  # Fires when master heartbeat returns during the 48h grace window.
+  # Promotion is cancelled.
+  # Placeholders: {timestamp}, {staleness_was_hours}, {pending_started_at}
+  subject: "IRAPM: Slave promotion cancelled — master returned"
+  body: |
+    The pending slave promotion was cancelled at {timestamp}.
+
+    The master's heartbeat returned during the 48-hour grace window.
+    Promotion was started at {pending_started_at} (master staleness
+    reached {staleness_was_hours} hours); master has since resumed
+    writing fresh heartbeats.
+
+    The system continues normal operation. The brief master
+    unavailability was likely a transient (network blip, cron miss,
+    process restart).
+
+    No action required.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Slave promotion cancelled — master returned at {timestamp}. Normal operation."
+
+split_brain_resolved:
+  # Fires when tiebreak runs (both boxes detected themselves as master).
+  # Auto-resolved; no halt. Per Item 7 ruling.
+  # Placeholders: {timestamp}, {winner_box_id}, {loser_box_id},
+  #               {partition_duration_hours}
+  subject: "IRAPM: Split-brain auto-resolved — tiebreak completed"
+  body: |
+    The system detected a split-brain condition (both boxes running as
+    master) and auto-resolved it via last-octet tiebreak at {timestamp}.
+
+    Tiebreak winner (continues as master): {winner_box_id}
+    Tiebreak loser (now SLAVE_SLEEPING): {loser_box_id}
+    Estimated partition duration: {partition_duration_hours} hours
+
+    The tiebreak is automatic — operator action is NOT required to
+    resume operation. The system has returned to single-master
+    operation.
+
+    For your awareness: during the partition window, both boxes may
+    have executed cycles independently. The loser's cycle log is
+    preserved for post-hoc review if you want to confirm no
+    conflicting trades or duplicate ACHs were executed. This is
+    informational; the system continues operating regardless.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Split-brain auto-resolved. {winner_box_id} continues as master. See email."
+
+
+# -----------------------------------------------------------------------------
+# Data / signal alerts
+# -----------------------------------------------------------------------------
+
+data_file_stale:
+  # Fires when lookback price files are stale and signal returns
+  # UNAVAILABLE. CB state holds. Notice severity, auto-recovers.
+  # Placeholders: {timestamp}, {staleness_days}, {threshold_days},
+  #               {affected_symbols}
+  subject: "IRAPM: Price data stale — signal UNAVAILABLE"
+  body: |
+    The Synthetic Growth Lookback signal returned UNAVAILABLE at
+    {timestamp} because input price data is stale.
+
+    Staleness: {staleness_days} days (threshold: {threshold_days})
+    Affected symbols: {affected_symbols}
+
+    CB state holds — no transitions will fire while the signal is
+    UNAVAILABLE. The system continues other operations normally
+    (withdrawals execute, rebalancing follows last known CB state).
+
+    Likely causes:
+    - Price data fetch failed (data provider issue, network problem)
+    - Stale local cache that wasn't refreshed by the cycle's input layer
+    - Specific symbol delisted or had a corporate action affecting feed
+
+    Auto-recovers: the next cycle re-attempts data fetch. If successful,
+    a `signal_recovered` alert fires.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Price data stale ({staleness_days}d). Signal UNAVAILABLE. CB holds."
+
+signal_recovered:
+  # Fires when signal returns to available after UNAVAILABLE period.
+  # Placeholders: {timestamp}, {unavailable_duration_hours}, {signal_value}
+  subject: "IRAPM: Signal recovered — {signal_value}"
+  body: |
+    The Synthetic Growth Lookback signal returned to available status
+    at {timestamp} after {unavailable_duration_hours} hours of
+    UNAVAILABLE.
+
+    Current signal value: {signal_value}
+
+    CB state machine resumes normal evaluation. If pending CB
+    transitions had been blocked by the UNAVAILABLE signal, they
+    will now be evaluated against the current value.
+
+    No action required.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Signal recovered at {signal_value} after {unavailable_duration_hours}h UNAVAILABLE."
+
+
+# -----------------------------------------------------------------------------
+# Configuration / sanity alerts
+# -----------------------------------------------------------------------------
+
+fi_overweight_persistent_suppression:
+  # Fires when §7.5.1 FI-sacrosanct rebalance suppression persists
+  # beyond fi_overweight_suppression_alert_weeks (default 4).
+  # Placeholders: {timestamp}, {weeks_suppressed}, {fi_overweight_pct},
+  #               {growth_drift_summary}
+  subject: "IRAPM WARNING: Rebalance suppressed for {weeks_suppressed} weeks — review"
+  body: |
+    A rebalance has been continuously suppressed for {weeks_suppressed}
+    consecutive weeks, longer than the alert threshold (4 weeks
+    default).
+
+    The suppression is the FI-sacrosanct rule (I5) firing: the
+    rebalance plan would require selling FI to buy Growth, which the
+    system refuses. This typically happens during prolonged Growth
+    drawdowns where FI has held value while Growth depreciated.
+
+    Current state:
+    - FI overweight: {fi_overweight_pct} above target
+    - Growth drift: {growth_drift_summary}
+
+    The system continues operating normally — withdrawals, refills,
+    and CB-state-based behavior all run as expected. Only the 5/25
+    rebalance trigger is suppressed.
+
+    The conditions producing significant FI overweight typically
+    coincide with CB1/CB2 territory (where rebalancing is suspended
+    anyway), so this alert mostly catches edge cases. If you see
+    this in CB_INACTIVE state, investigate whether the target weights
+    in ruleset.yaml still reflect your intent.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Rebalance suppressed {weeks_suppressed}wk. FI overweight {fi_overweight_pct}. See email."
+
+alerter_failure_recovered:
+  # Post-hoc: alerter dispatch failed during a prior period; channels
+  # have recovered. Warns the operator that alerts may have been
+  # dropped during the gap.
+  # Placeholders: {timestamp}, {failure_started_at}, {failure_duration_hours},
+  #               {missed_alert_count_estimate}
+  subject: "IRAPM WARNING: Alert delivery was failing — gap in coverage"
+  body: |
+    The alerter has recovered at {timestamp}. During the recovery,
+    the system detected that alert delivery had been failing.
+
+    Failure window: {failure_started_at} to {timestamp}
+    Duration: {failure_duration_hours} hours
+    Estimated missed alerts: {missed_alert_count_estimate}
+
+    Important: during the failure window, alerts that the system
+    attempted to send may NOT have reached you. The cycle log
+    (preserved separately) contains the full record of what
+    happened. You may want to review the cycle log for that window
+    to confirm no important events were missed.
+
+    Common causes of alerter failures:
+    - Email provider outage or rate-limiting
+    - SMS gateway failure or carrier issue
+    - Credentials expired or revoked
+    - Network connectivity issue at the master box
+
+    This alert itself was successfully delivered, which confirms the
+    channel(s) are working again at the moment of dispatch.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Alert delivery failed {failure_duration_hours}h. Check logs for missed events."
+
+
+# -----------------------------------------------------------------------------
+# Mandatory weekly summary
+# -----------------------------------------------------------------------------
+
+weekly_summary:
+  # Fires on every weekly cycle (§12.3). Mandatory — runs even on weeks
+  # with no state transitions or actions. Missing weekly_summary is
+  # itself a signal that something has gone wrong.
+  # Placeholders: numerous — see §12.3 mandatory content list
+  subject: "IRAPM weekly summary — {timestamp}"
+  body: |
+    Weekly summary for the cycle on {timestamp}.
+
+    PORTFOLIO STATE
+    Core portfolio value: ${core_portfolio_value}
+    Per-position values:
+    {position_values}
+    Allocation drift summary: {drift_summary}
+
+    CIRCUIT BREAKER STATE
+    Current CB state: {cb_state}
+    {cb_extended_detail}
+    Pending CB transitions: {pending_cb_transitions}
+
+    BUFFER STATE
+    SGOV buffer market value: ${sgov_value}
+    Buffer target: ${buffer_target}
+    Buffer condition: {buffer_tag}
+    {refill_status}
+
+    UPCOMING WITHDRAWAL
+    Next scheduled withdrawal: ${next_withdrawal}
+    Days until next monthly cycle: {days_until_withdrawal}
+    Income state: {income_state}
+
+    EXTRAORDINARY EVENTS (past week)
+    {extraordinary_events_summary}
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM weekly: Core ${core_portfolio_value}. CB {cb_state}. Buffer {buffer_tag}. See email."

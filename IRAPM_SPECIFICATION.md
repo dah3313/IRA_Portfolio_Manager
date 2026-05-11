@@ -1,0 +1,5916 @@
+# IRAPM — IRA Portfolio Manager
+
+## Specification
+
+**Version:** 1.3 (copyedit-review fixes; semi-annual Phase 2 steady-state reallocation; token-state validity model; hours-only coordination timing)
+**Status:** Implementation-ready pending ruleset.yaml drafting, operational runbook, and re-validation per §14.7
+**Supersedes:** v1.2, v1.1, v1.0 (consolidated drafts); IPM v1 (retired due to accumulated bug load and lost trust in the codebase); SPECIFICATION1.md through SPECIFICATION6.md (incremental drafts); PHASE_3_DESIGN.md (formerly authoritative for Phase 3 intent and math; concepts imported into v1.1, math imported into v1.2; **now deprecated**)
+
+**v1.3 changes:** Eight fixes from external copyedit review.
+(1) §4.1.1.6 regime taxonomy rewritten to partition by the binding
+clamp bound rather than by AND-conditions, closing a gap where
+`sub_floor < I_sustainable < floor_T` fell through all four regimes.
+(2) §10.5, §10.6.2 token-state validity model formalized: only
+specific valid configurations are operative; invalid intermediate
+states hold previous state and alert without aborting the grace
+window. (3) §4.3 step 1 T-7 validation reworded to "last weekly
+cycle 5+ trading days before transition" (the original T-7 was
+unreachable by the weekly schedule). (4) §7.5.2 adds semi-annual
+(Jan 15 / Jul 15) steady-state reallocation to 45/45/10 during
+Phase 2, addressing GBIL dilution from dividend flow. (5) §6.5.1
+and §9.6 "subsume" vocabulary clarified to mean scope-inclusion,
+not runtime cancellation. (6) §4.1.1.7 explicit precision rule for
+the per-month payment ceiling: intermediates full-precision, final
+payment cent-rounded. (7) §9.4.2 staleness threshold converted from
+days to hours throughout the coordination subsystem; grace window
+start point explicitly anchored to SLAVE_PROMOTION_PENDING entry.
+(8) Glossary, §2.3, §3.8, §4.3 ancillary updates supporting the
+above.
+
+**v1.2 changes:** Sustainable-withdrawal math imported from
+PHASE_3_DESIGN.md §5.1–§5.2 into IRAPM §4.1.1 (constants, bracket
+indexing, closed-form `I_sustainable`, sub-floor protection, `I_0`
+clamping, regime classification, per-month payment ceiling,
+implementation order). IRAPM is now self-contained for Phase 3
+implementation. PHASE_3_DESIGN.md is **deprecated**; remaining
+references to it in this document are historical-context-only
+(parameter-divergence notes, prior-validation references).
+Re-validation requirement at the new IRAPM parameter set
+(`INFLATION_PRE = 3.5%`, brackets-continue-growing) added as §14.7.
+
+**v1.1 changes:** PHASE_3_DESIGN.md cross-check imports — corrected token semantics inversion (Phase 3 tokens normally inserted, STOP INCOME tokens normally removed); added physical security model; added stuck-token alert; named failure-quiet and reversible-where-possible operational principles; named role-swap-not-failback property; replaced shared-state master/slave model with hybrid rsync-replicated state + state-write-as-heartbeat; added ACH manual fallback escalation; added resume-semantics worked example; cross-referenced ratified validation results.
+
+This document is the **single source of truth** for IRAPM. All Phase 3
+intent, financial concepts, and sustainable-withdrawal math previously
+held in `PHASE_3_DESIGN.md` have been imported here. `PHASE_3_DESIGN.md`
+is deprecated and should be moved out of the active document set
+(e.g., renamed `PHASE_3_DESIGN.deprecated.md` or relocated to an
+archive directory) to prevent its accidental treatment as authoritative.
+The validation results recorded in that document remain valid as
+*historical evidence* that the original parameter set (3.0% pre-trigger,
+fixed brackets at trigger) produced 100% survival over the 2005–2025
+sequence; they do **not** validate the IRAPM-current parameter set
+(see §14.7).
+
+Owner edit:  Each code module and block shall have a succinct comment prior on
+module/block function and what the variables refer to.  There shall be no
+Changelogs inside the modules, there will be a single changelog for IRAPM
+and if a change is significant enough for a changelog entry it will go there
+with a brief statement of the change. 
+ruleset.yaml will contain all tunable financial values, there shall be no hard
+coded financial values in the code blocks themselves.
+The only piece of the old IPM that may be reusable is the 'clock.py' as it allows
+graceful regression tests.
+Each code module shall be restricted to one functional area i.e. rebalancer.py 
+handles only rebalancing, circuitbreaker.py handles only circuit breaker functions, etc.
+
+---
+
+## Table of Contents
+
+- §1. Goals & Non-Goals (incl. §1.4 Operational principles)
+- §2. Foundational Assumptions
+- §3. Domain Model
+- §4. Phase Model (incl. §4.1.1 Phase 3 starting income calculation — full math)
+- §5. Synthetic Growth Lookback Signal
+- §6. State Machine
+- §7. Decision Logic
+- §8. Action Layer
+- §9. External Interfaces
+- §10. Hardware Tokens (incl. §10.1.1 Physical security model)
+- §11. Failure Modes & Recovery
+- §12. Observability
+- §13. Testing Strategy
+- §14. Open Questions (incl. §14.7 Phase 3 re-validation requirement)
+- §15. Glossary
+
+---
+
+## §1. Goals & Non-Goals
+
+### 1.1 What IRAPM is
+
+IRAPM is an automated portfolio manager for a single tax-advantaged retirement
+account (Traditional IRA or Roth IRA). It implements a **volatility-harvesting
+strategy** designed to support withdrawal rates substantially above the
+conventional 4–4.7% guideline by:
+
+1. Holding a high-volatility Growth front-end (FBCG, AVUV) that produces the
+   price movement the system harvests.
+2. Holding a high-yield multi-sector Fixed Income back-end (PYLD, JPIE) whose
+   dividends substantially cover ongoing withdrawals, reducing the rate at
+   which Growth must be sold.
+3. Continuously rebalancing the two buckets toward target weights via a 5/25
+   rule, which mechanically transfers Growth volatility into FI accumulation.
+4. Defending the portfolio against drawdown via a layered circuit-breaker
+   system that progressively reduces exposure to forced selling as conditions
+   worsen.
+5. Maintaining a 24-month SGOV cash-equivalent buffer outside the portfolio
+   accounting boundary, available to absorb extended unfavorable conditions
+   without contaminating the rebalancing signals.
+
+The system operates in phases tied to the operator's life circumstances:
+
+- **Phase 1** (years 0–8): income-production mode with active withdrawals.
+- **Phase 2** (years 8+): pure-growth mode after Social Security filing
+  establishes a non-portfolio income floor; withdrawals halted; allocation
+  shifts to 90/10 Growth/FI with FI as opportunistic dry powder.
+- **Phase 3** (event-triggered): survivor-income mode, structurally Phase 1
+  reactivated with adaptive withdrawal calculation and a longer horizon.
+
+### 1.2 What IRAPM is NOT
+
+These are deliberate exclusions, not omissions:
+
+- **Not a tax-aware system.** IRAPM operates only in tax-advantaged accounts.
+  It does not track tax lots, harvest losses, avoid wash sales, or report
+  realized gains. Deployment in a taxable account violates the system's
+  economic premise.
+- **Not a multi-account system.** It manages exactly one account. Cross-
+  account coordination is out of scope.
+- **Not a stock-picker.** The asset universe is fixed by configuration. The
+  system never selects, evaluates, or rotates between holdings.
+- **Not a market-timer.** Circuit breakers are damage-control mechanisms, not
+  return-seeking signals. The system never attempts to predict market
+  direction or enter/exit based on forecasts.
+- **Not a financial advisor.** It executes a fixed strategy specified in
+  configuration. It does not adapt strategy to changing personal
+  circumstances; phase transitions are pre-planned, not opportunistic.
+- **Not a survivor of arbitrarily long bear markets.** The 24-month SGOV
+  buffer defines the system's worst-case endurance. Bear markets exceeding
+  that duration require human intervention; the system's job is to buy time,
+  not to guarantee indefinite survival.
+
+### 1.3 Design priorities, in order
+
+When design decisions involve trade-offs, this is the priority order:
+
+1. **Correctness.** The system must do what the spec says, every time, with
+   no silent failure modes.
+2. **Trust.** Behavior must be inspectable, predictable, and explainable to
+   the operator at any point.
+3. **Robustness.** Failures (network, broker, data) must degrade gracefully,
+   never act on stale or incomplete information, and never leave the
+   portfolio in an inconsistent state.
+4. **Simplicity.** Fewer moving parts beats more clever ones. Code complexity
+   that doesn't directly serve correctness, trust, or robustness is a
+   liability.
+5. **Performance.** Effectively unconstrained. The system runs at most a few
+   times per day; computational efficiency is irrelevant compared to
+   correctness.
+
+### 1.4 Operational principles
+
+In addition to the implementation priorities above, the system commits to
+two operator-facing properties:
+
+- **Failure-quiet.** The system pays scheduled income reliably without
+  requiring action from the operator or survivor. Routine operation does
+  not generate operator decisions. Alerts fire on state transitions and
+  failures, but the absence of operator action is the normal case. In the
+  survivor scenario, the survivor inherits a running system, not a system
+  awaiting instructions.
+
+- **Reversible decisions where possible.** Mechanisms with operational
+  impact prefer toggleable forms over committed-once forms. The STOP
+  INCOME token (§4.4, §10) is the canonical example: a survivor can pause
+  income and resume it freely, with the schedule continuing as if no pause
+  had occurred. Non-reversible decisions are limited to those genuinely
+  required by external systems (phase progression is monotone; Phase 3
+  is permanent once latched) or by the nature of the action (executed
+  trades cannot be unmade).
+
+---
+
+## §2. Foundational Assumptions
+
+These assumptions are baked into the system's design. Violating any of them
+invalidates the spec.
+
+### 2.1 Account type
+
+The managed account is an IRA (Traditional or Roth). All trading activity
+is non-taxable at the transaction level. No tax-lot tracking, wash-sale
+avoidance, short-term/long-term gain distinction, or 1099-B reporting is
+required of the system.
+
+### 2.2 Strict allowlist
+
+The system operates on a fixed, configured list of symbols:
+
+| Bucket | Symbols (Phase 1) | Symbols (Phase 2) | Symbols (Phase 3) | Purpose |
+|---|---|---|---|---|
+| Core Growth | FBCG, AVUV | FBCG, AVUV | FBCG, AVUV | Volatility source |
+| Core Fixed Income | PYLD, JPIE | GBIL | PYLD, JPIE | Income engine + rebalance sink |
+| Buffer | SGOV | SGOV | SGOV | Crisis-mode withdrawal source |
+| Cash | (USD) | (USD) | (USD) | Transaction reserve + 1mo withdrawal float |
+
+**Anything else held in the account is invisible to IRAPM.** The system
+does not see, value, trade, or report on non-allowlisted positions.
+This is a *correctness invariant*, not a feature: the operator may hold
+unrelated positions in the same account, and IRAPM must not interfere
+with them or be confused by them.
+
+Phase 2 substitutes GBIL for PYLD/JPIE as the FI holding; Phase 3 reverts
+to PYLD/JPIE (provisional, simulator-tunable per §14). Phase transitions
+handle the swap mechanics (§4.3, §7.2).
+
+### 2.3 Single source of tunable parameters
+
+All financially meaningful parameters live in a single configuration
+file (`ruleset.yaml` or equivalent). Magic numbers in code are spec
+violations. This includes — non-exhaustively:
+
+- Target allocation weights per phase
+- 5/25 rebalance thresholds (the 5% absolute and 25% relative figures)
+- Circuit-breaker activation thresholds (-10%, -20%)
+- Circuit-breaker hysteresis buffers (+2%, +5%)
+- Confirmation window durations (2 weeks)
+- CB1 → CB2 timer (90 days, parameter `cb1_to_cb2_timer_days`))
+- Lookback window (6 months / ~26 weekly bars)
+- Lookback staleness gates (14 days max staleness, ≥80% bar coverage)
+- Phase 1 withdrawal amount and inflation rate ($3000/mo in 2027 USD, 3% nominal)
+- Phase 3 floor and ceiling brackets (`FLOOR_2026 = $3000`,
+  `CEILING_2026 = $5000` in 2026 USD; `INFLATION_PRE = 3.5%`
+  indexing rate, continues post-trigger; per §4.1.1.1)
+- Phase 3 post-trigger CPI rate (`CPI_POST = 4.0%`)
+- Phase 3 sustainable-withdrawal closed-form constants:
+  `RETURN_NOM = 6.0%` (assumed nominal portfolio return);
+  `HORIZON = 27 years`; `TARGET_TERMINAL = 0.50` (real terminal
+  target as fraction of trigger P); `INFLATION_TERMINAL = 2.5%`
+  (long-run inflation for terminal target); `SUB_FLOOR_RATE = 6.0%`
+  (sustainable rate for sub_floor regime). Per §4.1.1.1.
+- Phase 3 per-month payment ceiling
+  (`phase3_monthly_payment_ceiling_pct = 0.075`; applied as
+  `current_portfolio × pct / 12` per §4.1.1.7)
+- Annual review date (default January 15)
+- Freeze evaluation threshold days (default 30 cumulative CB1+ days)
+- SGOV buffer target (24 months × current monthly withdrawal)
+- SGOV refill rate (target/12 per month, recomputed annually on Jan 15)
+- SGOV refill startup delay (`sgov_refill_post_recovery_delay_days`,
+  default 60 days post-recovery)
+- Cash buffer target (`current_monthly_withdrawal + $1000` Phase 1/3, $1000 Phase 2)
+- Cash buffer tolerance ($250)
+- FI-low alert guard threshold (default 6 months × monthly withdrawal,
+  hysteresis 10%)
+- Portfolio-low alert floor dollars and floor months (default $50K / 18 months,
+  hysteresis 10%)
+- Position residual minimum ($1500 default)
+- Phase 2 opportunistic rebalance threshold (signal ≤ -10%)
+- Phase 2 opportunistic recovery threshold (signal ≥ +2%, absolute)
+- Phase 1 → Phase 2 transition date (2035-01-01)
+- ACHScheduleUpdate consecutive-failure Warning-escalation threshold
+  (`ach_update_warning_threshold_cycles`, default 3). Failures
+  generate Notice alerts until this threshold, then escalate to
+  Warning severity; no halt is triggered (per §8.2.7)
+- STOP INCOME stuck-token alert threshold and re-alert cadence
+  (`stopincome_stuck_alert_months` default 12,
+  `stopincome_stuck_realert_months` default 3)
+- Master/slave coordination timing (`master_heartbeat_time` default
+  06:00 ET, `rsync_replication_time` default 06:15 ET,
+  `slave_check_time` default 06:30 ET,
+  `slave_healthy_threshold_hours` default 24,
+  `slave_wake_staleness_hours` default 72,
+  `slave_promotion_grace_hours` default 48).
+  All coordination timing thresholds are in hours for consistency
+  (§9.4.2).
+- Phase 2 semi-annual reallocation dates
+  (`phase2_reallocation_dates`, default `[Jan 15, Jul 15]`; weekend/
+  holiday shift to next trading day) — per §7.5.2.b.
+- Pause auto-resume window (`pause_auto_resume_hours`, default 48,
+  per §11.3).
+- Consecutive same-reason pause escalation threshold
+  (`pause_consecutive_escalation_count`, default 4, per §11.3).
+- Large cash deployment trigger thresholds
+  (`large_cash_deployment_threshold_dollars` default 25000;
+  `large_cash_deployment_threshold_rate` default 5; trigger fires
+  when cash surplus exceeds the max of the two — per §7.7.1).
+- FI-overweight suppression alert threshold
+  (`fi_overweight_suppression_alert_weeks`, default 4, per §7.5.1).
+- Order fill timeout (`order_fill_timeout_seconds`, default 60,
+  per §8.2.1).
+- Dry-run mode (`dry_run`, boolean, default false, per §13.7).
+
+**Operator-configured operational parameters (not financial-strategy
+parameters but still in ruleset.yaml because it is the operator's
+only edited file):**
+
+- ACH destination (`ach_destination`): operator's external bank
+  account identifier (IBKR-side reference, not raw banking info).
+  Set once at deployment; edited only via runbook procedure if the
+  external bank changes. Read by IRAPM at runtime and included in
+  the Withdrawal Plan entry per §7.3.3. Lives in ruleset.yaml rather
+  than `.env` because `.env` is reserved for secrets (per §9.1.3)
+  and the ACH destination is not a credential.
+- Alerter contact info (operator email, operator SMS number, etc.).
+
+The intent is that the operator can re-tune the strategy without
+touching code, and that simulator runs can sweep parameter ranges
+without modification.
+
+#### 2.3.1 Consolidated parameter table
+
+The §2.3 bullet list above is descriptive; this subsection collects
+all parameters by name with canonical defaults, units, and governing
+section. The intent is to serve as the single reference for drafting
+`ruleset.yaml` (§14.3) and as the canonical map between parameter
+names used elsewhere in the spec and their concrete defaults. Every
+configurable value in the system has a row here; any value referenced
+in code that lacks a row is a spec violation per §1's "magic numbers"
+rule.
+
+**Allocation and rebalancing:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `rebalance_absolute_threshold_rate` | 5 | percent | §7.5.1 |
+| `rebalance_relative_threshold_rate` | 25 | percent | §7.5.1 |
+| `confirmation_window_weeks` | 2 | weeks | §6.3 |
+| `position_residual_minimum_dollars` | 1500 | dollars | §3.14 (I12) |
+
+**Circuit breakers:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `cb1_threshold_rate` | -0.10 | decimal | §3.10, §6.3.1 |
+| `cb2_threshold_rate` | -0.20 | decimal | §3.10, §6.3.1 |
+| `cb1_recovery_buffer_rate` | 0.02 | decimal | §6.3.2 |
+| `cb2_recovery_buffer_rate` | 0.05 | decimal | §6.3.2 |
+| `cb1_to_cb2_timer_days` | 90 | days | §6.3.3 |
+
+**Lookback signal:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `lookback_window_weeks` | 26 | weeks (≈6 months) | §5 |
+| `lookback_max_staleness_days` | 14 | days | §5 |
+| `lookback_min_bar_coverage_rate` | 0.80 | decimal | §5 |
+
+**Global inflation:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `inflation_rate` | 0.035 | decimal | §4.1, §4.1.2, §7.6 |
+
+**Phase 1:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `phase1_initial_monthly_dollars` | 3000 | 2027 USD | §4.1 |
+| `phase1_trigger_year` | 2027 | year | §3.13, §4.1 |
+| `phase1_to_phase2_transition_date` | 2035-01-01 | ISO date | §4.1, §4.2 |
+
+**Phase 2:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `phase2_opportunistic_trigger_rate` | -0.10 | decimal | §7.5.2.a |
+| `phase2_opportunistic_recovery_rate` | 0.02 | decimal | §7.5.2.a |
+| `phase2_reallocation_dates` | [Jan 15, Jul 15] | MM-DD list | §7.5.2.b |
+
+**Phase 3 (per §4.1.1):**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `phase3_i0_calc_return_assumption` | 0.06 | decimal | §4.1.1 |
+| `phase3_i0_calc_inflation_assumption` | 0.04 | decimal | §4.1.1 |
+| `phase3_i0_calc_horizon_years` | 30 | years | §4.1.1 |
+| `phase3_monthly_payment_ceiling_rate` | 0.075 | decimal | §4.1.1.2 |
+
+**SGOV buffer:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `sgov_buffer_target_months` | 24 | months | §3.6, §7.4 |
+| `sgov_refill_post_recovery_delay_days` | 60 | days | §7.4.1 |
+
+**Cash buffer:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `cash_buffer_offset_dollars` | 1000 | dollars | §3.7, §7.7 |
+| `cash_buffer_tolerance_dollars` | 250 | dollars | §7.7 |
+
+**Large cash deployment (§7.7.1):**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `large_cash_deployment_threshold_dollars` | 25000 | dollars | §7.7.1 |
+| `large_cash_deployment_threshold_rate` | 0.05 | decimal | §7.7.1 |
+
+**Low-resource alerts:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `fi_low_alert_threshold_months` | 6 | months | §6.4.1 |
+| `portfolio_low_alert_floor_dollars` | 50000 | dollars | §6.4.2 |
+| `portfolio_low_alert_floor_months` | 18 | months | §6.4.2 |
+
+**Annual review:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `annual_review_date` | Jan 15 | MM-DD | §7.6 |
+| `freeze_evaluation_threshold_days` | 30 | days | §7.6.1 |
+
+**Rebalance suppression alerting:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `fi_overweight_suppression_alert_weeks` | 4 | weeks | §7.5.1 |
+
+**Action layer:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `order_fill_timeout_seconds` | 60 | seconds | §8.2.1 |
+| `ach_update_warning_threshold_cycles` | 3 | cycles | §8.2.7 |
+
+**Hardware tokens:**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `phase3_grace_window_hours` | 24 | hours | §10.6.2 |
+| `phase3_token_count_required` | 4 | tokens | §10.8 |
+| `stopincome_token_count_required` | 2 | tokens | §10.8 |
+| `stopincome_stuck_alert_months` | 12 | months | §10.7.1 |
+| `stopincome_stuck_realert_months` | 3 | months | §10.7.1 |
+| `token_mismatch_critical_cycles` | 2 | cycles | §10.5 |
+
+**Master/slave coordination (all in hours per §9.4.2):**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `master_heartbeat_time` | 06:00 ET | clock | §9.4.2 |
+| `rsync_replication_time` | 06:15 ET | clock | §9.4.2 |
+| `slave_check_time` | 06:30 ET | clock | §9.4.2 |
+| `slave_healthy_threshold_hours` | 24 | hours | §9.4.2 |
+| `slave_wake_staleness_hours` | 72 | hours | §9.4.2 |
+| `slave_promotion_grace_hours` | 48 | hours | §9.4.2 |
+
+**Failure recovery (per §11.3):**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `pause_auto_resume_hours` | 48 | hours | §11.3 |
+| `pause_consecutive_escalation_count` | 4 | re-pauses | §11.3 |
+
+**Operational (operator-configured):**
+
+| Parameter | Default | Units | Section |
+|---|---|---|---|
+| `ach_destination` | (operator-specific) | IBKR bank ref | §2.3, §9.1.5 |
+| `dry_run` | false | boolean | §13.7 |
+| `cycle_schedule` | Wed 10:00 ET | clock | §9.6 |
+
+### 2.4 Modularity principle
+
+The system decomposes into separable concerns. Each subsystem has a
+narrow, well-defined responsibility and communicates with others
+through explicit interfaces. The original IPM's modular layout is the
+*architectural inspiration*; the specific module breakdown for IRAPM
+is derived fresh from this spec, not inherited.
+
+The expected top-level subsystems (subject to refinement during
+detailed design):
+
+- Configuration loader and validator
+- Market data fetcher (broker quotes; price-history files for lookback)
+- Synthetic Growth Lookback signal generator
+- Circuit-breaker state machine
+- Phase manager
+- Income state manager
+- Rebalancer (5/25 enforcement, Phase 2 opportunistic swing)
+- Withdrawal router (decides source per cycle)
+- Schedule manager (annual review: freeze evaluation + buffer/refill recompute)
+- SGOV buffer manager (drain via cascade, refill via Growth drawdown)
+- Cash buffer manager
+- FI-low alert guard
+- Portfolio-low alert guard
+- Order executor (broker interface)
+- Alerter (email + SMS)
+- Persistence layer (state minimal — see §6.7)
+- Master/slave coordination
+- Token monitor
+- Scheduler / orchestrator (runs cycles on cadence)
+- Recovery / replay (restart-safety)
+
+### 2.5 Decision/action separation
+
+Decisions (pure functions of state) are computed separately from
+actions (broker calls, alerts, persistence writes). This is a direct
+response to a class of bugs in IPM v1 where decisions and actions
+were conflated, allowing one condition to mistakenly govern two
+behaviors. Concretely:
+
+- A decision module reads state and emits a structured plan (e.g.,
+  "rebalance: BUY 23 SGOV, SELL 12 FBCG"; "withdrawal: $3000 sourced
+  via cascade — SGOV $2000, FI $1000").
+- An action module executes the plan, with no decision authority.
+- Plans are loggable, inspectable, and testable in isolation.
+
+### 2.6 Determinism and reproducibility
+
+Given the same input state (account positions, market prices, phase,
+date), the system produces the same plan every time. Any non-determinism
+(random tie-breaking, time-of-day sensitivity) is a spec violation and
+must be eliminated.
+
+Corollary: any historical decision can be re-derived from the inputs
+that were available at the time. This is what makes the system
+auditable and what allows the simulator to validate it against
+historical data.
+
+### 2.7 Fail-safe defaults
+
+When the system cannot proceed safely — missing data, broker
+unreachable, signal unavailable, ambiguous state — it does **nothing**
+and alerts the operator. Specifically:
+
+- Missing or stale price data → skip the cycle, alert.
+- Broker disconnect during a cycle → abort the cycle cleanly, alert,
+  recover on next attempt.
+- Lookback signal unavailable → CB state remains as-is (no transitions),
+  no rebalancing, withdrawals deferred if possible.
+- Configuration invalid → refuse to start.
+
+The system must never act on a partial picture. "Do nothing" is always
+a valid action.
+
+### 2.8 Money discipline
+
+All monetary values (account balances, position values, withdrawal
+amounts, buffer targets, drift calculations, order amounts) use the
+`Decimal` type, **rounded to the nearest cent** ($0.01). Float
+arithmetic is forbidden anywhere money is involved.
+
+Rationale: float-binary-fraction artifacts produce results like
+`$3000.00 - $2500.00 = $499.9999999999998`, which break equality
+comparisons, drift the buffer accounting over time, and cause silent
+penny-discrepancies between computed plans and broker fills. Decimal
+arithmetic is exact, and rounding to the cent matches the broker's
+own precision.
+
+Implementation rules:
+- Quantities (share counts) may be integer or Decimal depending on
+  whether fractional shares are supported by the broker for the
+  symbol; check per-symbol, do not assume.
+- Percentages and ratios (allocation weights, drift fractions, signal
+  values) use Decimal but are NOT rounded to two places — they retain
+  meaningful precision.
+- Conversions from float (e.g., from a third-party data source) go
+  through `Decimal(str(value))` to preserve the source's stated
+  precision without introducing binary-fraction artifacts.
+- Rounding mode is `ROUND_HALF_EVEN` (banker's rounding) — the Python
+  default and the financial-industry standard.
+
+### 2.9 Deposits, conversions, and external cash flows are out of scope
+
+IRAPM does not initiate, schedule, track, or coordinate any inflows
+to the managed account. Specifically out of scope:
+
+- Roth conversions from external 401(k) / IRA sources
+- Rollover deposits
+- Operator-initiated cash deposits
+- Any other inflow
+
+Operationally, Phase 1 has a significant inflow pattern: ~$200K
+initial Roth conversion in 2027 plus annual conversions of ~$130K
+in years 2–8. These happen at the brokerage level, outside IRAPM's
+awareness or control.
+
+When new cash appears in the managed account, IRAPM treats it as
+ordinary cash. On the next cycle, the cash buffer is taken to target
+first; remaining cash is deployed per the active phase's allocation
+rules. Two deployment paths exist depending on inflow size:
+
+- **Small inflows** (dividends, rounding residuals, modest deposits
+  below the large-deployment threshold) deploy bite-by-bite via the
+  cash buffer surplus rule (§7.7) — one position per cycle,
+  most-underweight first.
+- **Large inflows** (Phase 1 annual Roth conversions, bulk deposits
+  exceeding `large_cash_deployment_threshold_dollars` or
+  `large_cash_deployment_threshold_rate` of portfolio value) trigger
+  an explicit multi-position deployment plan that restores all
+  underweight positions to target weights in one cycle (§7.7.1).
+
+No special handling, no deposit-detection logic, no reconciliation
+against external records — both paths are emergent from cash being
+above target.
+
+**Bootstrap consideration.** Because the Year-1 portfolio after
+house/car/expenses is small (~$100K), and grows incrementally via
+annual conversions over years 2–8, early Phase 1 may operate with a
+core portfolio too small to support a full 24-month SGOV buffer. The
+**operational practice** the operator follows is to hold next-year
+withdrawal funds outside IRAPM (in HYSA / money market) and deposit
+into the managed account only those funds intended for portfolio
+investment. This sidesteps the bootstrap problem at the human layer.
+
+The **Portfolio-low alert guard state** (§3.10) is the system-level
+safety net for cases where this discipline is not maintained. It
+also protects the Phase 3 Year-1 scenario where the survivor
+inherits a small portfolio without the operator's operational
+context.
+
+---
+
+## §3. Domain Model
+
+This section defines the vocabulary used by the rest of the spec.
+All later sections refer to entities and quantities defined here.
+
+### 3.1 The account
+
+The single tax-advantaged brokerage account managed by IRAPM. Contains:
+
+- **Allowlisted positions** — the symbols in §2.2 that IRAPM operates on.
+- **Allowlisted cash** — USD held within the cash buffer accounting.
+- **External holdings** — anything else, invisible to IRAPM.
+
+### 3.2 Position
+
+A holding of one allowlisted symbol. Characterized by:
+
+- **Symbol** (e.g., FBCG)
+- **Share count**
+- **Last observed market price**
+- **Market value** = share count × last price
+- **Bucket assignment** (Core Growth, Core FI, or Buffer)
+
+### 3.3 Buckets
+
+The system organizes positions into named buckets per active phase
+(see §2.2 for the per-phase symbol assignments).
+
+A bucket's **value** is the sum of market values of its member positions.
+
+### 3.4 Core portfolio
+
+The combined Growth + Fixed Income buckets. **The buffer and cash
+buckets are explicitly NOT part of the core portfolio.** All percentage
+calculations (5/25 rebalance, lookback signal, allocation drift) operate
+on the core portfolio only.
+
+This isolation is a deliberate design choice: the buffer and cash
+buckets exist to absorb withdrawals and operational expenses without
+contaminating the rebalancing signals. If they were included in core
+calculations, withdrawing from the buffer would change the apparent
+allocation of Growth and FI, polluting the 5/25 logic.
+
+### 3.5 Target allocation
+
+A configured percentage assigned to each core position, summing to 100%.
+For example, in Phase 1: FBCG 25%, AVUV 25%, PYLD 25%, JPIE 25%
+(illustrative — actual targets in ruleset).
+
+The **target value** of a position is `core_portfolio_value × target_pct`.
+
+The **drift** of a position is `current_value − target_value`, expressed
+in dollars and as a percentage of the target value.
+
+### 3.6 Buffer accounting
+
+The SGOV buffer has its own internal accounting separate from market
+value:
+
+- **Buffer target** — `24 × current_monthly_withdrawal`. Recomputed at
+  the annual review (§7.6) using the new year's monthly withdrawal
+  amount. In Phase 2 (no scheduled withdrawals), the buffer target
+  carries forward at its end-of-Phase-1 value (no recompute, since
+  there is no current monthly withdrawal to reference).
+- **Buffer market value** — current SGOV holdings × SGOV price.
+- **Buffer surplus / deficit** — market value minus target.
+- **Refill state** — one of: idle (buffer at target), draining
+  (cascade active, refill suspended), delayed (within
+  `sgov_refill_post_recovery_delay_days` post-recovery window),
+  refilling (active batches running), exhausted (at residual
+  floor). See §12.3.
+- **Monthly refill rate** — `buffer_target / 12`. Recomputed at annual
+  review. The same monthly rate applies to every refill batch in that
+  year, regardless of how large the deficit is. Small deficits
+  (1-2 months drained) refill quickly; large deficits (12+ months
+  drained) refill at the annual rate.
+
+The buffer value is **never** included in core portfolio calculations,
+allocation drift, or lookback signals.
+
+### 3.7 Cash accounting
+
+The cash buffer has analogous accounting:
+
+- **Cash target** —
+  - Phase 1, Phase 3: `current_monthly_withdrawal + $1000`. Recomputed
+    at annual review with the new year's withdrawal amount.
+  - Phase 2: $1000 (transaction reserve only; no withdrawal float
+    needed).
+- **Cash actual** — current USD in account allocated to the cash buffer.
+- **Cash deviation** — actual minus target.
+- **Tolerance** — $250. Refill triggers when deviation exceeds tolerance
+  in either direction.
+
+Cash is also excluded from core portfolio calculations.
+
+### 3.8 Cycle
+
+A single execution of the system's main loop. Cycles are scheduled
+by the OS (systemd timers) and consist of: input refresh → state
+evaluation → decision → action → persistence → alert.
+
+Two cycle types exist (§6.5, §9.6):
+
+- **weekly** — full §6.5 evaluation. Default Wednesday 10:00 ET.
+  Several steps within the weekly cycle are date-gated:
+  monthly-withdrawal step (the weekly cycle on or before 4 business
+  days before the 15th of the month), annual-review step (the weekly
+  cycle on or after January 15), Phase 2 semi-annual reallocation
+  step (the weekly cycle on or after each phase2_reallocation_dates
+  entry, in Phase 2 only).
+- **daily-token** — minimal: token state read + write to local state
+  file + alerts. No broker interaction, no signal computation, no
+  decision layer.
+
+Cycle types run at different times of day on overlapping dates. The
+weekly cycle is the only one that touches the broker, computes the
+signal, or generates Plan entries.
+
+### 3.9 Phase
+
+A discrete operating mode of the system: Phase 1, Phase 2, or Phase 3.
+Each phase has its own configuration (target allocation, withdrawal
+behavior, refill behavior, applicable CB framework). Phase 1 → Phase 2
+transitions on a configured calendar date; Phase 1/2 → Phase 3
+transitions on a hardware-token event (see §4 and §10).
+
+Phase progression is monotone (no PHASE_2 → PHASE_1; no exit from
+PHASE_3).
+
+### 3.10 Circuit Breaker (CB) states
+
+The system maintains discrete CB states that govern withdrawal and
+rebalance behavior. The CB framework is active in **Phase 1 and
+Phase 3** (the income-producing phases). Phase 2 uses a single
+opportunistic-rebalance threshold and does not maintain CB states.
+
+**Three core CB machine states:**
+
+- **CB_INACTIVE** — Default state. No circuit breaker tripped.
+  Rebalancing active; withdrawals sourced from most-overweight core
+  position then proportionally from FI buckets.
+- **CB1** — Growth lookback ≤ -10%, confirmed for 2 weeks.
+  Rebalancing suspended. Withdrawals sourced from FI bucket only:
+  most-overweight FI position first, then proportional from remaining
+  FI buckets. Growth is never sold for withdrawals during CB1.
+  - **CB1 → CB2 timer transition** — CB1 has been continuously active for 90 days, triggering an automatic transition to CB2 via timer (§6.3.3)
+    without recovery. Sub-state of CB1 (not an independent state).
+    Behaviorally equivalent to CB2 for withdrawals (cascade
+    sourcing), but reached via the slow path. Retains CB1's
+    not-extended distinction for the rebalance gate.
+- **CB2** — Growth lookback ≤ -20%, confirmed for 2 weeks.
+  Rebalancing suspended. Withdrawals divert to SGOV cascade.
+
+**Two independent guard states (orthogonal to CB machine):**
+
+- **FI-low alert** — FI principal has dropped below threshold
+  (default 6 months × monthly withdrawal, configurable).
+  Withdrawals divert to SGOV cascade regardless of CB state. Triggered
+  by FI shortage even when Growth lookback signals are nominal.
+- **Portfolio-low alert** — Core portfolio (Growth + FI, excluding
+  buffer and cash) has dropped below ruleset-configured threshold
+  (default `max($50K, 18 × monthly_withdrawal)`). Withdrawals divert
+  to SGOV cascade. Rebalancing suspended. SGOV refill suspended (do
+  not drain a tiny portfolio further). Alert fires on activation and
+  persists at weekly cadence until cleared. Auto-clears with
+  hysteresis when core portfolio rises above threshold + 10%. This
+  guard exists primarily to protect early Phase 1 (when cumulative
+  Roth conversions have not yet built core size) and Phase 3 Year 1
+  (small surviving portfolio); see §2.9.
+
+The cascade target (SGOV → FI → Growth) is identical regardless of
+which path activated it (CB2).
+
+### 3.10a Income state
+
+Independent of CB state and Phase, the system maintains an **income
+state** that controls whether scheduled withdrawals execute:
+
+- **Active** — scheduled withdrawals execute per the active phase's
+  withdrawal calculation.
+- **Paused** — scheduled withdrawals are zero. All other system
+  behavior continues normally (rebalancing, CB transitions, refill,
+  alerts, annual reviews including freeze evaluation).
+
+Income state is controlled by the STOP INCOME hardware token (§10),
+with **AND semantics across both CL260 boxes** (both boxes must
+report tokens inserted to enter PAUSED state; both must report
+removed to return to ACTIVE; mismatched readings hold previous state
+per §10.5). In Phase 2, the income state is irrelevant (no scheduled
+income exists to pause); state changes are logged but produce no
+behavior change.
+
+When income resumes after a pause, the schedule continues as if it
+had never paused — see §4.4 for resume semantics.
+
+### 3.11 Signal: Synthetic Growth Lookback
+
+Defined in detail in §5. A scalar value representing the fractional
+change of a synthetic equal-weighted Growth-bucket price index over
+the configured lookback window (default 6 months, weekly cadence).
+Sign convention: negative = drawdown.
+
+### 3.12 Plan
+
+A structured, serializable description of what the system intends to
+do this cycle. Plans contain zero or more entries of these types:
+
+- **Order** — buy or sell N shares of symbol S in bucket B
+- **Withdrawal** — deliver $X via ACH; includes source breakdown
+  `[(symbol, dollar_amount, share_count), ...]`, ACH destination,
+  scheduled settlement date (see §7.3.3)
+- **BufferRefill** — buy $X SGOV, sourced from selling $X of symbol(s)
+  S (Growth-only sourcing per §7.4)
+- **CashRefill** — buy or sell $X to bring cash buffer toward target
+- **LargeCashDeployment** — coordinated multi-position BUY batch
+  deploying a large cash surplus across underweight core positions
+  in one cycle. Triggered when cash surplus exceeds the
+  large-deployment threshold (§7.7.1); typical case is Phase 1
+  annual Roth conversion inflows. Distinct from CashRefill (small
+  rounding) and PhaseTransition (allocation reset).
+- **PhaseTransition** — coordinated batch of liquidations and rebalances
+  to transition asset allocation (§7.2)
+- **CBStateTransition** — change CB state (logged but not itself an
+  external action; appended to CB transition log)
+- **ACHScheduleUpdate** — update IBKR's recurring monthly ACH amount
+  (e.g., $0 on STOP INCOME pause, restored on resume, updated annually
+  at annual review)
+- **Alert** — dispatch notification. Alert entries are dispatched at
+  end-of-cycle, after the other entries have completed or failed
+  (§8.2.8). The Alert entry's content can include actual outcomes
+  (e.g., "BUY 23 SGOV — filled at $112.45"), and alert dispatch is
+  *itself* not gated on action success — a cycle that failed
+  mid-execution still dispatches its alerts so the operator learns
+  about the failure.
+
+A plan is generated by the decision layer and consumed by the action
+layer. An empty plan ("do nothing this cycle") is the most common
+outcome.
+
+### 3.13 Schedule state
+
+For each income-producing phase (1 and 3), the system maintains a
+durable **schedule state** that fully determines scheduled monthly
+income for any year:
+
+```
+schedule_state = {
+    I_0:           Decimal,    # starting monthly income, base year USD
+    trigger_year:  int,        # year I_0 was set
+    cpi:           Decimal,    # annual CPI rate (0.03 P1, 0.04 P3)
+    frozen_years:  list[int],  # years for which CPI raise was skipped
+}
+```
+
+Phase 1 instance at program start: `(3000, 2027, 0.03, [])`.
+Phase 3 instance at trigger: `(computed_I_0, trigger_year, 0.04, [])`.
+
+Current scheduled monthly income for year Y is computed as:
+
+```
+n_raises_applied = (Y - trigger_year)
+                   - count(Y' in frozen_years where trigger_year+1 ≤ Y' ≤ Y)
+scheduled_monthly = I_0 × (1 + cpi)^n_raises_applied
+```
+
+The range `trigger_year+1 ≤ Y' ≤ Y` is **inclusive on both ends**.
+This is a pure function of the immutable triplet plus calendar year.
+The withdrawal layer reads the current scheduled value; it does not
+re-derive freeze decisions.
+
+### 3.14 Invariants
+
+Properties that must always hold true. Tested in §13.5.
+
+- **I1:** The buffer bucket is never included in core portfolio calculations.
+- **I2:** The cash bucket is never included in core portfolio calculations.
+- **I3:** Non-allowlisted holdings never appear in any IRAPM calculation,
+  plan, or alert.
+- **I4:** During CB1, CB2
+  states, no rebalancing trade touches Growth.
+- **I5:** FI is never sold to fund a Growth purchase (FI sacrosanct).
+  This applies to **rebalancing trades**. It does not apply to
+  withdrawals (see §7.3.2 for cascade semantics) or to cash refills
+  (FI → cash is permitted regardless of size).
+- **I6:** SGOV buffer is never used for anything other than
+  cascade-sourced withdrawals or operator-authorized non-recurring
+  expenses.
+- **I7:** A withdrawal action and a buffer-refill action cannot coexist
+  in the same plan in opposite directions on the same symbol.
+- **I8:** Plan generation is deterministic given identical input state.
+- **I9:** An invalid configuration prevents system startup; it never causes
+  silent fallback to defaults.
+- **I10:** SGOV buffer refill is suspended whenever the
+  portfolio-low alert threshold is crossed. The system does not drain
+  a depleted core portfolio to refill the buffer.
+- **I11:** Inflows to the managed account (deposits, conversions,
+  rollovers) are never initiated by IRAPM. The system only reacts to
+  cash that appears.
+- **I12:** Every position in the active phase's allowlist maintains a
+  market value ≥ `position_residual_minimum_dollars`. The system
+  never sells a position below this floor. Cascade and refill SELL
+  decisions are clamped at the residual floor; if the floor is
+  reached, the position is treated as exhausted-for-this-cycle and
+  any remaining demand cascades to the next stage.
+- **I13:** Phase transitions may liquidate a position to zero only if
+  the position appears in NO allowlist of any future-reachable phase
+  from the post-transition phase. Equivalently: liquidation is
+  permitted iff the position is permanently retired across all
+  reachable future system states. Positions that may be needed in a
+  future phase (e.g., PYLD/JPIE during Phase 2, in case Phase 3
+  activates) are held at `position_residual_minimum_dollars` instead
+  of being liquidated. This is the deliberate, audited exception
+  to I12 — and the rule for when the exception applies. See §7.2
+  for the per-transition liquidation table.
+- **I14:** During CB1 (not in CB2), withdrawals are sourced
+  exclusively from the FI bucket. Growth is never sold for
+  withdrawals during CB1. (This narrows I5: rebalancing trades are
+  symmetrically constrained, withdrawals during CB1 are
+  asymmetrically constrained against Growth.)
+- **I15:** If `phase == PHASE_3` then either `schedule_state.phase3`
+  is non-null, OR the Phase 3 transition cycle has not yet executed
+  (the latched-but-pending window per §4.3). The decision layer
+  treats this window as transition-pending and suppresses withdrawal
+  and rebalance actions until the transition cycle runs. This
+  invariant defends against the race condition where the Phase 3
+  latch fires (writing `phase = PHASE_3` to state) but the next
+  weekly cycle that initializes `schedule_state.phase3` has not yet
+  run. Any cycle that fires in the latch-vs-transition window must
+  detect this state and defer all withdrawal/rebalance work to the
+  transition cycle. See §7.3 for the withdrawal suppression rule and
+  §7.5.1 for the rebalance suppression rule.
+
+---
+
+## §4. Phase Model
+
+The system's operating mode is determined by **two independent
+dimensions**:
+
+1. **Phase** — Phase 1, Phase 2, or Phase 3. Determines asset
+   allocation, withdrawal calculation, and which subsystems are active.
+2. **Income state** — Active or Paused. Controlled by the STOP INCOME
+   token mechanism (§10). Orthogonal to Phase: a Phase 1 system can
+   have income paused; a Phase 3 system can have income paused.
+   Income state is a no-op in Phase 2 (which has no income to pause).
+
+This decoupling is deliberate. The original "Phase" concept conflated
+several axes; separating them prevents the conflation-class bugs that
+plagued IPM v1.
+
+### 4.1 Phase definitions
+
+#### Phase 1 — Income Production (2027-01-01 onward, until 2035-01-01 transition)
+
+The system's primary income-production mode, active from program start
+(operator's retirement date) until Social Security filing.
+
+- **Active withdrawals:** governed by schedule_state
+  `(phase1_initial_monthly_dollars, phase1_trigger_year, inflation_rate, [])`
+  per §3.13. Defaults: initial monthly withdrawal $3000 in 2027 USD;
+  raised 3% annually unless frozen by the annual review (§7.6).
+- **Allocation:** Growth (FBCG, AVUV) + Fixed Income (PYLD, JPIE) per
+  configured target weights.
+- **Rebalancing:** 5/25 weekly check, active unless suppressed by CB
+  state.
+- **Withdrawal sourcing (CB_INACTIVE):** most-overweight core position first
+  (any bucket), then proportionally from FI buckets.
+- **Withdrawal sourcing (CB1):** most-overweight FI position first, then
+  proportionally from remaining FI. Growth never sold for withdrawals
+  during CB1.
+- **Withdrawal sourcing (cascade):** SGOV → FI → Growth, when triggered
+  by CB2 guard.
+- **SGOV buffer target:** 24 × current monthly withdrawal (§3.6).
+- **SGOV refill rate:** target / 12 per month (recomputed annually).
+- **Cash buffer target:** `current_monthly_withdrawal + $1000` (§3.7).
+
+#### Phase 2 — Pure Growth (2035-01-01 onward, until Phase 3 trigger or indefinitely)
+
+After Social Security filing establishes a non-portfolio income floor
+that covers all baseline expenses, the system transitions to pure
+growth-accumulation mode. The portfolio no longer needs to fund living
+expenses, so the FI back-end's role changes from income engine to
+opportunistic dry powder.
+
+- **Withdrawals:** halted. The system performs no scheduled withdrawals.
+- **Allocation:** 90% Growth (FBCG, AVUV), 10% FI (GBIL).
+- **FI substitution:** PYLD and JPIE are drawn down to
+  `position_residual_minimum_dollars` (not liquidated, per I13);
+  GBIL is bought as new position. See §7.2.1.
+- **Rebalancing:** standard 5/25 does NOT apply. Rebalancing is
+  triggered opportunistically when Growth lookback ≤ -10%, at which
+  point GBIL is deployed to buy the most-underweight Growth holding
+  (§7.5.2).
+- **Circuit breakers:** the CB1/CB2 framework does not apply in Phase 2.
+  The single trigger is the opportunistic-rebalance threshold above.
+- **SGOV buffer:** maintained as emergency reserve. The buffer carries
+  forward at its end-of-Phase-1 dollar value (no recompute since there
+  is no current monthly withdrawal to reference). It is not redeployed
+  at phase transition and not used for any scheduled purpose. It exists
+  to absorb (a) Phase 3 activation if it occurs, and (b) major
+  non-recurring expenses authorized by the operator (new roof, vehicle
+  replacement, medical event). Refill is triggered whenever buffer
+  market value < target (§7.4); refill rate stays frozen at the
+  end-of-Phase-1 value (no annual recompute in Phase 2).
+- **Cash buffer target:** $1000 (transaction reserve only; no
+  withdrawal float needed).
+- **STOP INCOME token state:** no-op. Token state changes are logged
+  for audit but produce no behavior change.
+
+#### Phase 3 — Survivor Income (event-triggered, indefinite duration)
+
+Phase 3 is **structurally Phase 1 reactivated** with different asset
+allocation, different withdrawal calculation, and a much longer
+horizon. It activates only on physical removal of all four Phase 3
+hardware tokens (see §10). Once activated and the 24-hour grace window
+elapses, Phase 3 is permanent — there is no transition out.
+
+**Inherits from Phase 1 (unchanged):**
+
+- CB framework (CB_INACTIVE, CB1, CB2)
+- Synthetic Growth Lookback signal (§5)
+- 2-week CB confirmation, hysteresis (CB1 +2%, CB2 +5%), 90-day timer
+  trigger (60 days)
+- SGOV buffer mechanism (target = 24 × current monthly withdrawal,
+  recomputed at Phase 3 trigger and at each annual review)
+- Cash buffer mechanism (target = `current_monthly_withdrawal + $1000`)
+- Withdrawal sourcing logic (most-overweight first per CB state, then
+  proportional FI; cascade when triggered; SGOV → FI → Growth identical
+  sequence)
+- Rebalancer / buffer refill / cash refill subsystem separation
+- Schedule state structure (§3.13) and annual freeze evaluation (§7.6)
+- Decision/action separation, determinism, money discipline,
+  fail-safe defaults
+
+**Overrides Phase 1 (replaces):**
+
+- **Asset allocation:** 50% Growth / 50% Fixed Income, default
+  25/25/25/25 across FBCG/AVUV/PYLD/JPIE (provisional, simulator-tunable
+  per §14).
+- **Withdrawal calculation:** adaptive starting income `I_0` computed
+  once at Phase 3 trigger as a function of portfolio value, bounded by
+  a floor and ceiling (see §4.1.1 below).
+- **Schedule state:** `(I_0, trigger_year, 0.04, [])`. Post-trigger CPI
+  raise is 4% annually, with freeze logic skipping raises in years where
+  CB1+ was active for ≥ 30 days during the prior calendar year (§7.6).
+- **Per-month payment ceiling:** monthly withdrawal is additionally
+  clamped at `current_portfolio × 7.5% / 12` to prevent
+  over-distribution during deep drawdowns. This clamp applies every
+  month regardless of CPI scheduling. *Phase 3 only — Phase 1 has no
+  such clamp; Phase 1 relies on the Portfolio-low alert guard for the
+  depletion case.*
+- **Horizon:** designed for 27 years (vs Phase 1's 8). Affects
+  validation choices but not runtime behavior.
+
+**Adds to Phase 1 (new in Phase 3):**
+
+- Token-based activation trigger with 24-hour grace window for
+  accidental removal.
+- Indefinite duration — Phase 3 has no scheduled exit.
+- Permanent latch after grace window elapses; subsequent token
+  manipulation has no effect.
+- STOP INCOME token is meaningful (toggleable income pause —
+  see §4.4).
+
+**Reference note.** Earlier drafts deferred Phase 3 financial-concept
+authority to `PHASE_3_DESIGN.md`. That document is now **deprecated**;
+its useful concepts and the sustainable-withdrawal math have been
+imported into this specification (§4.1.1). IRAPM is self-contained
+for Phase 3 implementation.
+
+#### 4.1.1 Phase 3 starting income calculation
+
+When Phase 3 triggers in year `T`, the starting monthly income `I_0`
+is computed via a 30-year finite-horizon annuity sustainability
+formula using `P`, the current portfolio value at the moment the
+transition cycle executes (post-cascade if applicable per §4.2):
+
+```
+I_0 = P × (r - i) / (12 × (1 - ((1 + i) / (1 + r)) ** N))
+```
+
+Where:
+- `r = phase3_i0_calc_return_assumption` (default `0.06`)
+- `i = phase3_i0_calc_inflation_assumption` (default `0.04`)
+- `N = phase3_i0_calc_horizon_years` (default `30`)
+
+These calculation-side parameters are **deliberately conservative**:
+the assumed return is lower than the historical equity-heavy average
+(~7%) and the assumed inflation is higher than the canonical
+`inflation_rate` (3.5%). Using a pessimistic combination produces a
+lower `I_0`, leaving the survivor cushion against actual conditions
+diverging from assumptions.
+
+The values of `I_0` and `trigger_year = T` are persisted to Phase 3
+schedule state (§3.13) along with an empty `frozen_years` list.
+Subsequent annual reviews (§7.6) may append to `frozen_years` but
+never to `I_0`.
+
+##### 4.1.1.1 Annual raises after activation
+
+After latch, scheduled monthly withdrawal grows at the canonical
+`inflation_rate` (default `0.035`) per year, applied annually at the
+trigger anniversary. The Phase 3 freeze mechanism remains active
+across the indefinite Phase 3 horizon — the annual review may decide
+to freeze a year's raise based on prior-year CB1+ days
+(`freeze_evaluation_threshold_days`, default 30). Frozen years are
+appended to `frozen_years` and permanently excluded from the
+`n_raises_applied` count.
+
+The scheduled monthly withdrawal for any year `Y > T` is:
+
+```
+n_raises_applied = count of years in range(T + 1, Y + 1)
+                   NOT in frozen_years
+scheduled_monthly = I_0 × (1 + inflation_rate) ** n_raises_applied
+```
+
+##### 4.1.1.2 Per-cycle payment ceiling
+
+Every Phase 3 cycle, the actual monthly withdrawal is clamped:
+
+```
+actual_monthly = min(scheduled_monthly,
+                     current_portfolio_value × phase3_monthly_payment_ceiling_rate / 12)
+```
+
+Where `phase3_monthly_payment_ceiling_rate` defaults to `0.075`
+(7.5% annualized). If the ceiling binds — i.e., the scheduled
+monthly would exceed `portfolio × 0.075 / 12` — the system pays the
+ceiling and emits a `monthly_payment_ceiling_bound` Notice alert. No
+other state is affected by the ceiling binding: the schedule
+continues unchanged, the freeze evaluation is not triggered, and the
+next month re-runs the same clamp against the new portfolio value.
+
+The ceiling protects the corpus against several failure modes
+simultaneously:
+- `I_0` calibrated against a temporarily-inflated portfolio at latch
+- Portfolio drawdown after latch outpacing scheduled raises
+- Compounding inflation raises eventually outstripping the corpus
+
+In normal operation the ceiling does not bind. It is a safety clamp,
+not a target.
+
+##### 4.1.1.3 Implementation summary
+
+The Phase 3 transition cycle performs the following in order
+(see §4.3 for the general transition mechanism):
+
+1. Read portfolio value `P` after any cascade settlement.
+2. Compute `I_0` from the annuity formula above using `P` and the
+   three `phase3_i0_calc_*` parameters.
+3. Persist Phase 3 schedule_state: `(I_0, trigger_year=T, cpi_rate=inflation_rate, frozen_years=[])`.
+4. Recompute Phase 3 buffer target = `sgov_buffer_target_months × I_0`;
+   refill rate = `target / 12`; cash target = `I_0 + cash_buffer_offset_dollars`.
+   Persist via `buffer_state`.
+5. Emit `phase3_activation` Critical alert including: `I_0`, `P`,
+   the three calculation-input parameters, the resulting initial
+   withdrawal rate (`12 × I_0 / P` as percentage of portfolio).
+
+##### 4.1.1.4 Reference values (illustrative, not normative)
+
+Using default parameters (`r=0.06`, `i=0.04`, `N=30`):
+
+```
+I_0 / P = (0.06 - 0.04) / (12 × (1 - (1.04/1.06) ** 30))
+        = 0.02 / (12 × (1 - 0.5635))
+        = 0.02 / 5.238
+        ≈ 0.003818
+```
+
+So `I_0` is approximately `0.382%` of portfolio value per month
+(`~4.58%` annualized initial withdrawal rate, well below the 7.5%
+ceiling). Sample values:
+
+| Portfolio at latch | `I_0` (monthly) | Year-30 nominal |
+|---|---|---|
+| $500,000 | $1,909 | $5,357 (≈$1,640 in 2026 USD at 3.5% inflation) |
+| $750,000 | $2,864 | $8,035 |
+| $1,000,000 | $3,818 | $10,714 |
+| $1,500,000 | $5,727 | $16,071 |
+
+The year-30 nominal column assumes no freezes (all 30 annual raises
+apply). With freezes, the nominal stream is correspondingly lower.
+
+#### 4.1.2 Inflation rate
+
+A single canonical `inflation_rate` (default `0.035`) applies to all
+annual withdrawal raises across Phase 1 and Phase 3. This replaces
+the prior three-rate scheme (Phase 1 / Phase 3 pre-trigger / Phase 3
+post-trigger) for simplicity — three rates produced bookkeeping
+complexity without meaningfully different behavior, since the
+realized inflation environment dominates whichever spec rate is
+chosen.
+
+The Phase 3 I_0 calculation uses a separate higher rate
+(`phase3_i0_calc_inflation_assumption`, default `0.04`) as a
+deliberately-pessimistic input to the one-time sustainability
+formula at latch. This is not an inflation prediction; it is a
+safety buffer that produces a lower I_0 than canonical inflation
+would suggest, leaving room for actual inflation to exceed 3.5%.
+
+### 4.2 Phase transition triggers
+
+Phase transitions use different mechanisms depending on the
+transition, reflecting their fundamentally different natures:
+
+#### Phase 1 → Phase 2: calendar-date trigger
+
+The transition occurs on the configured calendar date. The first
+Phase 2 cycle runs on **2035-01-01** (exactly 8 years after
+program start on 2027-01-01). The final Phase 1 cycle is the last
+weekly cycle preceding 2035-01-01.
+
+Calendar-date trigger (rather than state-based) is deliberate:
+- **Predictability.** The operator knows exactly when the strategy
+  changes.
+- **Decoupling from market noise.** A bear market in late 2034 should
+  not delay the filing of Social Security in 2035.
+- **Auditability.** The transition is a single event with a single
+  cause, easy to log and verify.
+
+#### Phase 1 or Phase 2 → Phase 3: token-triggered (no scheduled date)
+
+Phase 3 activation occurs on physical removal of all four Phase 3
+hardware tokens, confirmed across both CL260 boxes (AND semantics).
+After the 24-hour grace window elapses without re-insertion, Phase 3
+**latches permanently** — the phase indicator is updated and the
+`phase3_activation` Critical alert fires. The transition cycle
+(asset reallocation, I_0 calculation) executes on the next weekly
+cycle, **regardless of cascade or guard state**. The Phase 3
+transition is a one-time allocation reset, not a rebalance, so
+there is no reason to defer it for market conditions. If cascade
+conditions are present at or after transition, Phase 3's withdrawal
+sourcing (§7.3.2) handles them — the cascade machinery is
+phase-agnostic in Phase 1 and Phase 3.
+
+I_0 is computed against the portfolio value at the moment the
+transition cycle executes, not at the moment of latch. Since the
+transition cycle runs within at most 7 days of latch (typically
+within 24-48 hours), the I_0 reflects the portfolio value at
+transition time.
+
+See §10 for the full token mechanism; §6 for phase machine semantics.
+
+Phase 3 may be triggered from either Phase 1 or Phase 2:
+- **Phase 1 → Phase 3:** operator died during the income-production
+  years before SS filing.
+- **Phase 2 → Phase 3:** operator died after SS filing but before any
+  natural Phase 2 exit.
+
+The transition mechanic is the same in both cases (see §4.3); only
+the starting allocation differs (Phase 1 holdings vs Phase 2
+holdings being liquidated and re-allocated to Phase 3 targets).
+
+### 4.3 Phase transition mechanics
+
+A phase transition is a planned, executable action. The general
+sequence is:
+
+1. **Pre-transition validation.** For Phase 1 → Phase 2 (calendar):
+   on the last weekly cycle that falls at least 5 trading days
+   before the transition date (typically 7-14 calendar days prior,
+   depending on how the transition date falls relative to the
+   weekly schedule), verify the transition can be executed cleanly
+   (positions reconcilable, broker reachable, incoming-phase
+   configuration valid). Alert operator on any failure. Earlier
+   drafts specified "T-7 days" but no cycle type lands at exactly
+   T-7 unless the weekly schedule happens to coincide; the
+   operative requirement is that the validation runs **at least 5
+   trading days** before transition so the operator has time to
+   respond to any failure surfaced. The validation does NOT
+   pre-check cascade exhaustion; cascade exhaustion is handled
+   separately as its own Critical-blocking failure (§11.2.7) and
+   does not gate normal phase transition. Phase 3 transitions skip
+   this step (no advance notice possible).
+2. **Pending-confirmation discard.** Any pending state-machine
+   confirmation in the outgoing phase (CB1 or CB2 mid-confirmation
+   in Phase 1; Phase 2 opportunistic swing mid-confirmation) is
+   discarded. The incoming phase starts with no inherited pending
+   transitions.
+3. **Final outgoing-phase cycle.** The last cycle under the outgoing
+   phase's rules executes normally. Final state is logged in detail.
+4. **Transition cycle.** On the transition date / activation event:
+   - Liquidate or draw-to-residual positions per the per-transition
+     liquidation table (§7.2).
+   - Compute target allocation under the incoming phase.
+   - Rebalance to incoming target allocation in a single coordinated
+     plan. (Large Rebalance alert always fires.)
+   - For Phase 3 transitions: compute and persist `I_0`,
+     `trigger_year`, initial empty `frozen_years` list.
+   - Update internal phase indicator and (for Phase 3) latch the
+     phase as permanent.
+5. **First incoming-phase cycle.** Run normally under new phase rules.
+
+**Phase 3 transitions** have an additional pre-step: the **24-hour grace
+window** (see §4.2 and §10.7). The transition cycle (step 4) runs
+on the next weekly cycle after the grace window elapses without
+re-insertion, regardless of cascade or guard state (§4.2).
+
+**Mid-execution failures** during a transition cycle are handled by
+the action layer per §8.3: no automatic rollback, next cycle re-reads
+broker state and re-decides. A partially-transitioned state may
+require operator review (Critical alert per §8.4.5).
+
+Phase transitions are the single largest action the system performs.
+They merit detailed pre-transition simulation. The spec does NOT
+require operator confirmation at runtime (Phase 1→2 is automatic on
+its date; Phase 3 activation is by physical token removal which is
+itself the confirmation), but the pre-transition validation alert
+performed at least 5 trading days before the transition (for calendar transitions) and the 24-hour grace window
+(for Phase 3) provide intervention windows.
+
+**Low-residual edge case at Phase 1 → Phase 2.** If PYLD or JPIE
+positions are below the residual minimum at the moment of Phase 1 →
+Phase 2 transition (e.g., due to Phase 1 cascade exhaustion), the
+transition proceeds anyway. The transition plan flags the discrepancy
+in its alert; the residual draw-down step becomes a no-op for any
+already-below-residual position. The transition is not blocked.
+
+### 4.4 The orthogonal income state dimension
+
+Independent of Phase, the system has an **income state**:
+
+- **Active** — scheduled withdrawals execute per the active phase's
+  withdrawal calculation.
+- **Paused** — scheduled withdrawals are zero. All other system
+  behavior continues normally:
+  - rebalancing
+  - CB state machine
+  - SGOV refill (subject to its own gates)
+  - cash buffer maintenance
+  - alerts
+  - **annual reviews including freeze evaluation and buffer/refill
+    target recomputation** (§7.6)
+
+Income state is controlled by the STOP INCOME token (§10), which has
+AND semantics across both CL260 boxes:
+
+- Both boxes have STOP INCOME inserted → **Paused**
+- Both boxes have STOP INCOME removed → **Active**
+- Mismatch → hold previous state, alert on persistent mismatch
+
+The STOP INCOME mechanism is meaningful in **Phase 1** and **Phase 3**
+(the income-producing phases). In **Phase 2**, the token is a no-op
+because there is no scheduled income to pause; state changes are
+logged for audit but produce no behavior change.
+
+When income resumes after a pause, the schedule continues as if it
+had never paused. Specifically, the resumed monthly amount reflects
+calendar-time elapsed since trigger, including any inflation freezes
+recorded in `frozen_years` during the pause:
+
+```
+scheduled_monthly = I_0 × (1 + cpi)^n_raises_applied
+```
+
+where `n_raises_applied` counts non-frozen years from `trigger_year+1`
+through the resume year (inclusive on both ends, per §3.13).
+
+Pausing does not freeze the schedule; it merely zeroes the actual
+withdrawal during the paused period. Freezes accumulate independently
+based on CB1+ activity during the paused period, evaluated by the
+annual review on its normal Jan 15 schedule.
+
+**Worked example.** Phase 3 triggers in January 2027 with
+`I_0 = $4,000/mo`, `cpi = 0.04`:
+
+- January 2028: STOP INCOME inserted. Last paid month was December 2027
+  at $4,000/mo.
+- Pause continues through 2028, 2029, 2030, 2031.
+- 2030 has a significant market drawdown. CB1+ is active for >30 days
+  during 2030. The January 2031 annual review evaluates 2030's CB-day
+  count and freezes 2031's CPI raise. `frozen_years` becomes `[2031]`.
+- January 2032: STOP INCOME removed. Income resumes.
+
+Resumed monthly calculation:
+- Calendar years from `trigger_year+1 = 2028` through `resume_year = 2032`:
+  `[2028, 2029, 2030, 2031, 2032]` = 5 years.
+- Frozen years in that range: `[2031]` = 1.
+- `n_raises_applied = 5 - 1 = 4`.
+- `scheduled_monthly = $4,000 × (1.04)^4 = $4,679/mo`.
+
+The resumed amount is **not** $4,866 (which would be 5 raises with no
+freeze accounting), and **not** $4,000 (which would treat the pause as
+freezing the schedule). The pause defers payment of income, not
+accumulation of the schedule. The survivor's real purchasing power is
+preserved across pauses — her cost of living continued to inflate
+during the pause, and the resumed income reflects that.
+
+### 4.5 Phase-aware CB and review behavior
+
+| Phase | CB framework active? | Annual review on Jan 15? | Freeze applies? | Lookback signal used for |
+|---|---|---|---|---|
+| Phase 1 | Yes | Yes | Yes (3% raise) | Rebalance gating, withdrawal cascade triggers, annual freeze evaluation, buffer/refill target recompute |
+| Phase 2 | No | Yes (refill recompute only — but moot, refill rate frozen) | N/A (no scheduled income) | Phase 2 opportunistic swing trigger only |
+| Phase 3 | Yes | Yes | Yes (4% raise) | Rebalance gating, withdrawal cascade triggers, annual freeze evaluation, buffer/refill target recompute |
+
+The CB *state machine itself* is unchanged across Phase 1 and Phase 3;
+only the parameters of the schedule_state differ.
+
+### 4.6 Resolved questions (Phase Model)
+
+The following questions, raised during spec drafting, are now resolved:
+
+- **Phase 2 fate of SGOV buffer:** maintained as emergency reserve
+  throughout Phase 2; carries forward at end-of-Phase-1 dollar value;
+  refill triggers whenever buffer < target (no operator-authorization
+  gate); refill rate frozen at end-of-Phase-1 value.
+- **CB2 active at Phase 1 → Phase 2 calendar transition:** transition
+  proceeds normally; pending CB confirmations are discarded; Phase 2
+  has no CB machine.
+- **Phase 3 activation during active cascade:** Phase 3 latches at
+  grace expiry; transition cycle defers until cascade clears (§4.2).
+- **PHASE_3_DESIGN.md reconciliation:** **RESOLVED in v1.1 and v1.2.**
+  Useful concepts imported into IRAPM v1.1; sustainable-withdrawal
+  math imported into IRAPM v1.2 §4.1.1. PHASE_3_DESIGN.md is now
+  deprecated.
+- **Phase 3 specific FI holdings:** provisionally PYLD+JPIE, default
+  weights 25/25/25/25 across FBCG/AVUV/PYLD/JPIE; simulator-tunable
+  (§14).
+- **Annual review schedule:** Jan 15 each year; combined event
+  performing freeze evaluation (Phase 1, Phase 3) and buffer-target /
+  refill-rate / cash-target recomputation (Phase 1, Phase 3 only).
+  In Phase 2, the annual review cycle runs but performs no recompute
+  work (all targets are constants or frozen-forward; see §7.6.3).
+
+---
+
+## §5. Synthetic Growth Lookback Signal
+
+The Synthetic Growth Lookback is the single signal that drives the
+Circuit Breaker state machine. It answers one question, evaluated each
+weekly cycle:
+
+> **By what fraction has the synthetic Growth-bucket price index
+> changed over the configured lookback window, relative to its value
+> at the start of the window?**
+
+### 5.1 Design properties
+
+The signal is constructed to satisfy these properties:
+
+- **Flow-immune.** Adding or removing shares (via rebalancing,
+  dividends, withdrawals) has zero effect on the signal. Only price
+  changes move it. This prevents the system's own actions from
+  contaminating the signal that governs them.
+- **Stateless (computationally).** The signal is computed from raw
+  price data files at every cycle. No persisted index file, no
+  carryover state, no cold-start period. The signal at any historical
+  date can be re-derived identically from the price data available at
+  that date. (The persistent state file does retain the most recent
+  signal value and timestamp for staleness reporting only — not for
+  transition logic.)
+- **Allocation-agnostic in construction.** The composite is
+  equal-weighted across Growth symbols regardless of the operator's
+  actual portfolio weights. The signal measures *market conditions in
+  the Growth asset class*, not *the operator's specific Growth P&L*.
+- **Interpretable.** The output is a simple fractional change over a
+  named window. "-0.10" means the index is 10% below where it was 6
+  months ago. No log-transformation, annualization, or smoothing
+  obscures the meaning.
+- **Deterministic.** Given identical price files, the signal returns
+  identical values. No randomness, no time-of-day dependency.
+
+### 5.2 Inputs
+
+| Input | Default value | Configurable | Notes |
+|---|---|---|---|
+| Growth symbols | FBCG, AVUV | Yes (via allowlist) | Must be ≥ 1 symbol |
+| Bar cadence | Weekly | No | Matches the system's primary cycle cadence |
+| Window length | 26 weekly bars (~6 months) | Yes (`lookback_window_weeks`) | Stored as bar count, not days, to avoid weekend/holiday ambiguity |
+| Price source | Per-symbol Adj Close from data files | No | Local files in `C:\portfolio\data\` (§9.2) |
+| Staleness tolerance | 14 days | Yes (`lookback_max_staleness_days`) | Latest bar in any symbol's file must be within this many days of "now" |
+| Coverage minimum | 80% of expected bars | Yes (`lookback_min_bar_coverage_rate`) | After date alignment, surviving bars must cover at least this fraction of the window |
+
+### 5.3 Algorithm
+
+#### 5.3.1 Step 1: Load and align price data
+
+For each Growth symbol, load the price file and extract the most
+recent N+1 weekly Adj Close bars, where N = `lookback_window_weeks`. Build a
+date-keyed map of per-symbol prices:
+
+```
+date_map[date][symbol] = adj_close_price
+```
+
+Retain only **dates on which every Growth symbol has a price**. A
+missing print for any symbol on a given date drops that date from
+the window. Sort surviving dates ascending.
+
+#### 5.3.2 Step 2: Staleness and coverage gates
+
+Apply two availability checks:
+
+- **Staleness check:** the latest surviving date must be within
+  `lookback_max_staleness_days` of "now." If not, return UNAVAILABLE.
+- **Coverage check:** the count of surviving dates must be at least
+  `ceil((N+1) × min_bar_coverage_pct)`. If not, return UNAVAILABLE.
+
+UNAVAILABLE is a distinct sentinel value, distinguishable from any
+numerical signal value (including 0).
+
+#### 5.3.3 Step 3: Compute per-bar composite returns
+
+For each adjacent pair of surviving dates (t-1, t) in the window:
+
+For each Growth symbol s, compute the per-symbol simple return:
+
+```
+r[s, t] = (price[s, t] / price[s, t-1]) - 1
+```
+
+If `price[s, t-1]` is non-positive for any symbol at bar t, **skip
+the entire bar** across all symbols (do not partial-average). Log a
+warning. This is a correctness guard: a partial set of symbols would
+silently change the composite weighting.
+
+If **all** symbols' per-symbol returns computed cleanly, compute the
+equal-weighted composite return for that bar:
+
+```
+r_composite[t] = (1 / N_symbols) × Σ r[s, t]    for s in Growth symbols
+```
+
+#### 5.3.4 Step 4: Compound into a level series
+
+Initialize the level series at an arbitrary anchor:
+
+```
+L[0] = Decimal("100.0")
+```
+
+For each bar t with a valid composite return:
+
+```
+L[t] = L[t-1] × (Decimal("1") + r_composite[t])
+```
+
+The choice of 100.0 is presentational; the signal output (a ratio) is
+unaffected by the anchor value.
+
+#### 5.3.5 Step 5: Compute the signal
+
+```
+signal = (L[last] - L[0]) / L[0]
+```
+
+This is the **point-to-point fractional change** of the synthetic
+index over the window. Output as a Decimal per §2.8.
+
+### 5.4 Output specification
+
+The signal returns one of:
+
+- A **Decimal** representing fractional change (e.g., `Decimal("-0.0750")`
+  means the index has fallen 7.5% over the window).
+- **UNAVAILABLE** sentinel, when staleness or coverage gates fail.
+
+Sign convention:
+- **Negative** = Growth bucket has fallen since the start of the window.
+- **Zero** = unchanged.
+- **Positive** = Growth bucket has risen.
+
+The signal is **never** clipped, smoothed, or transformed.
+Consumers (the CB state machine) apply their own thresholds and
+confirmation logic.
+
+### 5.5 Pseudocode
+
+```
+function synthetic_growth_lookback(
+        growth_symbols,
+        lookback_weeks = 26,
+        max_staleness_days = 14,
+        min_bar_coverage_pct = 0.80,
+        as_of = today
+    ):
+
+    if growth_symbols is empty:
+        return UNAVAILABLE
+
+    # --- Step 1: Load and align ---
+    bars_per_symbol = {}
+    for s in growth_symbols:
+        bars = load_weekly_adj_close(s, count = lookback_weeks + 1)
+        if bars is empty:
+            return UNAVAILABLE
+        bars_per_symbol[s] = bars
+
+    date_map = {}
+    for s, bars in bars_per_symbol.items():
+        for bar in bars:
+            date_map[bar.date][s] = bar.adj_close
+
+    aligned_dates = sorted(
+        d for d in date_map.keys()
+        if all(s in date_map[d] for s in growth_symbols)
+    )
+
+    # --- Step 2: Gates ---
+    if (as_of - aligned_dates[last]).days > max_staleness_days:
+        return UNAVAILABLE
+
+    expected_bars = lookback_weeks + 1
+    minimum_bars  = ceil(expected_bars * min_bar_coverage_pct)
+    if length(aligned_dates) < minimum_bars:
+        return UNAVAILABLE
+
+    # --- Step 3: Per-bar composite returns ---
+    N = length(growth_symbols)
+    composite_returns = []
+
+    for t in 1 .. length(aligned_dates) - 1:
+        d_prev = aligned_dates[t - 1]
+        d_curr = aligned_dates[t]
+
+        per_symbol = []
+        bar_valid = true
+        for s in growth_symbols:
+            p_prev = Decimal(date_map[d_prev][s])
+            p_curr = Decimal(date_map[d_curr][s])
+            if p_prev <= 0:
+                log_warning("non-positive prior price for " + s + " at " + d_curr)
+                bar_valid = false
+                break
+            per_symbol.append((p_curr / p_prev) - Decimal("1"))
+
+        if bar_valid:
+            composite_returns.append(sum(per_symbol) / Decimal(N))
+
+    if composite_returns is empty:
+        return UNAVAILABLE
+
+    # --- Step 4: Compound ---
+    levels = [Decimal("100.0")]
+    for r in composite_returns:
+        levels.append(levels[last] * (Decimal("1") + r))
+
+    # --- Step 5: Signal ---
+    return (levels[last] - levels[0]) / levels[0]
+```
+
+### 5.6 Worked example
+
+Suppose Growth = {FBCG, AVUV}, `lookback_weeks = 4` (smaller for
+illustration), and these aligned weekly bars:
+
+| Date       | FBCG  | AVUV  | Per-symbol returns                  | Composite return | Level |
+|------------|------:|------:|-------------------------------------|-----------------:|------:|
+| 2026-04-04 | 100.00| 50.00 | (anchor)                            |              n/a | 100.00 |
+| 2026-04-11 | 102.00| 50.50 | FBCG: +0.0200, AVUV: +0.0100        |          +0.0150 | 101.50 |
+| 2026-04-18 | 101.00| 50.00 | FBCG: -0.0098, AVUV: -0.0099        |          -0.0099 | 100.50 |
+| 2026-04-25 |  95.00| 48.00 | FBCG: -0.0594, AVUV: -0.0400        |          -0.0497 |  95.51 |
+| 2026-05-02 |  93.00| 47.50 | FBCG: -0.0211, AVUV: -0.0104        |          -0.0157 |  94.01 |
+
+Signal output: `(94.01 − 100.00) / 100.00 = -0.0599`
+
+Interpretation: the synthetic Growth index has fallen ~6.0% over the
+4-week window. CB1 (threshold -10%) would NOT activate; the system
+would remain in CB_INACTIVE.
+
+### 5.7 Properties and non-properties
+
+**The signal IS:**
+- Determined entirely by Growth symbol price data and configuration.
+- Recomputed from scratch each cycle.
+- Unaffected by the operator's actual portfolio positions, withdrawals,
+  rebalancing trades, or dividend reinvestments.
+- A pure function of (date, price files, configuration).
+
+**The signal IS NOT:**
+- An estimate of the operator's portfolio P&L.
+- An attempt to predict future returns.
+- A trading signal in itself (it has no buy/sell semantics; it only
+  characterizes Growth-bucket conditions).
+- Smoothed, filtered, or trend-fit. (Smoothing happens downstream in
+  the CB confirmation window logic, not here.)
+- Annualized. A -0.10 over 6 months is reported as -0.10, not as a
+  -20% annualized rate.
+
+### 5.8 Failure modes
+
+| Failure | Detection | Response |
+|---|---|---|
+| Price file missing | Load step | UNAVAILABLE; alert operator (data refresh needed) |
+| Price file stale | Staleness gate | UNAVAILABLE; alert operator |
+| Insufficient aligned bars | Coverage gate | UNAVAILABLE; alert if persistent (>1 cycle) |
+| Non-positive prior price for a symbol | Per-bar guard | Skip bar, log warning, continue |
+| All bars skipped | Empty composite_returns check | UNAVAILABLE |
+| Symbol added/removed from Growth allowlist mid-history | Configuration change | Recomputed from scratch (stateless); no migration needed |
+
+When the signal is UNAVAILABLE, the CB state machine **does not
+transition** — current CB state holds. The system does not "guess"
+or use a stale value.
+
+---
+
+## §6. State Machine
+
+This section formalizes every state the system maintains, every
+transition between states, and the rules governing interaction
+between independent state machines. The system maintains **four
+parallel state machines** that together describe its complete
+operating mode at any instant:
+
+1. **Phase machine** — Phase 1 / Phase 2 / Phase 3
+2. **Income state machine** — Active / Paused
+3. **CB machine** — CB_INACTIVE / CB1 / CB2
+4. **Guard machines** — FI-low alert (on/off) and Portfolio-low alert
+   (on/off), each independent of CB and of each other
+
+These machines are **mostly independent** but with defined interactions
+specified below. The complete operating state at any moment is the
+6-tuple:
+
+```
+(phase, income_state, cb_state)
+```
+
+Master/slave coordination role (MASTER / SLAVE_SLEEPING /
+SLAVE_PROMOTION_PENDING / STARTING) is per-box infrastructure and is
+**not** part of the operating-mode tuple — two boxes with different
+roles run identical strategy decisions.
+
+### 6.1 Phase machine
+
+States: `PHASE_1`, `PHASE_2`, `PHASE_3`.
+
+Transitions:
+
+| From | To | Trigger | Reversible? |
+|---|---|---|---|
+| PHASE_1 | PHASE_2 | Calendar date 2035-01-01 reached | No |
+| PHASE_1 | PHASE_3 | Phase 3 token activation, 24-hour grace elapsed | No |
+| PHASE_2 | PHASE_3 | Phase 3 token activation, 24-hour grace elapsed | No |
+| PHASE_3 | (none) | (terminal) | N/A |
+
+There is no PHASE_2 → PHASE_1 transition. There is no PHASE_3 →
+anything transition. Phase progression is monotone.
+
+Phase 3 transitions latch the phase indicator at grace expiry. The
+transition cycle (asset reallocation, I_0 calculation) executes on
+the next weekly cycle after latch, regardless of cascade or guard
+state (§4.2, §10.6.3).
+
+Phase transitions execute the mechanic specified in §4.3.
+
+### 6.2 Income state machine
+
+States: `ACTIVE`, `PAUSED`.
+
+Transitions:
+
+| From | To | Trigger | Reversible? |
+|---|---|---|---|
+| ACTIVE | PAUSED | Both boxes report STOP INCOME inserted (AND semantics) | Yes |
+| PAUSED | ACTIVE | Both boxes report STOP INCOME removed (AND semantics) | Yes |
+
+Mismatch behavior: if the two boxes disagree on STOP INCOME state,
+the income state machine **holds its previous state** until the boxes
+agree. See §10 for token mechanics and mismatch alerting.
+
+Phase interaction: in `PHASE_2`, transitions of the income state
+machine are recorded for audit but produce no behavioral change
+(no scheduled income exists to pause or resume). The state machine
+itself still tracks transitions correctly so that if Phase 3
+activates while STOP INCOME is inserted, the system enters Phase 3
+already in PAUSED state.
+
+### 6.3 CB machine
+
+States: `CB_INACTIVE`, `CB1`, `CB2`.
+
+The CB machine is **only active in Phase 1 and Phase 3**. In Phase 2,
+the CB machine is suspended (state held at CB_INACTIVE, no transitions
+evaluated, no behavior dependent on it).
+
+Per-cycle evaluation (when active):
+
+1. Compute current Synthetic Growth Lookback signal (§5).
+2. If signal is UNAVAILABLE: no transition this cycle (current state
+   holds).
+3. Otherwise apply transition rules below.
+
+#### 6.3.1 Activation transitions (require 2-week confirmation)
+
+| From | To | Activation condition | Confirmation |
+|---|---|---|---|
+| CB_INACTIVE | CB1 | Signal ≤ -10% (configurable: `cb1_threshold_rate`) | Signal must remain ≤ -10% for 2 consecutive weekly cycles |
+| CB1 | CB2 | Signal ≤ -20% (configurable: `cb2_threshold_rate`) | Signal must remain ≤ -20% for 2 consecutive weekly cycles |
+| CB_INACTIVE | CB2 | Signal ≤ -20% directly without prior CB1 | Signal must remain ≤ -20% for 2 consecutive weekly cycles |
+
+A "consecutive weekly cycle" means the most recent N successful signal
+computations all met the threshold. Cycles where the signal was
+UNAVAILABLE do **not** count toward confirmation (they neither advance
+nor reset the count). Cycles where the signal was available but did
+not meet the threshold reset the count to zero.
+
+#### 6.3.2 Deactivation transitions (require 2-week confirmation + hysteresis)
+
+| From | To | Deactivation condition | Confirmation |
+|---|---|---|---|
+| CB1 | CB_INACTIVE | Signal ≥ -10% + 2% = -8% (configurable: `cb1_recovery_buffer_rate`) | Signal must remain ≥ -8% for 2 consecutive weekly cycles |
+| CB2 | CB1 | Signal ≥ -20% + 5% = -15% (configurable: `cb2_recovery_buffer_rate`) AND signal still ≤ -10% | Signal must remain in this band for 2 consecutive weekly cycles |
+| CB2 | CB_INACTIVE | Signal ≥ -8% (i.e., satisfies both CB2→CB1 and CB1→CB_INACTIVE deactivation simultaneously) | Signal must remain ≥ -8% for 2 consecutive weekly cycles |
+
+The CB2 → CB_INACTIVE direct path exists for sharp recoveries that clear both
+thresholds in one move. The system does not require a "stop at CB1"
+intermediate; it transitions directly to whichever state the signal
+permits.
+
+#### 6.3.3 CB1 → CB2 timer transition
+
+The CB1 → CB2 transition has two trigger paths:
+
+1. **Signal-based path.** Signal ≤ `cb2_threshold_rate` for
+   `confirmation_window_weeks` consecutive weekly cycles. Standard
+   pending-transition logic applies (see §6.3.1).
+
+2. **Timer-based path.** When CB1 has been continuously active for
+   ≥ `cb1_to_cb2_timer_days` days (default 90), transition to CB2
+   fires immediately on the next cycle. No additional signal check;
+   no confirmation window — the timer itself is the trigger. This
+   path captures the "long grinding drawdown" scenario where the
+   signal sits in CB1 territory for months without ever falling
+   deep enough to trip the cb2 signal threshold.
+
+- **Timer mechanics.** The CB1-active timer is `now -
+  cb1_active_timer_started_at`. The timer resets to zero whenever
+  CB1 is freshly entered from CB_INACTIVE (does not accumulate
+  across episodes). The timer is cleared when state becomes
+  CB_INACTIVE or CB2.
+- **Persistence across phase transitions.** At Phase 1 → Phase 3
+  transition, the CB1 timer continues accumulating. The timer
+  measures market depression duration, which is a property of
+  market conditions independent of phase.
+
+This design replaces the prior **CB1 → CB2 timer transition derived sub-state**.
+The simplification merges "long CB1" into CB2 directly, so there is
+exactly one CB state machine path through `CB_INACTIVE → CB1 → CB2`,
+with two independent triggers for the second transition.
+
+### 6.4 Low-resource alerts
+
+Two simple alert thresholds — neither persists state, neither has
+cascade-routing side effects. Replaces the prior FI-low alert and
+Portfolio-low alert guard state machines. The §11.3 operational pause
+framework + `position_residual_minimum_dollars` floors handle actual
+sale-prevention at the depletion edge; these alerts give the operator
+advance warning.
+
+#### 6.4.1 FI low alert
+
+- **Activation:** core FI bucket value < `fi_low_alert_threshold_months` (default threshold: 6 months,
+  configurable). Evaluated each cycle. No confirmation window —
+  the threshold is a hard floor.
+- **Re-fire cadence:** weekly while condition persists.
+- **Self-clear:** alerting stops when FI value returns above threshold.
+  No separate deactivation alert.
+- **Phase scope:** active in Phase 1 and Phase 3. Held off in Phase 2
+  (no scheduled withdrawals; FI depletion has no operational meaning).
+
+#### 6.4.2 Portfolio low alert
+
+- **Activation:** core portfolio value (Growth + FI, excluding buffer
+  and cash) < `max(portfolio_low_alert_floor_dollars,
+  portfolio_low_alert_floor_months × current_monthly_withdrawal)`.
+  Defaults: $50,000 dollars / 18 months. Evaluated each cycle. No
+  confirmation window.
+- **Re-fire cadence:** weekly while condition persists.
+- **Self-clear:** alerting stops when value returns above threshold.
+- **Phase scope:** active in Phase 1 and Phase 3. Held off in Phase 2.
+
+#### 6.4.3 Why these are alerts, not guards
+
+In an earlier revision, these were stateful "guards" with cascade-
+routing side effects, hysteresis, and persistence. The §11.3
+operational pause framework (which catches order rejections at
+sale-prevented depletion) and `position_residual_minimum_dollars`
+floors (which prevent sales below the per-symbol residual) together
+provide the actual safety net at the depletion edge. The guards were
+duplicating that work with parallel state. Demoting to alerts removes
+the duplication; the alerts give the operator advance warning before
+the pause framework engages.
+
+### 6.5 Cycle evaluation order
+
+Each cycle evaluates state machines in this order. Order matters
+because some evaluations depend on outputs of earlier ones.
+
+1. **Refresh inputs.** Account positions, prices, broker connectivity,
+   token states. (Daily-token cycles refresh tokens only; see §6.5.1.)
+2. **Phase machine.** Check for calendar transition or token
+   activation. Execute transition mechanic (latch immediately at
+   grace expiry; transition cycle runs on next weekly cycle
+   regardless of cascade state, per §4.2). Subsequent steps see
+   the new phase indicator.
+3. **Income state machine.** Read STOP INCOME tokens; apply AND
+   semantics; transition Income state if both boxes agree on a new
+   value. (Mismatch holds previous state.) If Income state
+   transitioned this cycle, queue an ACHScheduleUpdate plan entry
+   for the action layer (§7.9).
+4. **Synthetic Growth Lookback signal.** Compute per §5. May return
+   UNAVAILABLE.
+5. **CB machine.** Evaluate transitions per §6.3. If signal
+   UNAVAILABLE, no transitions.
+6. **CB1 → CB2 timer transition timer update.** If currently in CB1, increment
+   timer; check threshold. If not in CB1, reset timer to zero.
+7. **Guard machines.** Evaluate FI-low alert and Portfolio-low alert
+   per §6.4. These read the current account state, not signal-derived
+   values. **Note on annual-review-day ordering:** on Jan 15 annual
+   review cycles, step 7 uses the prior year's
+   `current_monthly_withdrawal` value (the new year's value is set
+   in step 8 and applies to subsequent cycles). This is a
+   deliberate one-cycle lag — guards reflect last-year's risk
+   regime on the transition day, and shift to current-year's regime
+   starting the next weekly cycle. The risk-mismatch is bounded
+   (one cycle's worth of withdrawal at the new rate before the new
+   threshold engages, ~$3K of additional withdrawal exposure).
+8. **Annual review evaluations** (annual-review cycle only — Jan 15).
+   Run §7.6: freeze evaluation, schedule_state update, buffer-target
+   recompute, refill-rate recompute, cash-target recompute. In
+   Phase 2, this step is a no-op (all targets are constants or
+   frozen-forward; see §7.6.3).
+9. **Decision layer (§7).** Generate the cycle's plan as a pure
+   function of the resulting state.
+10. **Action layer.** Execute the plan.
+11. **Persistence.** Record state transitions, decisions, and actions
+    to logs and state file.
+12. **Alerts.** Dispatch any alerts triggered by transitions or actions.
+
+A failure at step 1 (cannot refresh inputs) aborts the cycle entirely.
+A failure at step 4 (signal UNAVAILABLE) does not abort but constrains
+later steps. A failure at step 10 (action execution) is logged, alerts,
+and the cycle ends without persisting partial state to the operating
+state file (cycle log retains the partial-execution record).
+
+#### 6.5.1 Cycle types and per-type scope
+
+Two cycle types differ in which §6.5 steps they execute:
+
+| Step | weekly | daily-token |
+|---|:---:|:---:|
+| 1. Refresh inputs (positions, prices, tokens) | full | tokens only |
+| 2. Phase machine | yes | — |
+| 3. Income state machine | yes | yes |
+| 4. Lookback signal | yes | — |
+| 5. CB machine (incl. CB1→CB2 timer eval) | yes | — |
+| 6. Annual review (date-gated: Jan 15) | yes | — |
+| 7. Monthly withdrawal (date-gated: see below) | yes | — |
+| 8. Decision layer | yes | minimal (alert-only entries) |
+| 9. Action layer | yes | yes (alerts only) |
+| 10. Persistence | yes | yes (token state to shared store) |
+| 11. Alerts | yes | yes |
+
+**daily-token** cycles are deliberately minimal — they do not query
+the broker, compute the signal, or run the decision layer. Their
+purpose is read-tokens / write-shared-state / alert-on-mismatch. This
+keeps daily token monitoring lightweight and resilient to broker or
+data-file issues.
+
+**weekly** cycles run on the configured `cycle_schedule` (default
+Wed 10:00 ET) and are the only place portfolio analysis, CB
+evaluation, rebalancing, deployment, withdrawals, annual review, or
+Phase 2 reallocation happen. Several steps within the weekly cycle
+are **date-gated** — they only execute on certain dates:
+
+- **Monthly withdrawal step.** Executes on the weekly cycle that is
+  the latest Wednesday ≤ (4 business days before the 15th of the
+  current month). This is the same weekly cycle in all months; in
+  months where the 15th is later in the week, the withdrawal may
+  place its SELL up to 10 days early. The SELL settles T+1 and the
+  cash sits in cash until the ACH pulls on the 15th — the few extra
+  days in cash carry negligible cost.
+- **Annual review step.** Executes on the weekly cycle on or after
+  the configured `annual_review_date` (default 01-15).
+- **Phase 2 semi-annual reallocation step.** Executes on the weekly
+  cycle on or after each `phase2_reallocation_dates` entry (default
+  Jan 15 and Jul 15) when phase is PHASE_2.
+- **Pre-transition validation step.** Executes on the last weekly
+  cycle falling at least 5 trading days before a scheduled Phase 1 →
+  Phase 2 transition per §4.3.
+
+In an earlier revision, monthly withdrawal, annual review, and the
+pre-transition validation were modeled as separate cycle types with
+their own schedules. Folding them as date-gated steps within the
+weekly cycle simplifies the scheduler (two scheduler entries total)
+and eliminates cycle-collision concerns.
+
+**Cycle-type collisions.** The only remaining cycle collision is
+daily-token vs. weekly on Wednesdays. They run at different times
+(daily-token early in day, weekly at the cycle_schedule time), so
+there is no actual concurrency. Each cycle reads broker/token state
+fresh at its start and writes state atomically at its end (§9.4.1).
+
+### 6.6 Composite operating mode
+
+The complete **effective operating mode** at any instant is the
+6-tuple:
+
+`(phase, income_state, cb_state)`
+
+Five elements are independent state-machine values; the sixth,
+It is included in the tuple because the effective operating mode
+(especially withdrawal sourcing) materially differs when CB1 → CB2 timer transition
+is active, so downstream logic and observability benefit from treating
+it as a discoverable mode dimension. It is **not** an independent
+state machine — there is no CB1 → CB2 timer transition persistence beyond the
+underlying CB1 state plus the timer.
+
+Most tuple combinations are reachable; a few are precluded by the
+rules above. The behaviorally-meaningful aspects of the operating
+mode are summarized below.
+
+**Active subsystems by phase:**
+
+| Subsystem | Phase 1 | Phase 2 | Phase 3 |
+|---|---|---|---|
+| Scheduled withdrawals | Yes (when ACTIVE) | No | Yes (when ACTIVE) |
+| 5/25 rebalancing | Yes (gated by CB) | No | Yes (gated by CB) |
+| Opportunistic rebalance | No | Yes (single threshold) | No |
+| Synthetic Growth Lookback | Yes | Yes | Yes |
+| CB machine | Yes | No (held CB_INACTIVE) | Yes |
+| Guards (FI-depl, Port-depl) | Yes | No (held off) | Yes |
+| SGOV buffer maintenance | Yes (target dynamic) | Yes (refill-only, target frozen) | Yes (target dynamic) |
+| Cash buffer maintenance | Yes (target dynamic) | Yes (target $1000 fixed) | Yes (target dynamic) |
+| Annual review (Jan 15) | Yes (freeze + recomputes) | Yes (no-op — all targets are constants or frozen-forward) | Yes (freeze + recomputes) |
+
+**Behavioral effects of CB / guard combinations (Phase 1 and Phase 3):**
+
+| Condition | Rebalancing | Withdrawal source | SGOV refill |
+|---|---|---|---|
+| CB_INACTIVE, no guards | Active | Most-overweight core, then proportional FI | Active when not in delay |
+| CB1 (not extended), no guards | Suspended | Most-overweight FI, then proportional FI (Growth never sold) | Active when not in delay |
+| CB2, no guards | Suspended | Cascade | Suspended |
+| Any CB + FI-low alert | Suspended | Cascade | Per CB rule (suspended in CB1-ext, CB2; active in CB_INACTIVE/CB1 if not in delay) |
+| Any CB + Portfolio-low alert | Suspended | Cascade | **Suspended** (Portfolio-low alert always suspends refill, per I10) |
+| Income state PAUSED | (unchanged) | No withdrawal scheduled | (unchanged) |
+
+The Income-state PAUSED row is intentionally orthogonal: pausing
+income does not change CB state, rebalancing, or refill behavior.
+The system continues all non-withdrawal operations normally,
+**including the annual review's freeze evaluation and recomputes**.
+
+### 6.7 State persistence
+
+The following state must persist across system restarts. Stored in
+the local state file on the master's pSLC SSD (JSON, atomic-write),
+replicated to the slave's local disk via the daily rsync per §9.4.2:
+
+- **Phase machine:** Current phase. Phase 3 grace-window timer (if
+  active).
+- **Income state:** Current ACTIVE / PAUSED.
+- **CB machine:** Current CB state. CB1-active timer (for timer-based CB1 → CB2 transition). Per-transition confirmation counters for each pending
+  CB transition.
+- **Guards:** Per-guard activation history (last activation timestamp,
+  for alert cadence management).
+- **Lookback signal:** Last successful signal value and timestamp
+  (for staleness reporting only — not for transition logic).
+- **CB transition log:** Append-only list of `(timestamp, from_state,
+  to_state, trigger_reason, cycle_id)` entries. Used by the annual
+  CPI freeze evaluation (§7.6) to compute days-in-CB1+ over the prior
+  calendar year. Retained indefinitely (small data volume — typically
+  <100 entries per year).
+- **Schedule state:** `(I_0, trigger_year, cpi, frozen_years)` per
+  §3.13. Phase 1 and Phase 3 each have their own instance (Phase 1
+  initialized at program start; Phase 3 initialized at trigger).
+- **Annual review record:** For each year, a record of
+  `(year, frozen: bool, cb1_days, cb2_days, decided_at_timestamp,
+  buffer_target, refill_rate, cash_target)`. Append-only.
+- **Phase 2 opportunistic state:** Current state of the swing (steady /
+  deployed). Only meaningful in Phase 2; cleared at Phase 3 transition.
+- **Buffer & cash targets:** Current `buffer_target_dollars`,
+  `monthly_refill_rate_dollars`, `cash_target_dollars`. Recomputed at
+  annual review; recomputed values persisted here for cycle reads.
+- **Operational pause:** `operational_pause` structure (paused bool,
+  pause_reason str, pause_started_at timestamp,
+  consecutive_pause_count int). Default
+  `{paused: false, pause_reason: null, pause_started_at: null, consecutive_pause_count: 0}`.
+  See §11.3.
+- **Withdrawal capacity:** `withdrawal_capacity_exhausted` (boolean,
+  default false). Permanent halt flag for cascade-exhausted state;
+  see §11.3.
+- **Master/slave coordination:** `master_box_id`,
+  `last_master_write_timestamp`, `master_ipv4_last_octet` in the
+  local state file (per §9.4.2 and §9.4.3, replicated to peer via
+  rsync); `role` (MASTER / SLAVE_SLEEPING / SLAVE_PROMOTION_PENDING /
+  STARTING) in per-box local-only operational state.
+- **Token observation file** (per-box, `token_observation.json`,
+  separate from the operating state file): each box's most recent
+  `(box_id, timestamp, phase3_count, stopincome_count, status)`
+  observation from its daily-token cycle (§10.3). Slave's observation
+  file is replicated to master via dedicated slave→master rsync.
+  Distinct from the operating state file precisely because slave
+  writes it; the operating state file remains master-write-only.
+
+**State that does NOT persist** (recomputed each cycle from inputs):
+
+- Account positions and values.
+- Synthetic Growth Lookback signal value (recomputed each cycle from
+  price files, per §5.1).
+- Plan content. Plans are written to the cycle log (§12.2.1) for
+  audit, not to the operating state file.
+- Allocation drift values.
+
+The state file contains *current state* only (target <10KB at any
+moment). Append-only logs (CB transition log, annual review log) are
+separate files with indefinite retention (§9.4.5). The operating
+state file holds the current snapshot needed to resume operation;
+the logs hold the history needed for audit and freeze-evaluation
+backreference. The state file is written atomically at end of cycle
+(after successful action execution and alerting). On startup, if
+the state file is missing or corrupt, the system refuses to start
+and alerts the operator (§11.2.3).
+
+### 6.8 State transition alerts
+
+Every state transition (Phase, Income, CB, guard) generates an
+alert. Alert types, severities, channels, and message templates
+are defined in the alert catalog (§12.6). The principle:
+**transitions are visible**. The operator should always be able to
+reconstruct what happened by reading alerts in chronological order.
+
+### 6.9 Resolved questions (State Machine)
+
+- **Phase 1 → Phase 2 mid-CB-confirmation:** discard pending
+  confirmation; Phase 2 has no CB machine (§4.3 step 2).
+- **CB1-active timer at Phase 3 activation:** carries forward; timer
+  measures market depression duration, independent of phase (§6.3.3).
+- **FI-low alert vs Portfolio-low alert alert ordering:** evaluated and
+  reported separately for operator visibility (§6.4.3).
+- **Phase 2 swing during Phase 3 grace window:** suspended (§7.5.2).
+- **Phase 2 swing mid-confirmation at Phase 3 activation:** discard
+  pending confirmation (§4.3 step 2).
+
+---
+
+## §7. Decision Logic
+
+This section specifies the decision layer: pure functions that
+consume the operating state (§6) and produce a structured **Plan**
+(§3.12) without performing any action. The action layer (§8)
+executes the plan.
+
+The decision layer's design philosophy is **decisions = data**:
+every decision the system makes corresponds to a serializable Plan
+entry. This makes decisions inspectable (you can log a Plan and read
+exactly what the system intended), testable (you can assert on Plans
+without executing them), and auditable (you can replay historical
+decisions from inputs and Plans).
+
+### 7.1 Top-level decision sequence
+
+Each cycle, after state evaluation (§6.5 step 7 or 8 for annual-review),
+the decision layer runs in this order. Each step may add zero or more
+entries to the Plan being built.
+
+1. **Phase transition decisions** — large rebalance, position
+   liquidation if a phase change just occurred this cycle.
+2. **Annual review decisions** (annual-review cycle only) — schedule
+   updates, target recomputes (§7.6).
+3. **Cash buffer decisions** — if cash is outside tolerance, plan a
+   refill or drawdown (§7.7).
+4. **Withdrawal decisions** — if scheduled and Income state is
+   ACTIVE, plan the withdrawal (source per §7.3).
+5. **SGOV buffer refill decisions** — if buffer is below target, in
+   the active-refill window, and not blocked by CB or guard state,
+   plan a refill batch (§7.4).
+6. **Rebalancing decisions** — if 5/25 thresholds are crossed and
+   rebalancing is not blocked by CB or guard state, plan rebalancing
+   trades (§7.5).
+
+The order matters because earlier decisions consume cash that later
+decisions might also want. Cash buffer comes before withdrawal so
+the cash bucket is at target when the withdrawal is sourced.
+Withdrawal comes before refill so the cycle's outgoing money is
+accounted for before deciding how much Growth to convert to SGOV.
+Rebalancing comes last so it sees the post-flow allocation, not the
+pre-flow allocation.
+
+A cycle's final Plan may be empty (no actions needed this cycle) or
+contain many entries. Empty plans are the most common outcome in
+quiet markets.
+
+### 7.2 Phase transition decisions
+
+When Phase machine state changed this cycle (§6.5 step 2), or a
+previously-latched Phase 3 transition is now executable (cascade
+cleared), the decision layer plans the transition. The plan
+reallocates positions between the outgoing phase's holdings and the
+incoming phase's holdings, applying the **liquidation rule** per I13:
+
+- A position appearing in the incoming phase's allowlist is
+  rebalanced to its incoming target weight.
+- A position NOT in the incoming phase's allowlist but possibly
+  needed in a future-reachable phase is **drawn down to
+  `position_residual_minimum_dollars`** (not liquidated).
+- A position NOT in the incoming phase's allowlist AND not in any
+  future-reachable phase's allowlist is **fully liquidated** (no
+  residual required).
+
+**Per-transition liquidation table:**
+
+| Position | Phase 1 | Phase 2 | Phase 3 | Phase 1→2 action | Phase 1→3 action | Phase 2→3 action |
+|---|---|---|---|---|---|---|
+| FBCG | core (Growth) | core (Growth) | core (Growth) | rebalance | rebalance | rebalance |
+| AVUV | core (Growth) | core (Growth) | core (Growth) | rebalance | rebalance | rebalance |
+| PYLD | core (FI) | not used | core (FI) | drop to residual | rebalance | refill from residual |
+| JPIE | core (FI) | not used | core (FI) | drop to residual | rebalance | refill from residual |
+| GBIL | not used | core (FI) | not used | new position (BUY) | n/a | **fully liquidate** |
+| SGOV | buffer | buffer | buffer | (continues) | (continues) | (continues) |
+
+Rationale for liquidation decisions:
+
+- **PYLD/JPIE held at residual through Phase 2** because Phase 3
+  reactivates them (Phase 3 holdings = Phase 1 holdings,
+  provisionally). Phase 3 is reachable from Phase 2.
+- **GBIL fully liquidated at Phase 2 → Phase 3** because Phase 3 is
+  terminal/latching (no transition out). GBIL appears in NO reachable
+  future phase from Phase 3, so no reason to maintain the position.
+
+#### 7.2.1 Phase 1 → Phase 2 plan
+
+- SELL PYLD down to `position_residual_minimum_dollars`. Skipped
+  if already at or below residual (no-op). The skip is recorded in
+  the cycle log (§12.2.1) and surfaced in the `large_rebalance`
+  alert's residual-exceptions section (§12.7).
+- SELL JPIE down to `position_residual_minimum_dollars` (same
+  residual-skip semantics).
+- Compute Phase 2 target allocation against post-liquidation core
+  total (FBCG + AVUV + GBIL = 100% of core, with PYLD + JPIE
+  residuals excluded from core total).
+- BUY GBIL to reach 10% of core (Phase 2 FI target).
+- Rebalance FBCG and AVUV to their Phase 2 target weights (default
+  per ruleset; sum to 90% of core).
+- Mark plan with `large_rebalance` flag.
+
+#### 7.2.2 Phase 1 → Phase 3 plan
+
+- (PYLD, JPIE, FBCG, AVUV all remain in active core. GBIL is not
+  present.)
+- Rebalance all four positions to their Phase 3 target weights
+  (default per ruleset, provisionally 25/25/25/25 — to be tuned
+  via simulator per §14).
+- Compute Phase 3 starting income `I_0` per §4.1.1 from current
+  portfolio value at the moment the transition cycle executes (not
+  at the moment of token-removal grace expiry — see §4.2).
+- Initialize Phase 3 schedule_state: `(I_0, trigger_year, CPI_POST, [])`.
+  Persist to durable state.
+- Recompute Phase 3 buffer target = 24 × I_0; refill rate = target/12;
+  cash target = I_0 + $1000. Persist.
+- Mark plan with `large_rebalance` and `phase3_activation` flags.
+
+#### 7.2.3 Phase 2 → Phase 3 plan
+
+- SELL GBIL fully (no residual — Phase 3 latches, GBIL never used
+  again).
+- Refill PYLD and JPIE from residual to Phase 3 FI target weights,
+  funded by GBIL liquidation proceeds and (if needed) Growth.
+- Rebalance FBCG and AVUV to Phase 3 target weights.
+- Compute Phase 3 starting income `I_0` and initialize schedule_state
+  as in §7.2.2.
+- Recompute Phase 3 buffer target, refill rate, and cash target as in
+  §7.2.2. (Buffer dollars carry forward from Phase 2; the new target
+  is what they're measured against.)
+- Mark plan with `large_rebalance` and `phase3_activation` flags.
+
+#### 7.2.4 Common rules for all phase transitions
+
+- The transition cycle suppresses all other decision steps. The
+  transition is the cycle. Withdrawals, refills, and rebalances
+  for the new phase begin on the next cycle.
+- Order of operations within the plan: liquidate or draw-to-residual
+  first (frees cash), then reallocate from cash. Action layer
+  responsibility to interleave if order dependencies require, but
+  plan expresses logical sequence.
+- All transitions trigger the `large_rebalance` alert.
+- Pending CB or swing confirmations from the outgoing phase are
+  discarded (§4.3 step 2).
+
+### 7.3 Withdrawal decisions
+
+A withdrawal is planned each cycle when:
+- Phase is 1 or 3, AND
+- Income state is ACTIVE, AND
+- Today is the scheduled withdrawal day for the current month
+  (monthly withdrawal step within the weekly cycle, per §6.5.1), AND
+- `active_phase.schedule_state` is non-null (defends against the
+  Phase 3 latch-vs-transition window per §4.3 and I15; see also
+  D12).
+
+If the scheduled day falls on a market holiday or weekend, the
+withdrawal cycle shifts to the **next trading day**. The IBKR ACH
+date should be configured to allow ≥2 trading days after the SELL
+fills for settlement (§9.6.1).
+
+#### 7.3.1 Withdrawal amount
+
+For both Phase 1 and Phase 3:
+
+```
+scheduled_monthly = compute_scheduled_monthly(
+                        current_year,
+                        active_phase.schedule_state)
+```
+
+per §3.13. For Phase 3 only, additionally apply the per-month payment
+ceiling per §4.1.1.2:
+
+```
+monthly_withdrawal = min(scheduled_monthly,
+                         current_portfolio × phase3_monthly_payment_ceiling_rate / 12)
+```
+
+If the ceiling binds, emit `monthly_payment_ceiling_bound` Notice
+alert. No other state is affected by the ceiling binding.
+
+Phase 1 has no portfolio clamp; the `portfolio_low_alert` provides
+operator warning at the depletion threshold, and the operational
+pause framework (§11.3) plus residual-floor (`position_residual_minimum_dollars`)
+prevent unsustainable sales.
+
+The `current_portfolio` in the Phase 3 clamp is the core portfolio
+value (Growth + FI; excludes buffer and cash).
+
+#### 7.3.2 Withdrawal source
+
+The source depends on the operating-mode tuple. There are three
+sourcing rules:
+
+**CB_INACTIVE sourcing** (CB_INACTIVE, no active guards):
+
+1. Compute current core portfolio value.
+2. Compute target value for each core position from current totals
+   and configured target weights.
+3. Compute drift dollars: `drift[s] = current_value[s] - target_value[s]`.
+4. Identify the most-overweight position: `argmax_s(drift[s])` where
+   `drift[s] > 0`. Tie-break: larger position by current $ value.
+5. If the most-overweight position has surplus ≥ withdrawal amount,
+   plan a SELL of that single position for the withdrawal amount,
+   clamped at the residual floor (I12).
+6. If the most-overweight position has surplus < withdrawal amount,
+   sell all surplus from it (clamped at residual floor); remaining
+   withdrawal sourced **proportionally from FI buckets** per their
+   current values, each FI SELL clamped at residual floor.
+7. If overall sourcing is insufficient even after applying steps 1–6:
+   this state is unreachable in correct operation —
+   Portfolio-low alert (§6.4.2) would have activated and routed
+   withdrawals through cascade instead. Reaching this branch
+   indicates a bug in guard evaluation or threshold configuration.
+   Abort cycle, set `operational_pause` with
+   `pause_reason: "internal_consistency_violation"`, alert Critical.
+   This branch is NOT eligible for 48h auto-resume — internal logic
+   inconsistencies require operator review before resumption.
+
+**CB1 sourcing** (CB1 not extended, no active guards):
+
+Withdrawals are sourced from the FI bucket only. Growth is never
+sold for withdrawals during CB1 (I14).
+
+1. Identify the most-overweight FI position by drift dollars (tie-break
+   by larger position $ value).
+2. If the most-overweight FI position has surplus ≥ withdrawal amount,
+   plan a SELL of that single FI position for the full amount, clamped
+   at residual.
+3. If the most-overweight FI position has surplus < withdrawal amount,
+   sell all surplus from it (clamped at residual); remaining demand
+   sourced proportionally from remaining FI positions, each clamped at
+   residual.
+4. If FI bucket cannot meet demand even at residuals: this state is
+   unreachable in correct operation — FI-low alert (§6.4.1) or
+   Portfolio-low alert (§6.4.2) would have activated and routed
+   withdrawals through cascade instead. Reaching this branch
+   indicates a bug in guard evaluation or threshold configuration.
+   Abort cycle, set `operational_pause` with
+   `pause_reason: "internal_consistency_violation"`, alert Critical.
+   This branch is NOT eligible for 48h auto-resume — internal logic
+   inconsistencies require operator review before resumption.
+
+**Cascade sourcing** (CB2, or
+Portfolio-low alert):
+
+Source in this order, draining each stage to its residual floor
+before moving to the next stage:
+
+1. **SGOV buffer.** Sell SGOV shares for the full withdrawal amount,
+   clamped at residual floor. If `(SGOV market value −
+   position_residual_minimum_dollars) ≥ withdrawal amount`, source
+   100% from SGOV, done.
+2. **FI buckets.** If SGOV reached residual, source remaining from
+   FI buckets proportionally, each clamped at residual floor.
+3. **Growth buckets.** If both SGOV and FI reached residual, source
+   remaining from Growth buckets proportionally, each clamped at
+   residual floor. This is the deepest cascade level reached while
+   still completing the withdrawal — Growth was sold to make up the
+   demand SGOV and FI couldn't cover. Emit `cascade_growth_source`
+   alert (Critical severity). Distinct from cascade exhaustion
+   (step 4): the withdrawal succeeded, but the portfolio is near
+   absolute floor and the operator should review.
+4. If all three stages have reached residual and demand is not yet
+   met, abort cycle. Set `withdrawal_capacity_exhausted: true`
+   in state (permanent halt for withdrawals only, per §11.3 and
+   §11.2.7). The portfolio has effectively reached its absolute
+   floor. Emit `withdrawal_capacity_exhausted` Critical alert.
+
+The cascade is identical regardless of which guard or CB triggered
+it (same cascade for fast and slow paths).
+
+#### 7.3.3 Withdrawal action shape
+
+The withdrawal Plan entry contains:
+- Total withdrawal amount (Decimal, cents).
+- Source breakdown: `[(symbol, dollar_amount, share_count_to_sell), ...]`.
+- ACH destination (operator's external bank, configured).
+- Scheduling metadata (the calendar date the ACH should hit external
+  account).
+
+The action layer translates this into broker SELL orders and an ACH
+transfer initiation (§8.2.2).
+
+### 7.4 SGOV buffer refill decisions
+
+A buffer refill batch is planned when **all of the following** are true:
+
+- Phase is 1, 2, or 3 (refill subsystem active in all phases).
+- Buffer market value < buffer target. (In Phase 2, the trigger is
+  the same: any drift below target — whether from operator
+  withdrawal, price effects, or otherwise.)
+- The 60-day post-recovery delay window has elapsed (or never
+  applied — initial setup, post-Phase-3-trigger, etc.).
+- No CB state is suspending refill (CB2
+  Portfolio-low alert all suspend; CB_INACTIVE and CB1-not-extended permit
+  refill).
+- Refill cadence (monthly): no refill batch has been executed in the
+  current calendar month.
+
+When all conditions met:
+
+- Compute monthly refill amount: `min(monthly_refill_rate, current_buffer_deficit)`.
+  The `monthly_refill_rate` is the value persisted at the most recent
+  annual review (§7.6); equals `buffer_target / 12` recomputed yearly.
+  If the deficit is smaller (buffer nearly full), only do what's needed.
+- **Source the refill from the most-overweight Growth position.** Tie-break:
+  larger position by current $ value. If multiple Growth positions are
+  overweight, source proportionally among them; if only one is overweight,
+  source entirely from it.
+- If no Growth position is overweight (i.e., Growth bucket is at-or-
+  under target, possibly due to a recent drawdown), source proportionally
+  from all Growth positions despite no overweight signal. (Refill
+  operates outside the rebalancer; it does not require an overweight
+  condition to act.)
+- All refill SELLs are clamped at the residual floor (I12). If any
+  Growth position would be drawn below `position_residual_minimum_dollars`,
+  reduce the SELL amount to keep it at the floor; reduce the refill
+  batch correspondingly. This is a transient, self-correcting condition:
+  when the next rebalance cycle runs (CB permitting), drift will be
+  resolved.
+- Plan: SELL the appropriate Growth amount(s), BUY equivalent SGOV.
+
+Refill is **always** Growth-sourced, never FI-sourced. The principle
+is distinct from FI-sacrosanct (I5, which constrains rebalance
+direction): the SGOV buffer exists to absorb withdrawal demand when
+FI/Growth are stressed. Refilling SGOV from FI would compound the
+underlying problem — drawing from the income-producing bucket to top
+up the emergency buffer that exists *for* income-producing-bucket
+stress events. Refilling from Growth is consistent with the broader
+"Growth funds long-term solvency" design: the SGOV buffer is itself
+a solvency reserve, so funding it from Growth is on-thesis. Refill
+operates outside the rebalancer; it does not participate in 5/25
+logic.
+
+#### 7.4.1 Recovery delay timer
+
+After any cascade-triggering event clears (CB2 → CB1, CB1 → CB2 timer transition →
+CB1, FI-low alert → off, Portfolio-low alert → off), a 60-day
+"refill delay" timer starts. Refill is suppressed during this window
+to give recovery time to confirm.
+
+If a new cascade event triggers during the delay window, the timer
+resets when the new cascade clears. (i.e., the system always waits
+60 days after the *most recent* cascade event clears.)
+
+#### 7.4.2 Refill cadence and small-vs-large deficit behavior
+
+Once active, refills run **once per calendar month** at the
+`monthly_refill_rate` (or the deficit, whichever is smaller). Two
+implications:
+
+- **Small deficit (e.g., 2 months drained):** the deficit is smaller
+  than the monthly rate; full refill happens in 1-2 months.
+- **Large deficit (e.g., 12+ months drained):** refill happens at the
+  annual rate over ~12 months, returning the buffer to full target
+  by end of year.
+
+The refill rate does not adjust mid-year based on deficit size. The
+yearly recompute at annual review (§7.6) is the only mechanism that
+changes the rate.
+
+### 7.5 Rebalancing decisions
+
+Rebalancing decisions are made each cycle when **all of the following**
+are true:
+
+- Phase is 1 or 3 (Phase 2 uses opportunistic rebalance instead, §7.5.2).
+- CB state is CB_INACTIVE (CB1 and CB2 suspend rebalancing, including
+  CB1 → CB2 timer transition).
+- No guard is active.
+
+#### 7.5.1 Phase 1 / Phase 3 standard rebalancing (5/25)
+
+**Pre-condition:** If `phase == PHASE_3 AND schedule_state.phase3 is null`
+(the latched-but-pending window per §4.3, I15), suppress the
+rebalance evaluation for this cycle. The Phase 3 transition cycle
+that initializes `schedule_state.phase3` is the only Plan-generating
+cycle permitted in this window (D12).
+
+For each core position s:
+- `target_value[s] = core_total × target_weight[s]`
+- `drift_dollars[s] = current_value[s] - target_value[s]`
+- `drift_absolute_pct[s] = |current_value[s] - target_value[s]| / core_total`
+- `drift_relative_pct[s] = |current_value[s] - target_value[s]| / target_value[s]`
+
+A position triggers rebalance if **either**:
+- `drift_absolute_pct[s] ≥ rebalance_absolute_threshold_rate` (default 0.05), OR
+- `drift_relative_pct[s] ≥ rebalance_relative_threshold_rate` (default 0.25).
+
+If any position triggers, plan a rebalance that brings **all**
+positions back to target (not just the triggering one). The plan:
+
+1. SELL each overweight position by its surplus.
+2. BUY each underweight position by its deficit.
+3. Net cash impact should be zero (modulo rounding); residual goes to
+   cash buffer for next cycle.
+
+**Constraint (FI-sacrosanct, I5):** rebalance trades cannot sell FI
+to fund a Growth purchase. In practice this is naturally satisfied
+when the trigger is "Growth overweight" (you sell Growth, buy FI —
+fine). If the trigger is "FI overweight" (FI grew faster than Growth),
+the natural plan would be to sell FI and buy Growth, which violates I5.
+
+**Resolution:** If the rebalance plan would require selling FI to buy
+Growth, **suppress the entire rebalance** for that cycle. Log a
+warning. This is a rare condition (FI dramatically outperforming
+Growth) and the right behavior is to wait — eventually Growth
+catches up. Note that the conditions producing significant FI
+overweight typically coincide with CB1/CB2 (Growth depressed),
+where rebalancing is suspended anyway.
+
+If the suppression-by-FI-sacrosanct condition persists for more than
+`fi_overweight_suppression_alert_weeks` (default 4), elevate to a
+`fi_overweight_persistent_suppression` Warning alert: the operator
+should look at why this is happening.
+
+#### 7.5.2 Phase 2 opportunistic rebalancing
+
+In Phase 2, standard 5/25 does NOT apply — invoking the 5/25
+framework in Phase 2 would resurrect Phase 1/3 rebalancing logic
+that is deliberately left quiet during Phase 2. Phase 2 has its
+own dedicated maintenance routine: a two-state opportunistic swing
+on drawdown/recovery (§7.5.2.a), plus a semi-annual steady-state
+reallocation that scrapes accumulated dividend drift back to target
+weights (§7.5.2.b). GBIL serves as opportunistic dry powder rather
+than a strategically defended FI position, but it is still
+maintained at 10% of core through the semi-annual reallocation.
+
+##### 7.5.2.a Two-state opportunistic swing
+
+The primary Phase 2 mechanism is a **two-state allocation swing**
+triggered by Growth lookback signal crossings.
+
+**Two allocation states in Phase 2:**
+
+- **Steady state:** 90% Growth (FBCG + AVUV per ruleset sub-weights),
+  10% GBIL.
+- **Deployed state:** Growth at ~100%, GBIL at
+  `position_residual_minimum_dollars` (default $1500). Growth split
+  between FBCG and AVUV per the same sub-weights as steady state.
+
+The system swings between these two states based on the signal:
+
+**Deployment trigger (steady → deployed):**
+
+- Synthetic Growth Lookback signal ≤ `phase2_opportunistic_trigger_rate`
+  (default -10%, using the same `cb1_threshold_rate` value).
+- 2-week confirmation window (signal must remain at or below trigger
+  for 2 consecutive weekly cycles).
+
+**Deployment plan when triggered:**
+
+- SELL GBIL down to `position_residual_minimum_dollars`.
+- BUY FBCG and AVUV with the proceeds, split per the Phase 2 Growth
+  sub-weights (e.g., if Phase 2 Growth split is FBCG 50% / AVUV 50%,
+  the GBIL proceeds split 50/50).
+- Mark plan with `phase2_opportunistic_deploy` flag → triggers alert.
+
+**Recovery trigger (deployed → steady):**
+
+- Synthetic Growth Lookback signal ≥
+  `phase2_opportunistic_recovery_rate` (default **+2%**, an
+  *absolute* signal value — meaning the synthetic Growth index is
+  2% above its value 6 months ago, equivalent to a 12% rise from
+  the -10% trigger point).
+- 2-week confirmation window (signal must remain at or above
+  recovery threshold for 2 consecutive weekly cycles).
+
+**Recovery plan when triggered:**
+
+- SELL FBCG and AVUV proportionally to their current overweight
+  (which will be substantial since they're at ~100% allocation).
+- BUY GBIL with the proceeds to reach 10% of post-rebalance core.
+- Apply residual floor (I12) to FBCG and AVUV SELLs, though this
+  is unlikely to bind given the volume involved.
+- Mark plan with `phase2_opportunistic_recover` flag → triggers
+  alert.
+
+**Phase 3 grace window suspension:** if the Phase 3 token activation
+grace window is active (24-hour countdown running), Phase 2 swings
+are suspended. Pending confirmations are held but not advanced. Once
+the grace window resolves (either cancelled or expired/latched),
+swing evaluation resumes (or is permanently moot if Phase 3 latched).
+Pending Phase 2 confirmations are discarded at Phase 3 latch.
+
+**Why the asymmetric recovery threshold?**
+
+Phase 2 is the legacy-growth phase with no withdrawal-survival
+concern. The wide gap between deploy trigger (-10%) and recovery
+trigger (+2%) is what makes the swing economically meaningful: the
+system buys Growth at -10% from 6-month-ago and sells at +2% above
+6-month-ago, capturing a roughly 12-percentage-point market move
+per complete swing cycle. This contrasts with Phase 1/3's CB1
+recovery, which uses a tight 2-point hysteresis (trip at -10%,
+clear at -8%) — but CB1 is a rebalance gate, not a swing strategy,
+and that 2-point band is hysteresis to prevent thrashing, not a
+profit-capture target. The two mechanisms serve different purposes;
+the wider Phase 2 band is intentional and on-thesis for the
+legacy-growth regime. The cost of the wider band is occasional
+"stuck long" periods when markets recover modestly then drop
+again — but in Phase 2 that's on-thesis (max-volatility growth)
+rather than off-thesis.
+
+**Single-state-machine constraint:**
+
+The Phase 2 swing maintains its own binary state (steady /
+deployed), persisted across cycles. The system enters Phase 2 in
+steady state. Subsequent swings happen only when the corresponding
+trigger fires with confirmation. The state cannot skip — deployed
+must precede recovery, and vice versa.
+
+This prevents serial opportunistic deploys during a slow grinding
+drawdown (where the signal might oscillate around the -10% trigger):
+once deployed, the system does NOT re-deploy until it has first
+recovered through +2% and returned to steady state.
+
+##### 7.5.2.b Semi-annual steady-state reallocation
+
+The two-state swing in §7.5.2.a handles drawdown-and-recovery, but
+during long quiet stretches with no swing events, Phase 2's
+allocation drifts: Growth-side dividends, Growth appreciation, and
+cash-buffer deployments (§7.7, Phase 2 routes cash surplus to
+most-underweight Growth only) all flow Growth-ward and dilute
+GBIL below its 10% steady-state share. Without a maintenance
+mechanism, GBIL would degrade toward zero across multi-year
+quiet periods, leaving no dry powder available when a swing
+finally triggers.
+
+To maintain the 10% GBIL allocation without resurrecting the 5/25
+framework (which is deliberately quiet in Phase 2), the system
+performs a **semi-annual steady-state reallocation** on configured
+dates. Default schedule: **Jan 15 and Jul 15** (configurable:
+`phase2_reallocation_dates`). The Jan 15 occurrence is naturally
+combined with the annual-review cycle; the Jul 15 occurrence runs
+as a scope extension of the weekly cycle on that date (§6.5.1).
+Weekend/market-holiday shift: next trading day, same rules as
+other date-anchored cycles.
+
+**Reallocation behavior:**
+
+- Trigger: cycle date matches `phase2_reallocation_dates` AND
+  phase is PHASE_2 AND Phase 2 swing state is `steady` (NOT
+  `deployed`). The reallocation is **skipped** during the
+  `deployed` state — that allocation is intentional and managed
+  by the swing-recovery trigger, not by the calendar.
+- Action: SELL FBCG and AVUV (whichever are overweight against
+  their post-reallocation targets) and BUY GBIL (or vice versa
+  if GBIL has somehow accumulated above 10%) such that the
+  post-reallocation core lands at:
+  - FBCG: 45% of core
+  - AVUV: 45% of core
+  - GBIL: 10% of core
+- The FBCG/AVUV 45/45 split inside Growth matches the deployed
+  state's 50/50 inside the 100%-Growth allocation, applied here
+  to the 90%-Growth slice of steady state.
+- Apply residual floor (I12) to all SELLs. Position residuals are
+  unlikely to bind given the volume involved, but the floor still
+  applies for defense-in-depth.
+- Mark plan with `phase2_semi_annual_reallocation` flag → triggers
+  an Info-severity alert noting the drift that was scraped back.
+
+**Skip conditions** (semi-annual reallocation does NOT run, even
+on a scheduled date):
+
+- Phase 2 swing state is `deployed` — the swing-recovery trigger
+  is what returns the system to steady state, not the calendar.
+- A Phase 3 token activation grace window is currently active —
+  same pause-pending-decision logic as the §7.5.2.a swing
+  triggers.
+- Lookback signal is UNAVAILABLE — defer to next weekly cycle
+  to retry; the reallocation is not signal-gated for its trigger
+  logic, but the operating environment must be observable enough
+  to safely execute the trades.
+- Any cascade is active (CB1+, FI-low alert, Portfolio-low alert in
+  the unusual case they were active in Phase 2 — note Phase 2
+  normally holds CB at CB_INACTIVE and guards off, so this is mostly
+  belt-and-suspenders).
+
+**Why semi-annual, not 5/25 or annual:**
+
+A twice-a-year cadence handles the dilution at a rate appropriate
+to its accumulation. Quarterly would generate nuisance trades
+from modest drift; annual would let GBIL drift far enough to
+significantly reduce swing-deploy ammunition mid-year. The Jan 15
+alignment with annual review keeps the operator's mental model
+clean (one big maintenance event in January); Jul 15 sits
+opposite on the calendar for the second occurrence.
+
+This mechanism is **not** a 5/25 invocation: there is no
+drift-threshold detection, no signal-gated activation, no
+cross-cycle confirmation window. It is a calendar-driven
+idempotent realignment that happens twice a year regardless of
+intervening market conditions (subject to the skip conditions
+above). Phase 1/3's 5/25 mechanics and Phase 2's semi-annual
+mechanic share no code; they are conceptually different
+maintenance regimes for different phases.
+
+### 7.6 Annual review (Jan 15)
+
+The annual review is a **single combined event** that runs once per
+year on the configured `annual_review_date` (default January 15;
+shifts to next trading day if weekend or market holiday). It executes
+during the annual-review cycle (§3.8, §6.5.1) and performs three
+distinct evaluations:
+
+1. **Freeze evaluation** (Phase 1 and Phase 3 only)
+2. **Buffer target and refill rate recompute** (Phase 1 and Phase 3;
+   moot in Phase 2)
+3. **Cash target recompute** (Phase 1 and Phase 3; Phase 2 stays at
+   $1000 fixed)
+
+These three evaluations always occur together; their results are
+persisted atomically as a single annual-review record (§6.7).
+
+#### 7.6.1 Freeze evaluation (Phase 1 and Phase 3)
+
+**Active:** Phase 1 and Phase 3 only. Phase 2 has no scheduled income
+to freeze.
+
+**Decision algorithm:**
+
+1. Read the persistent CB transition log (§6.7) for the prior calendar
+   year (e.g., evaluating on 2032-01-15 reads 2031's log).
+2. Compute total calendar days during the prior year on which **any
+   of CB1 or CB2 was active for any part of the day**.
+   Each calendar day counts at most once regardless of intra-day
+   transitions. 3. If total days ≥ `freeze_evaluation_threshold_days` (default 30,
+   configurable), the new year's CPI raise is **frozen** — the year
+   is appended to the active phase's schedule_state.frozen_years list.
+4. Otherwise, no append: the CPI raise applies normally per §3.13's
+   formula.
+5. Persist the decision (`year, frozen: bool, cb1_days, cb2_days,
+   decided_at_timestamp`) to durable state.
+6. Generate alert with the decision and the underlying CB-day counts.
+
+**Compounding rule:** Skipped raises do not stack. If 2031's raise
+was frozen and 2032's raise applies normally, 2032's monthly
+withdrawal is computed via §3.13's formula counting non-frozen years
+only. The freeze permanently removes that year's raise from the
+schedule.
+
+**STOP INCOME pause does not affect freeze evaluation.** The annual
+review runs whether or not income is paused. CB1+ days during the
+paused period count normally toward the threshold. On resume (per
+§4.4), the resumed monthly amount reflects the schedule_state
+including any freezes recorded during the pause.
+
+#### 7.6.2 Buffer target and refill rate recompute
+
+**Active:** Phase 1 and Phase 3.
+
+```
+buffer_target = 24 × current_monthly_withdrawal
+monthly_refill_rate = buffer_target / 12
+```
+
+`current_monthly_withdrawal` is the new year's scheduled monthly
+amount (post-freeze-evaluation, per §3.13's formula). Both values
+persist; they govern all refill batches until the next annual review.
+
+**Phase 2:** the buffer target and refill rate are NOT recomputed
+during Phase 2's annual review cycle. They carry forward at their
+end-of-Phase-1 frozen values. This is moot for refill triggering
+(§7.4 still triggers on buffer < target) but means the Phase 2 system
+uses static values for these fields throughout Phase 2's duration.
+
+#### 7.6.3 Cash target recompute
+
+**Active:** Phase 1 and Phase 3.
+
+```
+cash_target = current_monthly_withdrawal + 1000  (Phase 1, Phase 3)
+cash_target = 1000  (Phase 2, unchanged)
+```
+
+The cash target persists and governs cash refill / drawdown decisions
+(§7.7) until the next annual review.
+
+#### 7.6.4 Schedule state representation
+
+For each income-producing phase, the complete withdrawal schedule is
+fully determined by:
+- `I_0` — starting income at trigger (immutable after trigger)
+- `trigger_year` — calendar year of phase activation (immutable)
+- `cpi` — annual CPI rate (immutable per phase: 0.03 Phase 1, 0.04
+  Phase 3)
+- `frozen_years: list[int]` — years where the CPI raise was frozen
+  (append-only)
+
+Current scheduled monthly income for year Y is computed per §3.13.
+The withdrawal layer reads the current scheduled value; it does not
+re-derive freeze decisions.
+
+#### 7.6.5 Why an annual event and not just-in-time?
+
+A discrete annual event (rather than re-evaluating freeze on every
+withdrawal cycle, or recomputing buffer/cash targets on every cycle)
+provides:
+- A single auditable timestamp for each year's decisions
+- A natural alert moment for the operator/survivor
+- Cheaper cycles (read stored values vs. recompute from CB log)
+- Robustness against CB log corruption discovered later (the freeze
+  decision is locked once made)
+- Predictable buffer/refill behavior within a year (no mid-year rate
+  shifts)
+
+### 7.7 Cash buffer decisions
+
+The cash buffer is maintained at target ± $250 (configurable:
+`cash_buffer_target` per phase, `cash_buffer_tolerance`).
+
+Each cycle:
+
+- If cash > target + tolerance: plan a deployment of the surplus to
+  the most-underweight core position (Phase 1, Phase 3) or
+  most-underweight Growth (Phase 2). This is the mechanism that
+  handles unexpected inflows (deposits, conversions, dividends).
+- If cash < target - tolerance: plan a refill of the deficit by
+  selling from the most-overweight core position. Tie-break: larger
+  position by current $ value.
+- If no position is overweight at refill time: source proportionally
+  from the largest bucket by current $ value (Growth bucket vs FI
+  bucket). This handles the rare balanced-market case.
+
+**Note on FI-sacrosanct (I5):** I5 forbids only FI → Growth trades.
+Selling FI to fund cash is permitted regardless of size — cash is not
+Growth. The cash refill rule above is unconstrained by I5.
+
+**Cash deployment vs. FI-sacrosanct (I5):** Deploying surplus cash to
+an underweight Growth position is permitted regardless of how the
+cash originated. I5 constrains *rebalance trades* (§3.14) —
+specifically, a single-plan SELL FI → BUY Growth pair. Cash buffer
+deployment is not a rebalance trade; it is operational disposition
+of accumulated cash (from dividends, inflows, or rounding residuals).
+Even if recent cycles included permitted FI → cash sales, the
+resulting cash is fungible and can deploy where needed. I5 is a
+single-plan-entry rule, not a cross-cycle history rule.
+
+Cash buffer maintenance is independent of CB state — it runs even
+during cascade conditions. The cash buffer is operational
+infrastructure (transaction reserve), not an investment position;
+its maintenance has different priorities than core portfolio
+management.
+
+#### 7.7.1 Large cash deployment
+
+The §7.7 cash-surplus rule deploys small surpluses ($250 tolerance
+above target) to the most-underweight core position one bite per
+cycle. This works for dividends, rounding residuals, and small
+incidental inflows. It does **not** work well for large annual
+inflows — Phase 1's planned Roth conversion pattern (~$200K initial
+in 2027, ~$130K annual for years 2–8 per §2.9) lands tens of
+thousands of dollars of cash in a single deposit, and the
+single-position-per-cycle rule would take 6+ weeks to restore
+allocation, leaving large idle cash holdings during the deployment.
+
+**Trigger.** A large cash deployment fires when cash surplus
+exceeds the **max** of:
+
+- `large_cash_deployment_threshold_dollars` (default $25,000)
+- `large_cash_deployment_threshold_rate` × current portfolio value
+  (default 5%)
+
+The dollar floor protects small portfolios; the percentage floor
+keeps the trigger meaningful as portfolio grows. When triggered,
+the **entire surplus** above target is deployed in one cycle
+(not just the portion above the threshold).
+
+**Cadence.** Evaluated on every weekly cycle (the existing cash
+buffer evaluation in §6.5 / §7.7). A Roth conversion landing
+mid-week waits until the next Wednesday weekly cycle for deployment
+— the bounded delay (up to 6 calendar days) is operationally
+acceptable.
+
+**Algorithm (CB_INACTIVE and CB1, Phase 1 / Phase 3):**
+
+Deploy the cash in proportion to the active phase's target weights.
+For each position `s` in the active phase's `target_weights` dict:
+
+```
+buy_dollars[s] = cash_to_deploy × target_weight[s]
+```
+
+No reading of current position values; no proportional-to-deficit
+math. The algorithm is intentionally simple: cash flows to each
+position in exact target-weight proportion, regardless of pre-inflow
+allocation. The total BUY dollars = `cash_to_deploy` (modulo
+rounding).
+
+**Drift correction is delegated to existing mechanisms.** Any
+post-inflow drift away from target weights is absorbed by:
+
+- The next cycle's 5/25 rebalance evaluation (Phase 1 and Phase 3),
+  which triggers a corrective rebalance if drift exceeds the 5/25
+  thresholds.
+- The next semi-annual reallocation (Phase 2; see §7.5.2.b),
+  which scrapes accumulated drift back to target every 6 months.
+
+This is a deliberate trade-off: post-inflow drift up to 5/25
+tolerance levels persists until the next correction cycle. The cost
+(slightly slower drift correction) is paid in exchange for
+algorithmic simplicity and no dependence on current position values
+during deployment. This is consistent with the design philosophy
+elsewhere in the spec (e.g., §7.5.2.b accepts drift between
+semi-annual events).
+
+**Behavior by CB state:**
+
+- **CB_INACTIVE, CB1:** Target-weight proportional deployment as
+  above. CB1 restricts SELLs of Growth (per I14) but does not
+  restrict BUYs from cash.
+- **CB2 active:** Deploy all cash to **SGOV buffer** until the
+  buffer is at target (`sgov_buffer_target_months × current_monthly_withdrawal`).
+  Surplus beyond buffer-target deploys to **FI bucket only** (the
+  most-underweight FI position per §7.7 main body) — defensive
+  survival mode. The operator's strategy during cascade conditions
+  is runway extension, not aggressive Growth buying.
+
+**Behavior by phase:**
+
+- **Phase 1, Phase 3:** As above (CB-state-dependent).
+- **Phase 2:** Growth-only deployment via the same target-weight
+  algorithm applied to the `phase2_steady_target_weights` (or
+  `phase2_deployed_target_weights` if currently in the deployed
+  state per §7.5.2.a). Phase 2 has no withdrawal-survival mode;
+  cascade logic does not apply. The semi-annual reallocation handles
+  routine drift; the large-deployment mechanic handles bulk inflows.
+
+**Plan entry shape.** A new plan entry type, **LargeCashDeployment**,
+contains: total cash amount, per-position BUY breakdown (symbol,
+dollar amount, share count), target weights reference, and an alert
+flag. Action layer executes it as a coordinated multi-BUY batch,
+similar to PhaseTransition but BUYs-only (no SELLs, no liquidations).
+Alert: `large_cash_deployment` (Notice severity), per §12.7 alert
+catalog.
+
+**Cycle integration.** Runs between the §7.7 cash buffer maintenance
+and the §7.5 rebalance check. If a large deployment fires this
+cycle, the rebalance check skips this cycle (the deployment has
+already moved cash into target positions; any residual drift is
+sub-threshold and will be caught next cycle if it ever crosses 5/25).
+
+**Idempotency.** Same broker-state-as-truth rule as everything else
+(§8.3). If the LargeCashDeployment plan partially executed and the
+cycle aborted, the next cycle re-reads positions, observes that
+some cash has deployed and some remains, and produces a fresh plan
+covering only the still-needed BUYs.
+
+### 7.8 Decision layer invariants
+
+These properties of the decision layer must always hold and become
+test assertions (§13.5):
+
+- **D1:** A Plan generated for state S, evaluated again immediately
+  with no state change, produces an identical Plan.
+- **D2:** The Plan's net cash impact is zero ± rounding tolerance
+  (sales fund purchases). Exception: withdrawals (net negative cash
+  out via ACH) and refill batches (net negative core, net positive
+  buffer).
+- **D3:** No Plan entry sells FI to fund a Growth purchase
+  (FI-sacrosanct, I5).
+- **D4:** No Plan entry rebalances during CB1 or CB2 state.
+- **D5:** No Plan entry refills SGOV during CB2 state, or during the
+  60-day post-recovery window.
+- **D6:** No Plan entry initiates a deposit, conversion, or rollover
+  (per I11).
+- **D7:** Withdrawal Plan entries appear only when Income state is
+  ACTIVE.
+- **D8:** Phase transition cycles produce only the transition Plan;
+  withdrawal, refill, and rebalance entries are suppressed.
+- **D9:** No Plan entry SELLs an active-allowlist position below
+  `position_residual_minimum_dollars`. Phase transition liquidations
+  permitted by I13 are the only exception, and only for positions
+  permanently retired (not in any future-reachable phase's allowlist).
+- **D10:** During CB1 (not in CB2), no Withdrawal Plan entry has
+  Growth in its source breakdown (per I14).
+- **D11:** A LargeCashDeployment plan entry contains only BUY orders.
+  Per-position BUY dollars equal `cash_to_deploy × target_weight[symbol]`
+  for each symbol in the active phase's target weights. Total BUY
+  dollars equal `cash_to_deploy` (modulo rounding). No position
+  appears in the plan with a BUY amount that would deviate from
+  this target-weight-proportional rule.
+- **D12:** No Withdrawal, Rebalance, or LargeCashDeployment Plan
+  entry is generated when `phase == PHASE_3 AND schedule_state.phase3
+  is null` (the Phase 3 latched-but-pending window per §4.3 and
+  I15). The transition cycle that initializes `schedule_state.phase3`
+  is the only Plan-generating cycle permitted in this window.
+
+### 7.9 ACHScheduleUpdate decisions
+
+ACHScheduleUpdate plan entries are generated by the decision layer
+in three cases:
+
+1. **Income state transition.** When Income state transitions
+   ACTIVE → PAUSED (STOP INCOME tokens inserted), emit
+   ACHScheduleUpdate to set ACH amount to $0. When Income state
+   transitions PAUSED → ACTIVE, emit ACHScheduleUpdate to restore
+   the broker-side amount to the current scheduled monthly
+   withdrawal.
+2. **Phase transition affecting withdrawal amount.** Phase 1 → Phase 3
+   and Phase 2 → Phase 3 transitions change the withdrawal amount;
+   the phase transition plan includes an ACHScheduleUpdate to the
+   new amount. Phase 1 → Phase 2 transitions set ACH to $0 (no
+   Phase 2 withdrawals).
+3. **Annual review (Phase 1 and Phase 3).** When the annual review's
+   freeze evaluation results in a CPI raise (or determines no
+   freeze), the new annual amount is set via ACHScheduleUpdate,
+   conditional on Income state being ACTIVE. If PAUSED, the ACH
+   amount stays at $0 and the new amount is recorded in
+   schedule_state for use when income resumes.
+
+ACHScheduleUpdate retries on next cycle if rejected (§8.2.7).
+Persistent failure escalates to Warning severity alerts but does
+NOT halt the system (per §8.2.7 ruling): the system continues
+operating at the prior ACH amount until the operator resolves the
+IBKR-side issue. The §6.5 cycle evaluation order calls for
+emitting an ACHScheduleUpdate entry whenever Income state
+transitioned this cycle (between step 3 and step 4).
+
+### 7.10 Resolved questions (Decision Logic)
+
+- **Day-of-month for scheduled withdrawal ACH:** operator preference
+  (configured in ruleset).
+- **Withdrawal day on holiday/weekend:** shift to next trading day.
+- **Tie-breaking when two positions equally overweight:** larger
+  position by current $ value (deterministic).
+- **Phase 3 sub_floor protection logic:** four-regime taxonomy and
+  math both in §4.1.1.
+- **Cash buffer refill source when no overweight position:**
+  proportional from largest bucket.
+- **Annual review freeze trigger:** RESOLVED — Jan 15, scoped to
+  CPI freeze decision + buffer/refill recompute + cash recompute,
+  trigger is CB1+ ≥ 30 cumulative days.
+- **Action layer atomicity for partial plan failures:** specified in
+  §8.3.
+
+---
+
+## §8. Action Layer
+
+The action layer consumes a Plan (§3.12, §7) and executes it against
+external systems: the broker, the ACH transfer mechanism, the
+alerter, and the persistence layer. The action layer has **no
+decision authority** — it only executes what the Plan specifies.
+
+This separation is the structural defense against the IPM v1
+C2-class bug. In that bug, decision logic and action logic were
+intertwined: the condition that decided "withdrawals should pause"
+also accidentally controlled "where withdrawals route to." A decision
+layer that produces inspectable Plans, executed by a stateless action
+layer, makes it structurally impossible for one condition to silently
+control two effects.
+
+### 8.1 Plan execution model
+
+A Plan is a sequence of typed entries (§3.12). The action layer
+executes entries in their listed order, with these properties:
+
+- **Per-entry atomicity.** Each entry succeeds completely or fails
+  completely. No partial-state commits within an entry.
+- **Sequenced execution.** Later entries see the state changes from
+  earlier entries (e.g., a BUY after a SELL sees the cash from the
+  SELL).
+- **Failure-stops execution.** If any entry fails, remaining entries
+  are not attempted. The cycle ends with the failure logged.
+- **No retry within a cycle.** Failed entries are not automatically
+  retried in the same cycle. The next scheduled cycle re-evaluates
+  state from scratch and produces a new Plan that reflects the
+  partial-execution state.
+
+The "no retry within a cycle" rule is deliberate: retry logic at the
+action layer hides state inconsistencies from the decision layer.
+Better to let the cycle end in a known-failed state and have the
+next cycle observe the actual broker state and decide afresh.
+
+### 8.2 Entry type execution
+
+#### 8.2.1 Order entries (BUY / SELL)
+
+For each Order entry:
+
+1. Validate the entry against current broker state:
+   - Symbol is in active-phase allowlist AND known to the broker
+     (valid instrument).
+   - Sufficient cash for BUY (else fail).
+   - Sufficient shares for SELL (else fail).
+   - Order would not breach `position_residual_minimum_dollars` for
+     a SELL (else fail; this is a defense-in-depth check; the
+     decision layer should have prevented this per D9).
+2. Submit the order to the broker as a market order during regular
+   trading hours.
+3. Wait for fill confirmation, with a timeout (configurable:
+   `order_fill_timeout_seconds`, default 60s).
+4. On successful fill: record fill details (executed shares, average
+   price, total cost, broker order ID) and proceed to next entry.
+5. On timeout or fill rejection: record failure details, abort
+   remaining entries, alert.
+
+**Order timing.** All orders are submitted during regular US equity
+market hours (09:30–16:00 ET). The cycle scheduler must arrange that
+cycles requiring orders run during market hours. Cycles that fall
+outside market hours and contain order entries are aborted with an
+"after-hours-cycle-with-orders" alert; they will retry at the next
+scheduled cycle within market hours.
+
+**Market vs limit orders.** IRAPM uses market orders exclusively.
+Limit orders introduce timing complexity (partial fills, expired
+orders, order management state) that the cycle model isn't designed
+to handle. The high-liquidity ETFs in the IRAPM allowlist (FBCG,
+AVUV, PYLD, JPIE, GBIL, SGOV) have tight enough spreads that
+market-order slippage is negligible for the typical order sizes.
+
+**Fractional shares.** IBKR supports fractional shares for the
+allowlisted ETFs. The action layer issues orders in dollar amounts
+(IBKR converts to fractional shares) for all SELLs and BUYs. This
+avoids the share-count rounding error that would otherwise drift
+the buffer accounting over time.
+
+**Settlement timing within a cycle.** US equity ETFs settle T+1.
+Within a single cycle, SELL → BUY sequences (rebalancing, refills,
+phase transitions) execute without artificial delay; IBKR allows
+unsettled SELL proceeds to fund same-day BUY orders within an IRA.
+The settlement constraint applies only to SELL → ACH withdrawal
+sequences, which IRAPM handles at the scheduling layer (§9.6.1)
+rather than within a cycle.
+
+#### 8.2.2 Withdrawal entries
+
+For each Withdrawal entry (always exactly one per cycle that
+includes withdrawals):
+
+1. Verify the source breakdown sums to the total withdrawal amount
+   (defense in depth against decision-layer bugs).
+2. Submit the underlying SELL orders per the source breakdown
+   (using the Order entry execution mechanic above). All SELLs must
+   succeed before proceeding.
+3. After all SELLs fill, initiate the ACH transfer for the total
+   amount via the broker's ACH withdrawal API.
+4. Verify ACH initiation success (the broker returns a transfer
+   reference ID). The actual ACH settlement happens 1-3 business
+   days later, outside this cycle.
+5. Record: SELL fills, ACH initiation reference, scheduled settlement
+   date.
+6. If any SELL fails, do NOT initiate the ACH transfer. The cycle
+   ends in a partial-failure state (some SELLs may have filled).
+   Alert with severity: Critical (blocking — see §11.3). Operator
+   review required.
+
+**ACH mechanism.** Withdrawals flow via IBKR's recurring ACH withdrawal
+mechanism. IRAPM updates the recurring ACH amount on the broker side
+to match the current scheduled monthly withdrawal. The actual transfer
+is then triggered automatically by IBKR on the configured day of the
+month. (Per the operator's stated mechanism: 2nd IBKR access account
+with 2FA disabled, used for unattended ACH adjustment.)
+
+This means the IRAPM action layer's "withdrawal" entry is actually
+two distinct broker interactions:
+
+- **Monthly:** SELL orders to fund the cash needed for the upcoming
+  ACH transfer (one cycle, one or more SELLs).
+- **Whenever schedule changes:** UPDATE the recurring ACH amount on
+  the broker side, via the separate `ACHScheduleUpdate` plan entry
+  (§8.2.7).
+
+#### 8.2.3 BufferRefill entries
+
+A BufferRefill entry is structurally a sequence of one or more SELL
+orders (Growth → cash) followed by one BUY order (cash → SGOV).
+The action layer executes them as such, with all SELLs completing
+before the BUY. Net cash impact within the entry should be near zero.
+
+#### 8.2.4 CashRefill entries
+
+Symmetric to BufferRefill but in either direction (sell to add cash,
+or buy to deploy excess cash). Single SELL or BUY order in most cases.
+
+#### 8.2.5 PhaseTransition entries
+
+Executed as a coordinated batch:
+
+1. Execute all SELL orders (liquidations and drop-to-residuals) first.
+   Skip any SELL whose target position is already at or below residual
+   (no-op). The skip is recorded in the cycle log (§12.2.1) and
+   surfaced in the `large_rebalance` alert's residual-exceptions
+   section (§12.7).
+2. Wait for all SELL fills (timeout same as Order entries, but
+   applied to the batch).
+3. Compute available cash post-SELLs.
+4. Execute all BUY orders against the available cash.
+5. Verify post-execution allocation matches the target within
+   tolerance (defense-in-depth).
+6. Update internal Phase indicator (durable persistence).
+7. For Phase 3 transitions, also persist:
+   - `I_0` (computed against the post-SELL portfolio value)
+   - `trigger_year`
+   - Initial empty `frozen_years` list
+   - Buffer target = 24 × I_0
+   - Refill rate = buffer target / 12
+   - Cash target = I_0 + $1000
+
+A PhaseTransition entry's failure leaves the system in a partially-
+transitioned state requiring operator review. Alert with severity:
+Critical (blocking).
+
+#### 8.2.6 CBStateTransition entries
+
+Pure record-keeping. The decision layer already evaluates and decides
+state transitions; the CBStateTransition entry exists so the
+transition is **logged** as part of the Plan rather than as a side
+effect of decision logic. Execution:
+
+1. Append `(timestamp, from_state, to_state, trigger_reason, cycle_id)`
+   to the CB transition log (§6.7 persistence).
+2. No external action.
+
+CBStateTransition entries always succeed (modulo persistence layer
+failure, which is its own catastrophic case).
+
+#### 8.2.7 ACHScheduleUpdate entries
+
+Updates the recurring monthly ACH amount on the broker side. Execution:
+
+1. Submit the new amount via IBKR's ACH management API.
+2. Verify the broker accepted the change.
+3. On rejection (e.g., previous update still pending): log, alert
+   (Notice severity), mark cycle as "partial — ACH not updated";
+   subsequent cycles re-attempt.
+
+ACHScheduleUpdate entries are emitted by the decision layer in these
+cases:
+
+- Phase 1 → Phase 2 transition (set to $0; no Phase 2 withdrawals)
+- Phase 1/2 → Phase 3 transition (set to Phase 3 starting income)
+- Phase 1 / Phase 3 annual review when freeze decision changes the
+  scheduled amount or applies the CPI raise (set to new monthly amount)
+- STOP INCOME ACTIVE → PAUSED (set to $0)
+- STOP INCOME PAUSED → ACTIVE (set back to current schedule_state amount)
+
+Failure of an ACHScheduleUpdate entry does not fail the cycle — the
+decision is logged, alerted as Notice, and the next cycle re-attempts.
+SELL orders for the cycle's withdrawal still execute against current
+broker-side ACH amount (which may be stale by one cycle).
+
+**Persistent-failure escalation.** ACHScheduleUpdate failures do NOT
+trigger operational_pause. The system continues operating with the
+broker-side ACH amount unchanged from its last successful update;
+monthly withdrawals execute against the prior amount until the
+operator manually fixes the IBKR-side issue. Alert severity
+escalates with consecutive failures:
+
+- First failure: Notice severity, `ach_update_failed` alert.
+- After `ach_update_warning_threshold_cycles` consecutive failures
+  (default 3): escalates to Warning severity. Alert content includes
+  the target ACH amount, the IBKR Portal navigation path to the
+  recurring-withdrawal management page, and a note that the operator
+  must update the broker-side amount manually.
+- Failures continue alerting at Warning severity each subsequent
+  cycle; no further escalation. No state-file flag is set; no halt.
+
+The rationale: ACHScheduleUpdate is an annual-cadence operation in
+practice (only changes on phase transitions, annual review, or STOP
+INCOME edge cases). The wrong-amount risk is bounded — the prior
+amount continues, which is at worst slightly stale (last year's
+amount instead of this year's CPI-adjusted amount, or the pre-pause
+amount instead of $0 during STOP INCOME pauses). Halting the system
+entirely because IBKR's API rejected an update would be worse than
+running with a stale ACH amount until the operator resolves the
+IBKR-side issue. The manual procedure is specified in detail in the
+operational runbook (§14.4).
+
+#### 8.2.8 LargeCashDeployment entries
+
+Executed as a coordinated multi-BUY batch:
+
+1. Read current broker positions and cash balance to confirm the
+   surplus that triggered deployment is still present (broker state
+   is the source of truth per §8.3).
+2. Submit all BUY orders in the entry's per-position breakdown,
+   tracking each by broker order ID.
+3. Wait for fill confirmations on the full batch, with the same
+   per-order timeout as §8.2.1 Order entries
+   (`order_fill_timeout_seconds`).
+4. On full success: log fills, emit `large_cash_deployment` Notice
+   alert with per-position fill details.
+5. On partial failure (some BUYs filled, some timed out or
+   rejected): abort remaining BUYs, log the partial state. The
+   next cycle re-reads broker state, observes the partial
+   deployment, and produces a fresh LargeCashDeployment entry
+   covering only the still-needed BUYs.
+
+LargeCashDeployment does NOT set `operational_pause` on partial
+failure — the partial state is benign (some cash deployed,
+remainder waits for next cycle's plan), and the natural-retry
+behavior of the planning layer resolves it without special handling.
+
+#### 8.2.9 Alert entries
+
+Alerts are structured messages dispatched to the alerter (§9.3).
+Each Alert entry contains:
+
+- Severity (Info, Notice, Warning, Critical) — see §11.1
+- Channel (Email, SMS, Both) — typically Both per §9.3
+- Subject (short)
+- Body (structured with relevant context)
+- Deduplication key (so repeated alerts of the same type within a
+  cadence window collapse into one)
+
+Alert dispatch happens at end-of-cycle, after all other entries have
+either completed or failed. This ensures that the alert reflects the
+actual outcome of the cycle, not the intended outcome.
+
+Alert dispatch failure does NOT fail the cycle (the actions already
+happened; the alert just didn't reach the operator). It does generate
+a separate "alerter unreachable" durable record that the next cycle
+picks up.
+
+### 8.3 Idempotency and recovery
+
+A cycle that fails partway through must leave the system in a
+recoverable state. Specifically:
+
+- **Broker state is the source of truth.** IRAPM's persisted state
+  about positions is informational; the next cycle re-reads positions
+  from the broker. A cycle that filled some orders before failing
+  is not "lost" — the next cycle sees the actual broker state.
+- **Plan persistence (cycle log only).** The Plan generated by each
+  cycle is written to the cycle log (§12.2.1) at the start of the
+  action layer's execution. The Plan is NOT written to the operating
+  state file; the state file remains minimal. On restart after a
+  crash mid-cycle, the operator can read the cycle log to understand
+  what was attempted.
+- **No duplicate execution.** The action layer does NOT replay
+  previously-attempted Plans on restart. The next cycle re-evaluates
+  from current state and produces a fresh Plan.
+
+This means a partial cycle creates a transient anomaly (e.g., a SELL
+filled but the matching BUY didn't, leaving cash in the account)
+that the next cycle naturally resolves through cash-buffer logic
+and rebalancer logic.
+
+### 8.4 Action layer invariants
+
+These properties must always hold and become test assertions (§13.5):
+
+- **A1:** The action layer reads only the Plan and current broker
+  state. It does NOT consult the operating state machines (CB,
+  Phase, Income), which are decision-layer concerns.
+- **A2:** The action layer never modifies the operating state
+  machines. State transitions are recorded by CBStateTransition
+  entries, which are computed by the decision layer.
+- **A3:** Order entries are submitted as market orders, in dollar
+  amounts (fractional-share-aware), during regular trading hours.
+- **A4:** Withdrawal entries' SELL components must all succeed before
+  the ACH transfer is initiated. Partial SELL execution prohibits
+  ACH initiation.
+- **A5:** PhaseTransition entries that fail mid-execution leave the
+  system in a Critical-alert state requiring operator review.
+- **A6:** The action layer does not retry within a cycle.
+- **A7:** Alert dispatch failure does not fail the cycle.
+- **A8:** ACHScheduleUpdate failures do not fail the cycle; they
+  re-attempt on subsequent cycles.
+
+### 8.5 Resolved questions (Action Layer)
+
+- **Order timeout value:** 60s default; market orders only; reasonable
+  for liquid ETFs in the allowlist.
+- **Broker-side ACH amount update conflict behavior:** fail the
+  update, alert (Notice), retry next cycle (§8.2.7).
+- **Fractional share fill reporting:** dollar-denominated fills are
+  authoritative for IRAPM accounting (§8.2.1).
+
+---
+
+## §9. External Interfaces
+
+This section specifies the boundaries between IRAPM and the systems
+it depends on. For each external dependency: what IRAPM expects, how
+failures are handled, and what's deferred to implementation choice.
+
+### 9.1 Broker interface (IBKR)
+
+#### 9.1.1 Required broker capabilities
+
+IRAPM requires the broker to provide:
+
+- **Position queries** — current share counts and last prices for all
+  account positions, including non-allowlisted positions (which IRAPM
+  ignores per I3 but must read to confirm allowlist integrity).
+- **Cash balance query** — current USD cash balance.
+- **Market order submission** — buy and sell orders in dollar amounts
+  (fractional shares).
+- **Order status query** — fill status for a submitted order, including
+  partial fills, executed shares/dollars, and average price.
+- **ACH withdrawal management** — set/update the recurring monthly ACH
+  withdrawal amount; initiate one-off withdrawals if needed.
+- **Connection health query** — confirm broker API is reachable and
+  the account is accessible.
+
+#### 9.1.2 Connection model
+
+IRAPM uses the IBKR Gateway API. Connection model:
+
+- **Persistent gateway connection.** The IBKR Gateway runs as a
+  separate process; IRAPM connects to it via local socket.
+- **Connection check at cycle start.** Step 1 of each cycle (§6.5)
+  includes a connection health check (skipped for daily-token cycles,
+  which have no broker dependency). Failure aborts the cycle.
+- **Reconnection on transient failures.** Within a cycle, if a
+  broker call fails with a connection error, IRAPM attempts one
+  reconnection and retries the call. Persistent failure aborts
+  the cycle.
+- **No background polling.** IRAPM does not poll the broker between
+  cycles; all broker interaction happens within cycle execution.
+
+#### 9.1.3 Authentication
+
+IRAPM uses the dedicated 2nd IBKR access account with 2FA disabled,
+per operator design. This account has trading and ACH withdrawal
+permissions but is otherwise isolated from the operator's primary
+brokerage interaction. Credentials are stored in `.env` outside the
+codebase and read at process start.
+
+The 2FA-disabled access is an explicit operational design choice
+to enable unattended operation. The risk is mitigated by:
+- Account isolation from operator's primary brokerage account
+- Trading restricted to the IRAPM allowlist (operator-set IBKR
+  trading permissions)
+- ACH destination restricted to the operator's known external bank
+- Hardware-level access control on the CL260 boxes (physically
+  secured, see §10.1.1)
+
+#### 9.1.4 Failure modes
+
+| Failure | IRAPM response | Category |
+|---|---|---|
+| Broker unreachable at cycle start | Abort cycle; alert; retry next scheduled cycle | Transient (auto-recovers) |
+| Broker disconnect mid-cycle | Attempt one reconnect + retry; if still fails, abort cycle, alert | Transient (auto-recovers) |
+| Order submission rejected | Log rejection details; abort cycle; alert. Do not retry within cycle | Critical-blocking |
+| Order fill timeout | Cancel pending order; abort cycle; alert | Critical-blocking |
+| Position query returns inconsistent state | Abort cycle; alert (data integrity issue) | Critical-blocking |
+| ACH update rejected | Log, alert; mark cycle as "partial — ACH not updated"; subsequent cycles will retry | Notice (auto-recovers) |
+| Authentication failure | Refuse to start (at process startup) or abort cycle and alert (mid-run) | Critical-blocking |
+
+See §11 for category semantics (transient vs Critical-blocking).
+
+### 9.2 Price data interface
+
+IRAPM reads price data for the Synthetic Growth Lookback signal
+(§5) from local TSV/CSV files in `C:\portfolio\data\`. These files
+follow the format used by the IPMS simulator (see IPMS_SPECIFICATION.md
+or `data/README.md` for format details).
+
+The data files are operator-maintained: the operator periodically
+refreshes them via Yahoo Finance copy-paste. IRAPM does not fetch
+data automatically. Staleness gates in the lookback signal (§5.2)
+detect data refresh lag and trigger UNAVAILABLE.
+
+#### 9.2.1 Required files
+
+For Phase 1 / Phase 3 operation:
+- `FBCG.tsv` (or `.csv`) — FBCG Adj Close history, weekly cadence
+  acceptable
+- `AVUV.tsv` — AVUV Adj Close history
+
+For Phase 2 operation: same files (the Phase 2 opportunistic
+rebalance uses the same Growth lookback).
+
+The data interface does NOT require files for PYLD, JPIE, GBIL, or
+SGOV — those positions are not used in lookback calculations.
+
+#### 9.2.2 Failure modes
+
+| Failure | IRAPM response | Category |
+|---|---|---|
+| Required data file missing | Lookback signal UNAVAILABLE; alert; CB state holds | Notice (auto-recovers when refreshed) |
+| Data file stale (>14 days) | Lookback signal UNAVAILABLE; alert; CB state holds | Notice (auto-recovers when refreshed) |
+| Data file malformed | PriceDataError raised; cycle aborts; alert | Critical-blocking |
+
+Data file failures degrade gracefully — they prevent the lookback
+signal from updating but do not prevent withdrawals, rebalancing, or
+other actions that don't depend on the signal. The operating state
+machines (CB, etc.) hold their last value when the signal is
+unavailable.
+
+### 9.3 Alerter interface
+
+IRAPM dispatches alerts via two channels:
+
+- **Email** via Gmail SMTP (operator-configured; credentials in `.env`).
+- **SMS** via Twilio (operator-configured; credentials in `.env`).
+
+**All alerts are dispatched on both channels** regardless of
+severity. Rationale: SMS is the reliability layer (delivers even
+during data plan outages or remote-area connectivity loss); email
+is the detail layer (full structured content, easier to read on a
+larger screen). The two channels carry the same information at
+different abbreviation levels — email gets the full structured body;
+SMS gets a concise summary with a directive to check email for
+details.
+
+Severity affects retry behavior on dispatch failure (§9.3.3) but
+not channel selection.
+
+#### 9.3.1 Alert content structure
+
+All alerts include a structured body with:
+- Cycle ID and timestamp
+- Triggering condition (state transition, action result, etc.)
+- Current operating state snapshot (Phase, CB state, Income state,
+  guards)
+- Relevant numerical context (signal value, portfolio value, etc.)
+- Plan summary (what the cycle did or attempted)
+
+SMS messages are necessarily abbreviated; they include the most
+essential info and direct the operator to check email for details.
+
+#### 9.3.2 Deduplication
+
+Alerts include a deduplication key. Within a configurable window
+(default: 24 hours), repeated alerts with the same dedup key are
+suppressed (only the first sends; subsequent occurrences increment
+a counter that's reported in the next alert that does fire).
+
+This prevents alert storms during persistent conditions (e.g., a
+broker outage that fails every cycle for hours).
+
+#### 9.3.3 Failure modes and retry behavior
+
+| Failure | IRAPM response |
+|---|---|
+| Email send fails | Log; do not fail the cycle; record for retry next cycle |
+| SMS send fails (Info, Notice, Warning severity) | Retry once; if still fails, log; do not fail the cycle |
+| SMS send fails (Critical severity) | Retry up to 3 times with exponential backoff; if still fails, log to durable state with elevated visibility |
+| Both channels fail simultaneously | Log to durable state; surfaced as Warning at next successful cycle (operator may have lost both connectivity types) |
+
+The principle: **alert dispatch is best-effort and does not gate
+system operation.** The operator can always inspect logs to discover
+events that should have alerted but didn't reach them.
+
+### 9.4 Persistence interface
+
+IRAPM persists state to local files on the CL260 box's pSLC SSD.
+The persistence layer provides:
+
+- **State file** — current operating state (§6.7 persistent state list)
+- **CB transition log** — append-only log per §6.7 / §7.6
+- **Cycle log** — per-cycle record of (timestamp, plan, execution
+  outcomes, alerts dispatched). Used for audit and recovery. Plans
+  are written here, not to the state file.
+- **Annual review log** — per-year record of freeze decisions and
+  recompute results (§6.7).
+- **Token check log** — daily token observations.
+- **Alert log** — every dispatched alert (success, failure, dedup
+  suppressions).
+- **Coordination log** — heartbeat and role-transition events.
+
+#### 9.4.1 Write semantics
+
+- **Atomic writes.** State files are written atomically (write to
+  temp file, fsync, rename). A crash during write leaves the prior
+  state file intact.
+- **End-of-cycle persistence.** The state file is written once per
+  cycle, after action execution completes (or fails). A crash
+  during action execution is recovered from the prior state file
+  plus broker-side reconciliation on next cycle.
+- **Append-only logs.** All log files are append-only. Old entries
+  are never modified. Rotation policy per §9.4.5.
+
+#### 9.4.2 Master/slave coordination
+
+IRAPM runs on two CL260 boxes in a master/slave configuration. Both
+boxes have IRAPM installed; at any given time, exactly one is acting
+as **master** (executing cycles, making decisions, taking actions)
+and the other as **slave** (running only the lightweight daily slave
+check, not running full cycles). The architecture is a hybrid of two
+patterns: each box maintains a complete **local** state file (no
+shared network dependency), and **the master's state write is itself
+the heartbeat** (no separate ping daemon, no liveness pings to
+miss).
+
+The combination resolves the central tension in two-box HA: a shared
+state location creates a third point of failure (the share / NAS /
+network mount), but a separate ping mechanism can miss
+application-level failures (the box pings fine but IRAPM is hung or
+broken). The hybrid retains the resilience of local-only state (each
+box can operate from its own disk if the other is destroyed) while
+keeping the elegance of "state-write proves IRAPM is functioning
+end-to-end."
+
+**Architecture:**
+
+- Each box stores its operating state file **locally** on its own
+  pSLC SSD. There is no shared mount, no NAS, no network share, no
+  cross-host filesystem.
+- Master writes its state file at end of each cycle, plus a daily
+  idempotent heartbeat write at a configured time (default 06:00 ET)
+  regardless of whether a cycle ran that day.
+- A `cron`-driven `rsync` job on master replicates its state file to
+  slave's local disk daily (default 06:15 ET, after master's
+  heartbeat). The rsync direction always matches the role:
+  master → slave. (When roles swap, the rsync direction reverses;
+  see "Replacing a failed box" below.)
+- Slave runs a lightweight daily "slave check" cycle (default 06:30
+  ET, after rsync completes) reading its **local** copy of the state
+  file. It inspects `master_box_id` and `last_master_write_timestamp`
+  to assess master liveness.
+
+**Role state machine (per-box):**
+
+Each IRAPM instance maintains a `role` state: `MASTER`,
+`SLAVE_SLEEPING`, `SLAVE_PROMOTION_PENDING`, or `STARTING`. Role is
+per-box infrastructure and is **not** part of the operating-mode
+tuple (§6).
+
+Role transitions:
+
+| From | To | Trigger |
+|---|---|---|
+| STARTING | MASTER | On startup, local state file's `master_box_id` matches this box (or absent/never-initialized — initial deployment) |
+| STARTING | SLAVE_SLEEPING | On startup, local state file's `master_box_id` is the peer |
+| SLAVE_SLEEPING | SLAVE_PROMOTION_PENDING | Slave check observes staleness ≥ `slave_wake_staleness_hours` (default 72h) with no fresh heartbeat from master (rsync brings no updated state, or rsync arrives but `last_master_write_timestamp` has not advanced). Staleness in `[slave_healthy_threshold_hours, slave_wake_staleness_hours)` logs a notice but does not transition |
+| SLAVE_PROMOTION_PENDING | MASTER | 48 hours elapsed since promotion-pending started, and master heartbeat is still stale |
+| SLAVE_PROMOTION_PENDING | SLAVE_SLEEPING | Fresh master heartbeat arrives via rsync during the 48-hour grace window (auto-cancels promotion) |
+| MASTER | SLAVE_SLEEPING | On observing a peer state-file write (via reverse rsync after repair, see below) that claims master role and is more recent than this box's last write |
+
+**State-file fields used for coordination:**
+
+- `master_box_id` — OS hostname or auto-generated UUID of the box
+  currently holding the master role.
+- `last_master_write_timestamp` — wall-clock timestamp of the most
+  recent master write (cycle write or heartbeat write).
+- `master_ipv4_last_octet` — recorded in each state-file write for
+  split-brain tiebreaking (see §9.4.3).
+
+**Slave detection of master failure:**
+
+The slave-check cycle runs daily and performs these steps. All
+timestamp comparisons operate in hours; configuration is in hours
+throughout to eliminate days/hours mixing:
+
+1. Read local state file (which was synced from master via the most
+   recent rsync, if rsync succeeded).
+2. Inspect `last_master_write_timestamp` and compute staleness
+   in hours from `now`.
+3. If staleness is less than `slave_healthy_threshold_hours`
+   (default 24): master is healthy. Remain in SLAVE_SLEEPING.
+4. If staleness is between `slave_healthy_threshold_hours` and
+   `slave_wake_staleness_hours` (default 24 to 72): log a
+   notice; remain in SLAVE_SLEEPING. (Single missed heartbeat is
+   tolerated — could be a 24-hour cron miss or rsync glitch.)
+5. If staleness is greater than `slave_wake_staleness_hours`
+   (default 72) and this box is in SLAVE_SLEEPING: transition to
+   SLAVE_PROMOTION_PENDING and record `promotion_pending_started_at`
+   timestamp in local state. Fire a Critical alert: "Primary box
+   offline — secondary will auto-promote in
+   [slave_promotion_grace_hours] hours unless primary returns.
+   Last master heartbeat [N] hours ago at [timestamp]."
+6. If this box is already in SLAVE_PROMOTION_PENDING: compute
+   elapsed time since `promotion_pending_started_at`. If at least
+   `slave_promotion_grace_hours` (default 48) have elapsed since
+   the SLAVE_PROMOTION_PENDING transition, AND master heartbeat is
+   still stale (per step 5 condition), proceed to promotion (see
+   below). The grace clock anchors to the SLAVE_PROMOTION_PENDING
+   transition timestamp, not to the master's last heartbeat — this
+   means the grace window's wall-clock duration is precisely
+   defined regardless of cycle-runtime drift.
+7. If this box is in SLAVE_PROMOTION_PENDING and a fresh heartbeat
+   has arrived (staleness less than `slave_healthy_threshold_hours`):
+   transition back to SLAVE_SLEEPING; clear
+   `promotion_pending_started_at`. Fire an Info alert: "Primary
+   heartbeat recovered. Promotion cancelled."
+
+The 48-hour grace window allows the operator (or in Phase 3, the
+survivor) time to reboot, repair, or replace the failed primary
+before automatic promotion. No explicit acknowledgment is required
+to cancel: if primary returns and resumes writing, slave observes
+the fresh timestamp on the next rsync and cancels promotion
+automatically.
+
+**Promotion mechanic:**
+
+When slave promotes (72-hour staleness + 48-hour grace elapsed):
+
+1. Confirm staleness one final time by re-reading the local state
+   file (defense against clock skew or last-minute rsync arrival).
+2. Atomically write a new local state file with `master_box_id` set
+   to this box and `last_master_write_timestamp` set to now.
+3. Generate a Critical alert: "Slave promoted to master. Previous
+   master last heartbeat [N] days ago. Now operating as master."
+4. Reverse the rsync direction in cron configuration: this box's
+   cron now pushes state to peer (peer becomes the rsync receiver
+   when it returns online).
+5. Begin operating as master. The next scheduled IRAPM cycle runs
+   from the most-recent local state file (which may be up to 72 hours
+   stale on portfolio data, but the broker query at cycle start
+   refreshes actual positions before any decision is made).
+
+**Role-swap, not failback.** When a failed primary returns online,
+the system does **not** automatically restore it to master. The
+currently-running master continues. The returning box detects the
+new master state via the next rsync (now pushed *from* the new
+master to it) and transitions to SLAVE_SLEEPING. This is a
+deliberate design choice: role swaps reduce state-transition surface
+area (every failback would be an additional transition with its own
+failure modes) and the operator does not need to predict "which box
+is currently primary" — they can inspect either box's local state
+file to see `master_box_id`.
+
+If the operator explicitly wants to swap roles back (e.g., the
+original primary is preferred hardware), they perform a manual swap:
+
+1. Stop IRAPM on the current master.
+2. Wait 120 hours (72 hours staleness + 48 hours grace) for the other box to auto-promote.
+3. Bring the original primary back online; it observes the new
+   master and becomes slave.
+
+Alternatively, operator may use a documented manual override
+procedure (per the operational runbook, §14.4) that atomically
+swaps `master_box_id` and reverses rsync direction without waiting
+through the auto-promotion sequence.
+
+**Repaired-box reintegration:**
+
+When a failed master is repaired and brought back online:
+
+1. IRAPM starts on the repaired box.
+2. It reads its local state file (which has not been updated since
+   failure; `master_box_id` may still be this box's ID with a stale
+   timestamp).
+3. It checks for incoming rsync data from the peer. Two cases:
+   - **Slave has not yet promoted** (returned within the 120-hour
+     window): peer is still in SLAVE_SLEEPING (or SLAVE_PROMOTION_PENDING).
+     Repaired box's heartbeat will arrive at peer via the original
+     rsync direction (which is still master → slave from repaired
+     box's perspective). The repaired box continues as MASTER. Peer
+     observes the fresh heartbeat on its next slave check and cancels
+     any pending promotion.
+   - **Slave has already promoted** (returned after the 120-hour
+     window): rsync from peer (new master → this box, reverse
+     direction) has been arriving. The repaired box's local state
+     file is being updated by incoming rsync. It reads
+     `master_box_id` and sees the peer is now master.
+4. If peer is master: repaired box transitions to SLAVE_SLEEPING.
+   Generate Info alert: "Restarted as slave — peer is now master."
+   Stop attempting to write state as master; let incoming rsync
+   continue to populate state file.
+5. If repaired box has been gone long enough that **its local cron
+   was driving rsync in the wrong direction** (e.g., it failed
+   without realizing it, and cron tried to push stale state to peer
+   for some time during the partition), this is benign in the
+   hybrid: incoming rsync from new master always wins by
+   overwriting on the receiving side. No special cleanup needed.
+
+**Replacing a failed box (full hardware replacement):**
+
+When the operator physically replaces a failed box with new
+hardware:
+
+1. New box is configured with IRAPM installed.
+2. New box's local state file is empty / nonexistent.
+3. Operator configures rsync on **the running master**: master pushes
+   state to the new box on its next cron cycle.
+4. New box receives state file via incoming rsync. Reads it. Sees
+   `master_box_id` is the peer.
+5. New box transitions to SLAVE_SLEEPING.
+6. Operator configures the new box's local cron to receive rsync
+   (no outbound rsync from new box). Future promotion will reverse
+   this if needed.
+
+**Configuration:**
+
+- `master_heartbeat_time` — daily time for master heartbeat write
+  (default: 06:00 ET).
+- `rsync_replication_time` — daily time for rsync push from master
+  to slave (default: 06:15 ET).
+- `slave_check_time` — daily time for slave to read local state and
+  check freshness (default: 06:30 ET).
+- `slave_healthy_threshold_hours` — staleness threshold below which
+  master is considered healthy (default: 24). At or above this
+  threshold, a notice is logged but no promotion is initiated.
+- `slave_wake_staleness_hours` — staleness threshold for slave to
+  enter SLAVE_PROMOTION_PENDING (default: 72, formerly
+  `slave_wake_staleness_days = 3`).
+- `slave_promotion_grace_hours` — grace window before auto-promotion
+  completes, measured from SLAVE_PROMOTION_PENDING transition
+  timestamp (default: 48).
+- Per-box rsync configuration (source/dest paths, current direction)
+  is operational, not in shared ruleset.
+
+All coordination-subsystem timing parameters are in hours, including
+the staleness threshold (which was previously specified in days).
+This eliminates a days-vs-hours mixing that previously created
+ambiguity about off-by-one execution boundaries when cycle runtimes
+drifted.
+
+#### 9.4.3 Split-brain prevention and resolution
+
+Two failure modes can produce a split-brain scenario where both
+boxes believe they are master:
+
+- **Network partition during slave promotion:** the boxes lose
+  network connectivity to each other (rsync cannot flow); slave
+  reaches the 120-hour threshold and promotes; meanwhile, the
+  original master is actually fine but unreachable. When the
+  network heals, both boxes are running cycles as master.
+- **Simultaneous startup with stale state files:** unusual case
+  where both boxes restart simultaneously and both local state
+  files claim this-box-is-master (possible if both boxes failed,
+  were restored to old backups independently, and then restarted).
+
+The first scenario is the dangerous one. Without prevention, both
+boxes would execute cycles against the same IBKR account
+concurrently, potentially placing duplicate orders or conflicting
+ACH updates. The hybrid model addresses both prevention and
+resolution.
+
+**Prevention: rsync direction enforces single-writer.**
+
+Under normal operation, exactly one box is the rsync source and
+exactly one is the receiver. Slave's role does NOT include writing
+state — only reading its local state file (which is populated by
+incoming rsync from master). If slave does not promote, no
+split-brain can occur regardless of network state, because slave
+never writes state.
+
+Slave's promotion is gated on 72-hour staleness + 48-hour grace. This
+is the only mechanism by which slave begins writing state and
+acting as master. During the partition that causes the staleness,
+the original master continues running cycles and writing its local
+state — but its writes do not propagate to slave (rsync is failing).
+When slave eventually promotes, its first action is to atomically
+update its local state file and reverse rsync direction.
+
+Once both boxes are running cycles as master, the next time the
+network heals (rsync resumes in some direction), one of them sees
+the other's state file and the resolution mechanic activates.
+
+**Resolution: IPv4 last-octet tiebreak.**
+
+When network heals and the boxes detect each other claiming master:
+
+1. The first box to receive a peer state-file rsync (with peer
+   claiming master role and a recent `last_master_write_timestamp`)
+   triggers split-brain resolution.
+2. Both boxes compare their own IPv4 last octet against the peer's
+   (recorded in each state-file write via `master_ipv4_last_octet`).
+3. **Higher last octet wins** — that box stays MASTER. Its rsync
+   direction (outbound) is correct.
+4. **Lower last octet** transitions to SLAVE_SLEEPING and reverses
+   its rsync direction to incoming-only.
+5. Both boxes generate Critical alerts: "Split-brain detected and
+   resolved during partition recovery. This box is [winner / loser].
+   Operator review required to identify any conflicting trades
+   executed during partition."
+6. The losing box's cycle log from the partition period is preserved
+   and surfaced in the alert body for operator review.
+
+**Tiebreak rule edge cases:**
+
+- **Same last octet (different subnets):** out of scope. Both
+  CL260 boxes must be deployed on the same subnet for the
+  master/slave coordination model (rsync, heartbeat, state sync)
+  to function. Deployment on different subnets is unsupported and
+  would impair state synchronization independent of any tiebreak
+  considerations. The tiebreak rule (last-octet comparison) is
+  reliable on same-subnet deployments and is the only supported
+  configuration.
+- **Boxes never detect each other during partition:** if rsync never
+  resumes (e.g., one box is destroyed, the other has been
+  partitioned indefinitely), the promoted box continues operating
+  alone. This is the expected steady state after permanent loss of
+  the original primary. No alert until either: (a) repaired or
+  replacement box brings rsync back, or (b) an operator-driven
+  health check detects the asymmetric configuration.
+
+**Why prevention is stronger here than in the shared-state model:**
+
+In a shared-state model, network partition typically halts both
+boxes (neither can write to shared state). Availability suffers.
+
+In the hybrid rsync model, network partition halts replication but
+neither box halts on its own. The original master continues
+operating from local state. Availability is preserved at the cost
+of accepting the possibility of split-brain at promotion time —
+which is then resolved by tiebreak when the network heals.
+
+This trade-off is appropriate for IRAPM's cadence: cycles run
+weekly, withdrawals run monthly, and the chance of a single
+partition lasting >5 days *and* coinciding with operationally
+significant events is low. When it does happen, the tiebreak
+resolves cleanly and the operator reviews the cycle log to confirm
+no actual harm was done.
+
+#### 9.4.4 Persistence failure modes
+
+| Failure | IRAPM response | Category |
+|---|---|---|
+| Local state file write fails | Cycle ends in inconsistent state; abort | Critical-blocking |
+| Local state file missing on startup | If never-initialized: bootstrap as MASTER on initial deployment, else refuse to start and alert | Critical-blocking (post-deployment) |
+| Local state file corrupt on startup | Refuse to start; alert; operator restores from peer box's copy | Critical-blocking |
+| Rsync push fails (master side) | Log; cycle does not fail; next day's cron retries | Warning (auto-recovers) |
+| Rsync receive fails / no incoming data (slave side) | Slave check sees no fresh `last_master_write_timestamp`; staleness accumulates per §9.4.2 promotion logic | Notice → Critical on promotion threshold |
+| Disk full | Cycle ends in failure | Critical-blocking |
+| Split-brain detected | Apply IP-last-octet tiebreak; loser → SLAVE_SLEEPING; operator review of partition-period cycle log | Critical-blocking (both boxes alert) |
+| Split-brain unresolvable (same last octet) | Both boxes refuse to operate; manual resolution required | Critical-blocking |
+
+State persistence is the most failure-critical interface. The system
+prioritizes refusing-to-run over running-with-bad-state.
+
+#### 9.4.5 Log rotation
+
+- **Daily rotation** for: cycle log, coordination log, alert log,
+  token check log.
+- **Retention 90 days** for cycle/coordination/alert/token logs.
+- **Indefinite retention** for CB transition log and annual review
+  log (small data volume; needed for freeze evaluation and audit).
+- **Off-box backup of logs** is OUT OF SCOPE for IRAPM. The operator
+  may use OS-level tools (rsync, NAS replication, cloud sync) to
+  back up logs; IRAPM does not provide this functionality.
+
+### 9.5 Hardware token interface
+
+Detailed in §10. The tokens interact with IRAPM as a read-only state
+that the cycle reads at step 1 (input refresh).
+
+### 9.6 Time and scheduling interface
+
+IRAPM cycles are scheduled by systemd timers (Linux) or equivalent.
+The IRAPM process itself does not run a scheduler; it is invoked
+once per cycle by the OS scheduler.
+
+Scheduled cycles (per §3.8 and §6.5.1):
+
+- **Weekly primary cycle** — runs on a configured day/time
+  (default: Wednesday 10:00 ET). Performs full state evaluation,
+  decision generation, and action execution.
+- **Daily token check** — runs at 09:00 daily. Minimal scope: token
+  state read, write to local state file, alert on mismatches.
+- **Monthly withdrawal cycle** — runs on a configured day of month.
+  Must be **at least 2 trading days before** the IBKR recurring ACH
+  withdrawal date. Performs the standard weekly cycle work plus the
+  monthly withdrawal SELLs to fund the upcoming IBKR ACH transfer.
+- **Annual review cycle** — runs on the configured annual review
+  date (default: January 15; shifts to next trading day if weekend
+  or market holiday). Performs the standard weekly cycle work plus
+  the annual review evaluations (§7.6).
+
+The scheduler configuration lives outside IRAPM (in systemd unit
+files). IRAPM is invoked with a `--cycle-type` argument that tells
+it which evaluations and actions to run.
+
+**Cycle-type collisions** are handled by precedence: annual-review >
+monthly-withdrawal > weekly > daily-token. The more comprehensive
+cycle type subsumes the less comprehensive when they fall on the same
+day.
+
+#### 9.6.1 Settlement separation between SELL and ACH
+
+US equity ETFs settle T+1. ACH withdrawals require **settled** cash;
+same-day SELL + ACH initiation will fail at the broker. IRAPM handles
+this constraint at the **scheduling layer**, not in mid-cycle delays:
+
+- The monthly withdrawal step within the weekly cycle's SELL orders fund cash that becomes
+  withdrawable T+1 (next trading day after fill).
+- The IBKR recurring ACH transfer happens on a separately-configured
+  day of the month.
+- Scheduling rule: the monthly withdrawal step within the weekly cycle must run **at least 2
+  trading days before** the IBKR ACH date, providing a settlement
+  buffer.
+
+Example: if the IBKR ACH transfer runs on the 5th of each month
+(assume the 5th is a Wednesday), the monthly withdrawal step within the weekly cycle should
+run on or before Monday the 3rd (2 trading days back). SELLs fill
+same-day; cash settles by Tuesday the 4th; the ACH transfer initiates
+on Wednesday the 5th with settled cash available.
+
+Holiday/weekend shift: if the scheduled withdrawal cycle day falls on
+a market-closed day, it shifts to the **next trading day**. The
+operator should configure the IBKR ACH date with enough buffer that
+the +1-day shift still leaves ≥2 trading days of settlement runway.
+
+For SELL + BUY operations within the same cycle (rebalancing,
+buffer refills, phase transitions), no settlement separation is
+needed: IBKR allows unsettled SELL proceeds to fund same-day BUY
+orders within an IRA.
+
+### 9.7 Resolved questions (External Interfaces)
+
+- **Cycle scheduling:** operator preference; default Wed 10:00 ET.
+- **ACH update timing:** ACHScheduleUpdate retries on next cycle if
+  rejected (§8.2.7).
+- **Shared state location:** infrastructure choice; spec requires only
+  atomic read/write capability from both boxes.
+- **Log rotation:** daily, 90-day retention for most logs, indefinite
+  for CB transition + annual review (§9.4.5).
+- **Manual role-swap:** "stop master, wait for slave to wake, restart
+  original master into slave role" mechanic; no special command needed.
+- **Multi-subnet deployment:** out of scope. Both CL260 boxes must
+  be deployed on the same subnet for master/slave coordination
+  (rsync, heartbeat, state sync) to function. Last-octet tiebreak
+  is reliable on same-subnet deployments and is the only supported
+  configuration.
+
+---
+
+## §10. Hardware Tokens
+
+IRAPM uses physical USB tokens to control two distinct system
+behaviors:
+
+- **Phase 3 activation** — four "Phase 3" tokens whose physical
+  removal triggers the Phase 1/2 → Phase 3 transition.
+- **Income pause** — one or more "STOP INCOME" tokens whose presence
+  pauses scheduled withdrawals.
+
+The token mechanism is the system's interface to **operator life
+events**. It is the only mechanism by which the survivor (or the
+operator themselves, in the income-pause case) communicates with the
+running system without requiring login credentials, network access, or
+software interaction.
+
+### 10.1 Design principles
+
+The hardware-token mechanism is governed by these principles:
+
+- **Physical action, not logical.** The trigger is the physical
+  presence (or absence) of a USB token. No GUI button, no API call,
+  no command-line invocation, no software override can substitute.
+  This is deliberate — the survivor scenario assumes the operator is
+  unavailable to log in, the survivor lacks system credentials, and
+  the survivor's tech-support resources cannot be assumed to include
+  anyone with system-administration skill. **There is no software
+  override path** for either token type; the hardware-only constraint
+  is a load-bearing element of the system's survivor-safety model.
+- **Two-box AND semantics.** Phase 3 activation and STOP INCOME both
+  require **both** CL260 boxes to agree on the token state. A single
+  box reading a state change is insufficient. This protects against
+  hardware failures (one box's USB controller fails), single-token
+  failures (one drive fails in-place), and accidental token
+  disturbance affecting only one box.
+- **Type+presence detection, not serial-number identification.** The
+  system identifies tokens by their type and quantity, not by
+  individual serial numbers. The cycle confirms "4 Phase 3 tokens
+  present" or "1 STOP INCOME token present per box", not "tokens
+  with serial numbers X, Y, Z, W are present." Rationale: replacing
+  a failed token shouldn't require a configuration update; misreading
+  a serial number shouldn't trigger a false negative.
+- **Inverse normal-state semantics by token type.** The two token
+  types have opposite normal states, each chosen to match its purpose:
+  - **Phase 3 tokens are normally INSERTED.** All four Phase 3 tokens
+    (2 per box) reside continuously in their USB ports throughout
+    Phase 1 and Phase 2 operation. Phase 3 activation triggers when
+    all four are physically **removed**.
+  - **STOP INCOME tokens are normally REMOVED.** Each box has one
+    STOP INCOME token slot kept empty during normal operation. The
+    STOP INCOME tokens themselves reside in a powered USB charger
+    next to the CL260 boxes (continuously powered, accessible but
+    out of slot). Income pause triggers when STOP INCOME tokens
+    are physically **inserted** into both boxes.
+- **Rationale for inverse semantics.** Two design pressures drive
+  this asymmetry:
+  - **Bitrot prevention for Phase 3 tokens.** Industrial USB tokens
+    held continuously inserted are kept alive by the host's normal
+    USB I/O activity (periodic media-scan, error-correction read
+    cycles, controller refresh). A token sitting unused in a safe
+    deposit box or drawer for 10–20 years is at non-trivial risk of
+    silent data corruption — the kind of failure that would manifest
+    only at the moment of greatest need. Continuous insertion keeps
+    Phase 3 tokens in-circuit and integrity-maintained indefinitely.
+    The STOP INCOME tokens, by contrast, are used routinely (every
+    pause/resume cycle) and don't accumulate the decade-scale unused
+    period that drives bitrot risk. The charger slot keeps them
+    powered (preventing flash-cell decay) without requiring an
+    occupied USB slot on the CL260s.
+  - **No retrieval-during-grief problem.** Phase 3 tokens being
+    already present at trigger time means the survivor doesn't need
+    to find a safe deposit box key, travel to a bank, or coordinate
+    with anyone external to obtain the tokens. The activation action
+    is a single physical removal that can happen at the boxes
+    themselves with whatever support the survivor has on-site.
+- **Grace window for accidental Phase 3 removal.** Phase 3
+  activation has a 24-hour delay between detection and latch, giving
+  the operator (or survivor, if removal was accidental) time to
+  recover from incidental token disturbance — cleaning, dust, child
+  or pet, contractor working in the area, etc.
+- **No grace window for STOP INCOME.** STOP INCOME state changes are
+  intentional operator actions. Insertion takes effect on the next
+  daily-token cycle (≤24 hours latency, no grace window). Removal
+  also takes effect on the next daily-token cycle.
+- **Permanent latch for Phase 3.** Once the 24-hour grace window
+  elapses without re-insertion, Phase 3 is latched. Subsequent
+  re-insertion of the tokens does NOT exit Phase 3.
+- **Reversible STOP INCOME.** STOP INCOME insertion and removal can
+  toggle the income state any number of times during Phase 1 or
+  Phase 3. This implements the reversible-where-possible operational
+  principle (§1.4). In Phase 2, STOP INCOME is a no-op per §4.4.
+
+### 10.1.1 Physical security model
+
+The hardware-token mechanism's reliability depends on a physical
+security configuration that is operator-maintained but assumed by
+IRAPM. The system specification does not enforce these
+configurations (there is no software check that the enclosure is
+secured), but the threat model and operational behavior below
+assume the configuration is in place.
+
+**Enclosure.** Both CL260 boxes are housed in a single
+expanded-metal cabinet with a hinged access door. The door is
+**safety-wired shut** during normal operation. Defeating the
+enclosure requires tools (wire cutters or pliers) and visible
+disturbance — the access pattern is high-friction enough to rule
+out casual or accidental tampering, while remaining accessible to
+the operator (or survivor with on-site support) when intentional
+access is needed.
+
+**Token chaining.** All tokens are physically chained to their
+respective CL260 boxes via short braided-steel lanyards. This
+prevents:
+- Loss during cleaning or other incidental contact with the cabinet
+- Removal-and-pocketing during any access event
+- Accidental disposal during operator-life-event chaos
+
+**Phase 3 token layout.** Two Phase 3 tokens per box (4 total),
+each chained to its respective box, each inserted continuously into
+a USB port. The chain length permits removal-for-trigger but not
+relocation.
+
+**STOP INCOME token layout.** Each box has one STOP INCOME token,
+chained to the box, residing in a powered USB charger slot adjacent
+to the box during normal operation. To trigger pause, the token is
+moved from the charger slot into a USB port on the CL260; the chain
+length permits this. Spare STOP INCOME tokens (2 per box, also
+chained) reside in adjacent charger slots; their function is
+hot-spare replacement of the primary token if it fails. The chargers
+keep all tokens powered to prevent the inverse-bitrot problem
+(flash-cell decay in entirely unpowered tokens).
+
+**Threat coverage:**
+
+| Threat | Mitigation |
+|---|---|
+| Cats, incidental physical contact | Enclosure blocks contact entirely |
+| Casual human tampering | Safety-wire makes access deliberately high-friction |
+| Token loss (drop / displacement) | Chain attachment prevents loss |
+| Phase 3 token bitrot over decades | Continuous insertion + USB controller activity |
+| STOP INCOME token bitrot in storage | Powered charger slot keeps tokens alive |
+| Single USB port hardware failure | AND-across-boxes semantics requires both boxes to fail |
+| Single token hardware failure (Phase 3) | AND-across-boxes: peer box's token preserves correct state |
+| Single token hardware failure (STOP INCOME) | Hot-spare tokens in chargers; operator swaps in spare |
+| Sophisticated adversary with physical access and tools | **Not covered.** The system assumes operator-grade physical security, not adversarial security. |
+
+The threat model is incidental and accidental, not adversarial. A
+determined adversary with physical access, time, and tools can
+defeat the enclosure; this is an accepted limitation, consistent
+with the broader assumption that the boxes reside in a controlled
+private space.
+
+### 10.2 Token types and counts
+
+The system uses two distinct USB token types, distinguishable by
+device characteristics (vendor ID, product ID, capacity, filesystem
+label, or similar properties detectable without inspecting serial
+numbers).
+
+| Token type | Normal state | Per-box active count | Per-box spares | Total active | Total physical | Purpose |
+|---|---|---|---|---|---|---|
+| Phase 3 token | INSERTED in USB port | 2 | 0 | 4 | 4 | Phase 3 activation (removal triggers) |
+| STOP INCOME token | REMOVED, in adjacent charger | 1 | 2 | 2 | 6 | Income pause (insertion triggers) |
+
+**Active count** is the number of tokens IRAPM expects to detect by
+type during normal cycle operation. **Spare count** is additional
+physical tokens stored powered-but-not-in-USB-port (STOP INCOME
+chargers); these are not detected during normal cycle operation
+and serve as hot-spares for token failure.
+
+Detection logic per §10.3:
+
+- **Phase 3 token detection** counts tokens-of-correct-type currently
+  inserted in CL260 USB ports. Active count = 2 per box (4 total).
+  Removal trigger fires when the inserted count drops to 0 on both
+  boxes.
+- **STOP INCOME token detection** counts tokens-of-correct-type
+  currently inserted in CL260 USB ports. Active count = 1 per box
+  (2 total) when income is paused, 0 per box when income is
+  active. The spare tokens in chargers are not counted (they are
+  not inserted in CL260 USB ports).
+
+Each box has a USB hub configuration that physically separates the
+two token types (different ports, labeled or color-coded). The
+operator maintains spare STOP INCOME tokens in the charger slots
+for replacement of failed units (per §10.1.1 physical security
+model).
+
+### 10.3 Token detection mechanism
+
+Each box runs a daily-token cycle independently. Token observations
+are exchanged between boxes via the same rsync mechanism that
+replicates the operating state file (per §9.4.2). The current master
+consults both boxes' observations to derive system-level token
+state:
+
+1. Each box runs its own daily-token cycle on its own schedule
+   (default 09:00).
+2. The cycle enumerates USB devices, classifies each as Phase 3 token
+   / STOP INCOME token / other, and counts per-type.
+3. The cycle writes its observation to a local **token observation
+   file** (`token_observation.json`, separate from the operating
+   state file): `(box_id, timestamp, phase3_count, stopincome_count, status)`
+   where status is one of READABLE, UNAVAILABLE. The slave's
+   observation file is replicated to master via a **dedicated
+   slave→master rsync** of the observation file (separate from the
+   master→slave operating-state-file replication described in
+   §9.4.2), scheduled to run shortly after the slave's daily-token
+   cycle completes. The operating state file remains master-write-only;
+   the single-writer rationale for split-brain prevention (§9.4.3)
+   is unaffected because the token observation file is not used for
+   master/slave promotion decisions.
+4. After both boxes' observations have been collected on master,
+   master derives the system's token state:
+   - Phase 3 tokens removed: BOTH boxes report `phase3_count == 0`.
+     Either box reporting `phase3_count > 0` means tokens still
+     present.
+   - STOP INCOME inserted: BOTH boxes report `stopincome_count >= 1`.
+   - STOP INCOME removed: BOTH boxes report `stopincome_count == 0`.
+   - Mismatches: see §10.5.
+
+Observation freshness gates this: master uses only slave
+observations that are within the past 24 hours. Older observations
+are treated as UNAVAILABLE for the affected box.
+
+### 10.4 UNAVAILABLE state
+
+A box's token observation can fail for various reasons (USB driver
+issue, system call failure, file lock, etc.). When a box cannot read
+its USB devices reliably, it reports `status: UNAVAILABLE` instead of
+a count.
+
+UNAVAILABLE handling:
+
+- The system **holds its previous token state** while a box is
+  UNAVAILABLE. No Phase 3 activation, no STOP INCOME state change.
+- Generic alert (Notice severity): "Box [id] cannot read tokens."
+  Generic — does NOT specify whether Phase 3 or STOP INCOME tokens
+  are affected, since the box can't tell.
+- If UNAVAILABLE persists for >2 daily cycles, alert escalates to
+  Warning.
+- If UNAVAILABLE persists for >7 daily cycles on the same box, alert
+  escalates to Critical (Critical-blocking — operator must
+  investigate).
+- If both boxes report UNAVAILABLE simultaneously, immediate Critical
+  alert (token monitoring functionally lost).
+
+The conservative "hold previous state" rule prevents UNAVAILABLE from
+being exploited as a Phase 3 activation path. A box with a broken
+USB controller cannot trigger Phase 3 by failing to see the tokens.
+
+### 10.5 Mismatch handling and token-state validity
+
+The token system has a tightly-constrained notion of **valid
+system-level states**. Anything outside these is treated as
+invalid and triggers hold-previous-state with an alert.
+
+**Valid Phase 3 token states** (system-level, across both boxes):
+
+- **All-inserted:** Box A `phase3_count == 2` AND Box B
+  `phase3_count == 2`. Total = 4. Normal operating state.
+- **All-removed:** Box A `phase3_count == 0` AND Box B
+  `phase3_count == 0`. Total = 0. Triggers Phase 3 activation
+  flow per §10.6.
+
+Any other Phase 3 token configuration — partial counts on either
+box (1 per box, 1 on one and 2 on the other, etc.), asymmetric
+states between boxes — is **invalid** in normal operation. Note
+the exception: during the Phase 3 grace window (§10.6.2), partial
+counts have explicit meaning — any nonzero token count on either
+box is a candidate abort signal (with one-cycle persistence
+confirmation) rather than an invalid state.
+
+**Valid STOP INCOME token states** (system-level):
+
+- **All-removed:** Box A `stopincome_count == 0` AND Box B
+  `stopincome_count == 0`. Income state is ACTIVE.
+- **All-inserted:** Box A `stopincome_count >= 1` AND Box B
+  `stopincome_count >= 1`. Income state transitions to PAUSED.
+
+Any other STOP INCOME configuration (one box inserted, other
+removed) is **invalid**.
+
+**System response to invalid states:**
+
+- The system **holds its previous state** until a valid state is
+  observed (per §10.5.1).
+- Alert (Warning severity): "Token state invalid — Box A reports
+  [counts], Box B reports [counts]. Expected valid state
+  [all-inserted / all-removed]. Holding previous state."
+- If the invalid state persists for >2 daily cycles, the alert
+  escalates to Critical (configurable:
+  `token_mismatch_critical_cycles`, default 2).
+
+Invalid states are the expected pattern at the **start** of a
+legitimate state change: one box's daily-token cycle runs before
+the other's, so for some hours the boxes report different counts.
+The 2-cycle escalation threshold allows for normal asynchronous
+detection without nuisance escalation while ensuring genuine
+persistent invalid states surface promptly. Hardware failures,
+single-token failures, accidental partial removal, and tampering
+attempts all manifest as invalid intermediate states.
+
+For the special case where the invalid state occurs **during the
+Phase 3 grace window**, see §10.6.2: the grace window uses its
+own pattern logic (any-re-insertion aborts with one-cycle
+persistence confirmation) rather than the general
+hold-previous-state mismatch rule. The grace window is the only
+context where partial / asymmetric token counts have an
+explicit non-hold interpretation.
+
+#### 10.5.1 Hold-previous-state as a named design principle
+
+The hold-previous-state behavior on invalid token configurations
+is a deliberate design choice with a specific safety property:
+**state changes require positive confirmation from both boxes in a
+specifically-defined valid configuration**. A single point of
+failure — one failed USB token, one glitched box, one accidentally-
+disturbed port — cannot produce a state change, because the
+resulting partial / asymmetric reading is not a valid system-level
+state. Combined with invalid-state alerts (§10.5), the system is
+robust against single-token failures, single-box glitches, and
+most accidental tampering scenarios.
+
+The alternatives considered and rejected:
+
+- **Debounce timer** — declare new state final after a stable
+  observation period (e.g., 60 seconds of consistent readings).
+  **Rejected.** Adds timer state and logic for negligible benefit:
+  the hold-previous-state behavior already handles the transient
+  mismatch case correctly, and the daily-token cycle cadence makes
+  finer-grained timing impractical. A debounce timer also creates
+  an ambiguous middle period ("which state are we in right now?")
+  that hold-previous does not.
+- **Apply most-recent change** — assume the latest box change is
+  intentional and apply that state immediately. **Rejected.** A
+  single box failure or glitch could trigger an unintended state
+  change. This violates the single-point-of-failure-cannot-trigger
+  property that is the entire reason for two-box AND semantics.
+- **Apply most-recent change with confirmation** — apply latest box
+  change but require peer confirmation within N hours, else revert.
+  **Rejected.** More complex than hold-previous with no additional
+  safety benefit, and creates a window during which the system has
+  acted on unconfirmed input.
+
+The hold-previous-state choice is consistent with the broader
+fail-safe-defaults principle (§2.7): when the system cannot proceed
+safely, it does nothing and alerts. Token mismatch is exactly such
+a case — the correct action is to wait for the boxes to agree, and
+to alert the operator while waiting.
+
+### 10.6 Phase 3 activation flow
+
+Phase 3 activation proceeds in stages:
+
+#### 10.6.1 Stage 1: Detection
+
+- A daily-token cycle observes `phase3_count == 0` on both boxes
+  (AND semantics).
+- The system records the **detection timestamp** in the master's
+  state file as `phase3_grace_window_start` (replicated to slave
+  via rsync per §9.4.2).
+- Generates a Critical alert: "Phase 3 tokens removed on both boxes.
+  24-hour grace window started. Re-insert tokens before [timestamp +
+  24h] to abort activation."
+- Phase indicator unchanged at this stage. System continues operating
+  in current phase (Phase 1 or Phase 2).
+
+#### 10.6.2 Stage 2: Grace window
+
+For the next 24 hours, daily-token cycles continue to run. Each
+cycle's observation is classified against just two patterns:
+
+**Pattern A: Any token re-inserted (Box A `phase3_count >= 1` OR
+Box B `phase3_count >= 1`).** Candidate abort. The system requires
+**persistence across one full daily-token cycle** before committing
+the abort, to defend against transient USB-read glitches:
+
+- On first observation of `phase3_count >= 1` on either box: log a
+  Notice alert ("Phase 3 grace: token re-insertion observed,
+  pending confirmation on next daily cycle"). Grace window
+  continues running.
+- On the next daily-token cycle, re-evaluate:
+  - If `phase3_count >= 1` still observed on at least one box:
+    **abort is committed**. `phase3_grace_window_start` is cleared
+    from the state file. Generate `phase3_grace_aborted` Info alert
+    (per §12.6 catalog). System continues in previous phase.
+  - If both boxes return to `phase3_count == 0`: candidate abort
+    is discarded as a transient. Grace window continues normally
+    toward latch.
+
+This 2-cycle persistence rule typically adds ~24 hours of
+additional grace-window time in the survivor scenario (one cycle
+to observe, one cycle to confirm). The trade-off is intentional:
+asymmetry of consequences strongly favors easy-to-abort. A false
+latch is permanent and irrevocable; a false abort means the
+survivor's tokens "didn't quite work the first time" — they
+remove the tokens again and the grace window restarts cleanly on
+the next daily-token cycle. The persistence requirement closes
+the transient-glitch false-abort path while preserving the
+asymmetry advantage.
+
+**Pattern B: All-removed (Box A `phase3_count == 0` AND Box B
+`phase3_count == 0`).** The grace window **continues** running:
+this is the legitimate triggered state, persisting toward latch.
+
+**Latch decision at +24h.** When the grace timer reaches 24 hours
+with no committed abort: the system enters Stage 3 (latch) per
+§10.6.3.
+
+The grace window timer is calendar time (24 hours by clock), not
+cycle count. A late-running cycle does not extend the window.
+
+**Rationale for the any-re-insertion-aborts rule.** This is a
+deliberate departure from the earlier all-four-required-to-abort
+rule. The asymmetry of consequences drives it: a false Phase 3
+latch is permanent, irrevocable, and reallocates the portfolio
+to the wrong target weights with the wrong starting income; a
+false abort costs 24 hours plus another removal attempt. Strongly
+asymmetric stakes argue for the easier-to-abort rule. The audience
+this matters most for is the survivor who may be confused, grieving,
+or unfamiliar with the system; the rule that lowest-barrier-to-abort
+is safest for that audience.
+
+#### 10.6.3 Stage 3: Latch
+
+At the end of the 24-hour grace window with tokens still removed:
+
+1. Update the state file: `phase = PHASE_3` (latched, permanent).
+2. Generate a `phase3_activation` Critical alert: "Phase 3 LATCHED
+   at [timestamp]. Asset reallocation executing on next weekly cycle."
+3. The next weekly cycle (which runs within at most 7 days, typically
+   within 24-48 hours) executes the Phase 3 transition plan per
+   §7.2.2 or §7.2.3, **regardless of cascade or guard state**.
+   The system enters Phase 3 operational logic immediately upon
+   transition execution. If cascade conditions are present at or
+   after transition, Phase 3's withdrawal sourcing handles them
+   per §7.3.2 (the cascade machinery is phase-agnostic in Phase 1
+   and Phase 3).
+4. Subsequent token states (re-insertion, removal, mismatch) have
+   no effect on phase. The latch is permanent.
+
+The earlier design deferred the transition cycle when cascade was
+active. This was removed (v1.4): the Phase 3 transition is a
+one-time allocation reset, not a rebalance, so there is no reason
+to defer it for market conditions. The survivor needs the Phase 3
+income calculation in effect; cascade sourcing protects the
+portfolio during the transition cycle just as it does during
+normal operation. The transition may trade smaller Growth volumes
+if CB1 is active (I14 still applies during transitions), but the
+transition itself proceeds.
+
+### 10.7 STOP INCOME flow
+
+STOP INCOME has no grace window; it transitions on the next
+daily-token cycle that observes consistent state across both boxes.
+
+**Insertion (Active → Paused):**
+
+1. Daily-token cycle observes `stopincome_count >= 1` on both boxes
+   (AND).
+2. Income state transitions to PAUSED.
+3. Generate Notice alert: "Income paused — STOP INCOME tokens
+   detected on both boxes."
+4. Next monthly withdrawal step within the weekly cycle plans an `ACHScheduleUpdate` entry
+   with amount $0 (per §8.2.7), and skips the SELL+ACH withdrawal
+   actions for that month.
+
+**Removal (Paused → Active):**
+
+1. Daily-token cycle observes `stopincome_count == 0` on both boxes
+   (AND).
+2. Income state transitions to ACTIVE.
+3. Generate Notice alert: "Income resumed — STOP INCOME tokens
+   removed from both boxes. Schedule resumes at $[current scheduled
+   amount]."
+4. Next monthly withdrawal step within the weekly cycle plans an `ACHScheduleUpdate` entry
+   restoring the schedule_state-derived monthly amount, and resumes
+   normal SELL+ACH withdrawal actions.
+
+In Phase 2, both flows still record state changes for audit purposes
+but produce no behavioral effect (no withdrawals exist to pause or
+resume).
+
+#### 10.7.1 Stuck-token alert (long-duration pause)
+
+If the STOP INCOME state has been PAUSED continuously for more than
+12 months (configurable: `stopincome_stuck_alert_months`, default 12),
+the daily-token cycle emits a Notice-severity alert at the next
+boundary and at quarterly intervals thereafter while pause persists:
+
+> "STOP INCOME has paused scheduled income for [N] months. Confirm
+> intent: continue pausing, or remove tokens from both boxes to
+> resume scheduled income."
+
+This catches the "forgot STOP INCOME was inserted" failure mode —
+particularly relevant for the survivor scenario where the survivor
+inserted STOP INCOME early in Phase 3 to defer income while living
+on SS + HYSA, and then either (a) forgot the deferral was active
+or (b) circumstances changed (HYSA drawdown, increased expenses)
+without prompting reconsideration of the pause.
+
+The alert is informational and does **not** auto-resume income.
+Failure to respond does not change system behavior; the alert
+serves only to re-surface the paused state for operator review.
+
+The 12-month threshold and quarterly cadence are chosen to be
+infrequent enough to avoid nuisance, while frequent enough that an
+operator who genuinely forgot will be reminded within a reasonable
+window. The cadence is suppressed if income resumes (Paused →
+Active) and resets if income re-pauses.
+
+### 10.8 Configuration
+
+Token-related configuration in ruleset.yaml:
+
+- `phase3_grace_window_hours` — default 24
+- `phase3_token_count_required` — default 4 (2 per box × 2 boxes); valid configurations are 4 (all-inserted) and 0 (all-removed) per §10.5
+- `stopincome_token_count_required` — default 2 (1 per box × 2 boxes); valid configurations are 0 (income active) and 2 (income paused; one per box) per §10.5
+- `stopincome_stuck_alert_months` — default 12 (threshold for
+  long-duration-pause alert per §10.7.1)
+- `stopincome_stuck_realert_months` — default 3 (re-alert cadence
+  once stuck-token threshold is exceeded)
+- `token_unavailable_warning_cycles` — default 2
+- `token_unavailable_critical_cycles` — default 7
+- `token_mismatch_critical_cycles` — default 2
+
+Token type detection rules (vendor ID, product ID, etc.) live in
+per-box configuration outside ruleset (since they're hardware-
+specific).
+
+### 10.9 Operational considerations
+
+- **Spare tokens.** The operator maintains physical spares for both
+  token types. Failed tokens are replaced by inserting a spare into
+  the same port. The system detects the new token by type+presence
+  and the count is restored.
+- **Token failure during Phase 3 grace window.** If a Phase 3 token
+  fails (reads as removed while inserted) on a single box, the
+  asymmetric count is detected by §10.5's mismatch logic and fires
+  a Warning alert (escalating to Critical after
+  `token_mismatch_critical_cycles` daily cycles). The grace window
+  does NOT start. Phase 3 activation only begins when **all four**
+  Phase 3 tokens read as removed on both boxes simultaneously — a
+  state that requires either deliberate operator action or
+  simultaneous hardware failure of all four tokens, which the
+  operator considers practically impossible (and which would
+  coincide with conditions affecting the boxes themselves, addressed
+  at the hardware infrastructure layer rather than within IRAPM).
+- **Operator-initiated test of Phase 3 mechanism.** Periodically the
+  operator should verify Phase 3 activation works end-to-end without
+  actually triggering a transition. This is handled via the dry-run
+  cycle mode (§13.7).
+
+### 10.10 Resolved questions (Hardware Tokens)
+
+- **Token identification mechanism:** type+presence (file-based
+  detection), not serial-based. Confirmed via §10.1, §10.3.
+- **UNAVAILABLE alert specificity:** generic, since detection failure
+  may prevent type identification.
+- **Replacement of failed tokens:** spare insertion; no system
+  reconfiguration needed.
+
+---
+
+## §11. Failure Modes & Recovery
+
+This section enumerates the system's failure modes and how the
+operator (or survivor) restores normal operation. The principle:
+**failures should never silently degrade the system.** Every failure
+that prevents normal operation produces a visible alert, leaves the
+system in a known state, and has a documented recovery procedure.
+
+### 11.1 Severity model
+
+Four severity levels:
+
+| Severity | Definition | Channels | Retry behavior |
+|---|---|---|---|
+| Info | Routine state transition or success notification | Email + SMS | None |
+| Warning | Non-blocking issue; system continues | Email + SMS | None on alert dispatch |
+| Notice | Significant state change requiring operator awareness | Email + SMS | 1 retry on SMS dispatch failure |
+| Critical | Issue that requires operator action; may or may not block operation | Email + SMS | 3 retries on SMS dispatch failure |
+
+Critical alerts have an additional **recovery category** orthogonal
+to severity:
+
+- **Critical (transient):** the underlying condition is expected to
+  resolve naturally on subsequent cycles (e.g., broker temporarily
+  unreachable). The system continues operating; the next cycle
+  retries the operation. No `operational_pause` is set.
+- **Critical (blocking):** the system cannot safely continue normal
+  operation; `operational_pause` is set per §11.3. Most blocking
+  conditions auto-resume after `pause_auto_resume_hours` (default
+  48). The single permanent halt is
+  `withdrawal_capacity_exhausted` from cascade exhaustion.
+
+Notation in the failure catalog: `Critical (transient)` or
+`Critical (blocking)`. Both are Critical severity for alerting
+purposes; they differ only in whether they set `operational_pause`.
+
+The severity name "Notice" is preferred over "Alert" to avoid
+confusion with the Plan entry type `Alert` (which is the dispatch
+mechanism; severity is metadata about that dispatch).
+
+### 11.2 Failure catalog
+
+#### 11.2.1 Broker connectivity loss
+
+- **Symptom:** Cycle aborts at step 1 (input refresh) with broker
+  connection error.
+- **Severity:** Critical (transient).
+- **System response:** Cycle ends; state file unchanged; alert
+  dispatched.
+- **Recovery:** Next scheduled cycle (typically next day) attempts
+  to reconnect. If the cycle that fails is a monthly-withdrawal
+  cycle, the SELL+ACH for that month may be delayed. Operator should
+  check broker status if the alert persists across multiple cycles.
+
+#### 11.2.2 Order rejection (broker)
+
+- **Symptom:** Order entry submitted; broker returns rejection
+  (reason varies: insufficient buying power, instrument restricted,
+  account flagged, etc.).
+- **Severity:** Critical (blocking).
+- **System response:** Cycle aborts after rejection.
+  `operational_pause` is set with `pause_reason: "order_rejection"`.
+  Per §11.3, the pause auto-resumes after
+  `pause_auto_resume_hours` (default 48); the next cycle re-reads
+  broker state and produces a fresh plan.
+- **Recovery:** Transient causes (insufficient buying power from a
+  prior cycle's unexpected fill behavior, temporary broker flag)
+  resolve naturally within 48h; the auto-resume cycle decides
+  cleanly against fresh state. Persistent causes (instrument
+  permanently restricted, account flag requiring operator action)
+  re-pause; `consecutive_pause_count` increments. At N=4
+  consecutive re-pauses, alert severity escalates to Warning via
+  `pause_consecutive_escalation` so the returning operator sees an
+  unmissable pattern. No manual state-file edit is required at any
+  point; the operator's role is to resolve the broker-side issue
+  (if any), after which the next auto-resume cycle succeeds and
+  the pause clears naturally.
+
+#### 11.2.3 State file missing or corrupt
+
+- **Symptom:** Process startup fails to read or parse state file.
+- **Severity:** Critical (blocking).
+- **System response:** Process refuses to start. Logs error to
+  startup log. Alerts via email/SMS if alerter can be initialized
+  without state file (which it should — credentials live in `.env`).
+- **Recovery:** Operator restores state file from peer box's copy,
+  from backup, or from cycle log replay. Detailed runbook in
+  operational documentation.
+
+#### 11.2.4 Rsync replication failure
+
+- **Symptom:** Master's daily rsync push to slave fails (network
+  unreachable, slave host down, ssh credentials expired, disk full
+  on slave).
+- **Severity:** Warning (auto-recovers when peer reachable). Escalates
+  to Critical if persistent failures cross the slave promotion
+  threshold (72 hours), since the slave will then begin its 48-hour
+  promotion grace.
+- **System response:** Master cycle does NOT fail (master writes its
+  own local state successfully). Failed rsync attempts are logged on
+  master side. Slave's local state file is not refreshed; slave's
+  daily check observes stale `last_master_write_timestamp` and
+  escalates per §9.4.2.
+- **Recovery:** Operator restores network connectivity or fixes
+  rsync configuration. Next successful rsync brings slave's local
+  state file current; slave returns to SLAVE_SLEEPING and cancels
+  any pending promotion.
+
+#### 11.2.5 Lookback signal UNAVAILABLE
+
+- **Symptom:** Synthetic Growth Lookback returns UNAVAILABLE due to
+  stale or insufficient price data.
+- **Severity:** Notice (auto-recovers when data refreshed).
+- **System response:** CB state holds. Rebalancing and refill
+  decisions continue per the held state. Withdrawal decisions
+  continue (lookback is not a withdrawal gate). Phase 2 swing
+  decisions are deferred (signal is required for both deploy and
+  recover triggers).
+- **Recovery:** Operator refreshes price data files. Next cycle's
+  signal computation succeeds.
+
+#### 11.2.6 Alerter dispatch failure
+
+- **Symptom:** Email or SMS dispatch fails.
+- **Severity:** Variable per channel and severity of the underlying
+  alert (§9.3.3).
+- **System response:** Cycle does NOT fail. Failed alerts are
+  recorded for retry on next cycle.
+- **Recovery:** Auto-recovers when network/credentials work. If
+  persistent, a Warning alert fires when the alerter does eventually
+  dispatch.
+
+#### 11.2.7 Cascade exhaustion
+
+- **Symptom:** Withdrawal sourcing reaches all three cascade stages
+  at residual floor with demand still unmet.
+- **Severity:** Critical (blocking, **permanent halt**).
+- **System response:** Withdrawal cycle aborts before SELL execution.
+  No partial withdrawal. `withdrawal_capacity_exhausted: true` set
+  in the state file. The system enters a permanent halt for
+  withdrawals only: future withdrawal attempts are suppressed, but
+  all other system functions (CB state machine, signal computation,
+  weekly summary alerts, rebalancing if any value remains, etc.)
+  continue normally. The weekly summary re-alerts the
+  `withdrawal_capacity_exhausted` condition every cycle.
+- **Recovery:** No automatic recovery. The portfolio cannot fund
+  withdrawals, and retrying achieves nothing. External operator
+  action (manual fund deposit, account closure, transition to
+  non-portfolio income sources, etc.) is required. If external
+  action restores portfolio value, the flag auto-clears when the
+  cascade can again meet a hypothetical withdrawal demand at the
+  next withdrawal cycle (i.e., when SGOV+FI+Growth above-residual
+  total ≥ current monthly withdrawal). Unlike other pause
+  conditions, there is no 48-hour auto-resume — auto-retrying the
+  same impossible operation indefinitely would be pointless.
+
+#### 11.2.8 Partial PhaseTransition execution
+
+- **Symptom:** A PhaseTransition entry's SELL or BUY orders fail
+  mid-execution, leaving the system with an asset allocation matching
+  neither the outgoing nor the incoming phase.
+- **Severity:** Critical (blocking).
+- **System response:** Cycle ends in inconsistent state. Phase
+  indicator may have been updated (depending on where in the
+  PhaseTransition execution the failure occurred — see §8.2.5).
+  `operational_pause` is set with `pause_reason: "partial_phase_transition"`.
+  Per §11.3, the pause auto-resumes after
+  `pause_auto_resume_hours` (default 48). The 48-hour window
+  allows any in-flight broker orders to settle to terminal states
+  (filled or rejected) before the next attempt.
+- **Recovery:** On auto-resume, the next cycle re-reads broker
+  state (the source of truth per §8.3), computes the gap between
+  current allocation and target-phase allocation, and produces a
+  new plan that completes the transition from wherever it left
+  off. The same plan-generation logic that produced the original
+  PhaseTransition entry handles the partial state cleanly because
+  it always plans from current state toward target. If the
+  follow-up plan also fails, `consecutive_pause_count` increments
+  and the system re-pauses; at N=4 the alert severity escalates
+  via `pause_consecutive_escalation`. No manual state-file edit
+  required.
+
+#### 11.2.9 Token unreadable (single box)
+
+- **Symptom:** Daily-token cycle fails to enumerate USB devices.
+- **Severity:** Notice (escalates to Warning at >2 cycles, Critical
+  at >7 cycles per §10.4).
+- **System response:** Token state holds at previous value.
+- **Recovery:** Operator investigates USB or driver issue on the
+  affected box; reboot or hardware replacement as needed.
+
+#### 11.2.10 Token mismatch (between boxes)
+
+- **Symptom:** Two boxes report different token counts after daily
+  reads.
+- **Severity:** Warning (escalates to Critical at >2 daily cycles).
+- **System response:** State holds at previous value (per §10.5).
+- **Recovery:** Operator investigates. Most-likely cause is
+  asynchronous detection during a real state change (resolves
+  naturally within 2 cycles). Persistent mismatch indicates a
+  hardware or configuration issue.
+
+#### 11.2.11 Master/slave split-brain
+
+- **Symptom:** Both boxes detect themselves as master with conflicting
+  recent writes.
+- **Severity:** Notice (auto-recovered).
+- **System response:** IP last-octet tiebreak applied (§9.4.3) — this
+  runs automatically on detection, no operator action required.
+  Loser transitions to SLAVE_SLEEPING. Loser's actions during the
+  partition window are surfaced in the alert content for operator
+  awareness.
+- **Recovery:** No operator action required to resume operation.
+  The tiebreak resolves the split-brain automatically. Operator
+  review of the cycle log is *informational* — confirms whether any
+  conflicting trades or duplicate ACHs executed during the partition.
+  This is post-hoc audit, not a recovery action. `operational_pause`
+  is NOT set.
+
+#### 11.2.12 Configuration validation failure
+
+- **Symptom:** Process startup detects invalid `ruleset.yaml`
+  (missing required field, type mismatch, internal inconsistency).
+- **Severity:** Critical (blocking).
+- **System response:** Process refuses to start (per I9). Logs and
+  alerts. This is a pre-condition failure, not a runtime failure;
+  the operational_pause framework doesn't apply (the process
+  cannot run at all).
+- **Recovery:** Operator fixes the configuration file and restarts
+  the process. The system never silently falls back to defaults.
+  Slave promotion (§9.4.2) handles continuity if the failure is
+  on master only.
+
+#### 11.2.13 Disk full
+
+- **Symptom:** State file write or log append fails with ENOSPC.
+- **Severity:** Critical (blocking).
+- **System response:** Cycle aborts. `operational_pause` is set
+  with `pause_reason: "disk_full"`. Per §11.3, auto-resume after
+  48 hours retries; log rotation may have freed sufficient space
+  by then.
+- **Recovery:** Most cases resolve via the daily log rotation
+  freeing space within the 48-hour auto-resume window. Persistent
+  failures (e.g., very large state files, runaway cycle logs)
+  re-pause; `consecutive_pause_count` increments; at N=4 the
+  alert severity escalates via `pause_consecutive_escalation`
+  prompting operator attention.
+
+### 11.3 Operational pause (auto-resuming)
+
+The `operational_pause` state replaces the earlier single-flag
+`paused_pending_recovery` model. It is a structure in the persistent
+state file:
+
+```
+operational_pause = {
+    paused: bool,
+    pause_reason: str,            # see catalog below
+    pause_started_at: timestamp,
+    consecutive_pause_count: int, # incremented on same-reason re-pause
+}
+```
+
+When `paused == true`, scheduled cycles still run but **abort
+immediately after step 1** (input refresh + state read), without
+proceeding to decision or action layers. The cycle dispatches a
+`pause_initiated` (first cycle) or `pause_re_alert` (subsequent
+cycles) alert.
+
+**Auto-resume.** When `pause_started_at + pause_auto_resume_hours`
+(default 48) has elapsed, the next cycle observes the threshold,
+clears the pause structure (`paused: false`, `pause_reason: null`),
+emits a `pause_auto_resumed` alert, and proceeds with normal cycle
+execution. The cycle reads fresh broker state and produces a new
+plan that reflects whatever happened during the pause window.
+
+If the next cycle's plan re-triggers the **same pause condition**,
+`consecutive_pause_count` is incremented. When `consecutive_pause_count >= 4`,
+the alert severity escalates to Warning with a
+`pause_consecutive_escalation` alert (the system keeps trying, but
+the alert pattern gets louder so the returning operator sees an
+unmissable signal).
+
+**Pause-reason catalog:**
+
+| `pause_reason` | Source failure | Auto-resume? | Notes |
+|---|---|---|---|
+| `partial_phase_transition` | §11.2.8 | Yes (48h) | Next cycle re-reads broker state and completes the transition |
+| `order_rejection` | §11.2.2 | Yes (48h) | Next cycle re-decides against fresh state; consecutive-escalation at N=4 |
+| `disk_full` | §11.2.13 | Yes (48h) | Disk may have freed via log rotation by next attempt |
+| `withdrawal_capacity_exhausted` | §11.2.7 (cascade exhaustion) | **NO — permanent halt** | Portfolio cannot fund withdrawals; resume is irrelevant without external intervention |
+| `state_file_corrupt` | §11.2.3 | N/A — refuses to start | Slave promotion handles this per §9.4.2 |
+| `configuration_validation` | §11.2.12 | N/A — refuses to start | Operator must fix `ruleset.yaml` before restart |
+
+Conditions explicitly NOT setting operational_pause (alert only, no
+halt):
+- Broker disconnect (§11.2.1) — transient; auto-recovers on retry
+- ACH update failure (§8.2.7) — system continues at prior ACH amount;
+  external (IBKR-side) operator action required
+- Master/slave split-brain resolved (§11.2.11) — tiebreak completed
+  automatically; Notice alert only
+- Signal UNAVAILABLE (§11.2.5) — CB state holds; system continues
+
+**Permanent halt: `withdrawal_capacity_exhausted`.** This is the only
+indefinite-stop state. It is set when cascade sourcing reaches all
+three stages (SGOV, FI, Growth) at residual floor with demand unmet
+(§7.3.2 step 4). When set:
+
+- Future withdrawal attempts are suppressed (no point in trying).
+- All other system functions continue: CB state machine, signal,
+  weekly alerts, the buffer/cash buckets to the extent any value
+  remains.
+- The weekly summary alert re-fires the
+  `withdrawal_capacity_exhausted` condition every cycle.
+- Auto-clears only if the portfolio recovers above a configurable
+  threshold (unlikely once exhausted; possible via residual position
+  dividends or external operator action transferring cash into the
+  account).
+
+**The operator never edits the state file.** All auto-resume and
+clear paths are system-managed. The `withdrawal_capacity_exhausted`
+halt is intentionally permanent because there is no recovery
+IRAPM can perform on its own — the portfolio cannot meet demand,
+and only external action (operator returning, depositing funds,
+closing the account, etc.) changes the situation.
+
+### 11.4 Recovery alert cadence
+
+When the system is in `operational_pause.paused == true` state:
+
+- Each scheduled cycle generates a re-alert (Notice severity).
+- The re-alert references the original failure event and timestamp.
+- The cadence is the cycle cadence — typically one re-alert per
+  weekly cycle, plus daily-token cycle re-alerts if token-related
+  failure.
+- Re-alerts are NOT deduplicated (the §9.3.2 dedup window is bypassed
+  for paused-state re-alerts), since the operator needs persistent
+  visibility that the system is not running.
+
+### 11.5 Resolved questions (Failure Modes & Recovery)
+
+- **Auto-resume of operational pause:** most pause conditions
+  auto-resume after `pause_auto_resume_hours` (default 48); the system
+  retries the failed operation against fresh broker state. Only
+  `withdrawal_capacity_exhausted` (cascade exhaustion) is a permanent
+  halt requiring external intervention. Per-condition behavior is
+  specified in the §11.2 catalog and the operational_pause model
+  in §11.3.
+- **Re-alert cadence during pause:** every cycle while paused; not
+  deduplicated. Auto-resume events emit their own alerts
+  (`pause_auto_resumed`, with consecutive-pause-count for context).
+- **Selective blocking:** transient Critical failures alert but do
+  not pause (broker disconnect, signal UNAVAILABLE, ACH update
+  failure); Critical-blocking failures pause with auto-resume per
+  §11.3.
+
+---
+
+## §12. Observability
+
+This section specifies what the system makes visible to the operator
+during normal operation, beyond the per-event alerts of §11. The
+observability principle: **at any moment the operator should be able
+to answer "what is the system doing right now and why?" by reading
+recent alerts and logs alone.**
+
+### 12.1 Per-cycle output
+
+Every cycle (regardless of type) produces:
+
+1. A cycle log entry (§9.4 / §12.2.1) recording the full cycle.
+2. State file updates (per §6.7).
+3. Zero or more alert dispatches.
+
+### 12.2 Logs
+
+#### 12.2.1 Cycle log
+
+The cycle log is the primary forensic record. Each entry contains:
+
+- Cycle ID (UUID), cycle type, timestamp start/end, box ID
+- Input snapshot: positions, prices, broker connectivity status,
+  token states
+- State machine snapshot: all 6 elements of the operating-mode tuple
+- Synthetic Growth Lookback signal value (or UNAVAILABLE)
+- Annual review evaluations (annual-review cycle only): freeze
+  decision, prior-year CB-day counts, recomputed buffer/refill/cash
+  values
+- Plan generated (full structured Plan)
+- Action layer execution log: per-entry attempt result, broker
+  response, fills, ACH references
+- Alerts dispatched (severity, channel, dedup outcome)
+- Final state-file write status
+
+Cycle log entries are JSON for machine readability. Daily rotation,
+90-day retention (per §9.4.5).
+
+#### 12.2.2 CB transition log
+
+Append-only, indefinite retention. Used by the annual review for
+freeze evaluation. Format per §6.7.
+
+#### 12.2.3 Annual review log
+
+Append-only, indefinite retention. Per-year record of the freeze
+decision, prior-year CB-day counts, and recomputed buffer/refill/cash
+values. Format per §6.7.
+
+#### 12.2.4 Alert log
+
+Daily rotation, 90-day retention. Records every dispatch attempt
+(success and failure) including dedup suppressions.
+
+#### 12.2.5 Coordination log
+
+Daily rotation, 90-day retention. Records role transitions,
+heartbeat writes, slave-wake decisions, and split-brain resolutions.
+
+#### 12.2.6 Token check log
+
+Daily rotation, 90-day retention. Records each daily-token cycle's
+observation per box.
+
+### 12.3 Mandatory weekly summary alert
+
+Every weekly cycle MUST generate a summary alert (Info severity,
+Email + SMS) containing the following structured content:
+
+1. **Portfolio state**
+   - Core portfolio value (Growth + FI total, dollar)
+   - Per-position values (FBCG, AVUV, PYLD/JPIE or GBIL by phase)
+   - Allocation drift summary (largest absolute deviation)
+2. **Circuit breaker state**
+   - Current CB state (CB_INACTIVE/CB1/CB2)
+   - CB1 → CB2 timer transition timer if in CB1 (days accumulated)
+   - Any pending CB transitions and their confirmation progress
+3. **Buffer state**
+   - SGOV buffer market value
+   - Buffer target value
+   - Buffer condition tag: one of {idle, drawdown, exhausted,
+     refilling}
+   - Refill status if relevant (next batch amount, target completion
+     date)
+4. **Upcoming withdrawal**
+   - Next scheduled withdrawal amount
+   - Days until next monthly withdrawal step within the weekly cycle (calendar date)
+   - Income state (ACTIVE / PAUSED) at time of summary
+5. **Extraordinary events**
+   - Any state transitions in the past week
+   - Any failures that triggered Critical-transient alerts in the
+     past week
+   - Any tokens in UNAVAILABLE state on any box
+   - Any persistent mismatches
+
+The buffer condition tags are defined as:
+
+- **idle:** buffer at or above target (within $250 tolerance); no
+  refill activity needed.
+- **draining:** buffer below target, active cascade in progress
+  (CB2 active).
+  Refill is suspended because cascade is active.
+- **delayed:** buffer below target, no active cascade, within
+  `sgov_refill_post_recovery_delay_days` post-recovery delay window.
+  Refill is suspended because the recovery timer has not elapsed.
+- **refilling:** buffer below target, no active cascade, recovery
+  timer elapsed, refill batches actively running.
+- **exhausted:** buffer at or near residual floor; cascade has
+  drawn it down significantly. Separate from "draining" — this is
+  the alarming subset where the buffer is no longer absorbing
+  meaningful withdrawal demand.
+
+The summary alert is **mandatory** — it runs even on weeks with no
+state transitions or actions. It is the operator's regular touchpoint
+with the system. A missed weekly summary alert is itself a signal
+that something has gone wrong (no cycles ran, alerter is broken,
+master is dead, etc.).
+
+### 12.4 Alert content structure
+
+Per §9.3.1. Every alert includes the cycle ID and timestamp so the
+operator can locate the corresponding cycle log entry.
+
+### 12.5 Operator-initiated inspection
+
+The operator should be able to inspect the system without modifying
+it via:
+
+- Reading the state file directly (it is JSON; readable text format)
+- Reading recent cycle logs
+- Reading the CB transition log
+- Reading the annual review log
+
+No special command or tool is required for read-only inspection. The
+state file format is documented in operational documentation.
+
+### 12.6 Alert catalog
+
+This is the canonical catalog of alert types the system emits.
+Every alert dispatched via the §9.3 alerter has a row in this
+catalog. Plan-flag references throughout the spec
+(`large_rebalance`, `phase3_activation`, etc.) map to `alert_id`
+values here.
+
+Operator-facing message templates (Subject, Body, SMS) are
+parameterized with `{placeholders}` for runtime values and should
+live in a sibling YAML file `alert_templates.yaml`, edited
+independently of `ruleset.yaml`. The two operator-edited files
+have distinct scopes: `ruleset.yaml` is for financial / operational
+parameters that affect system behavior; `alert_templates.yaml` is
+for human-facing message wording that does not affect behavior.
+Code references `alert_id` only; the human-facing text is loaded
+from `alert_templates.yaml` at runtime.
+
+**Catalog structure.** Each entry has:
+
+- `alert_id` (stable identifier used by code)
+- Trigger (the condition / plan flag / state transition that fires it)
+- Default severity (Info / Notice / Warning / Critical)
+- Channels (always Both — see channel policy below)
+- Editable template fields (subject, body, SMS) in `alert_templates.yaml`
+- Dedup-key pattern (per §9.3.2)
+
+**Channel policy: every alert dispatches via BOTH email AND SMS.** The
+operator may be in locations with cell coverage but no WiFi or data
+plan (rural travel, cabins, cruise ships in port). SMS uses the
+cellular voice/text network, which has fundamentally wider coverage
+than internet-based email delivery. For a system whose purpose is to
+keep operating unattended during long absences, "operator reachable
+by cell but not internet" is a real and common scenario. The "Channels"
+column in the tables below shows "Both" uniformly — earlier drafts
+distinguished Email vs Both per alert; this was unified in v1.4 to
+guarantee that every alert reaches the operator under the cellular-
+only-coverage condition.
+
+**Phase and transition alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `large_rebalance` | Any phase transition plan generated | Notice | Both |
+| `phase3_activation` | Phase 3 latch event (24h grace expired) | Critical | Both |
+| `phase3_grace_started` | All four Phase 3 tokens read as removed, grace window begins | Critical | Both |
+| `phase3_grace_pending_abort` | Token re-insertion observed during grace; awaiting persistence confirmation | Notice | Both |
+| `phase3_grace_aborted` | Token re-insertion persisted across one full cycle; abort committed | Info | Both |
+
+**Circuit breaker and guard alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `cb_transition` | Any CB state change (entry or exit of CB1, CB2) | Notice | Both |
+| `guard_activation` | FI-low alert or Portfolio-low alert turning on | Warning | Both |
+| `guard_deactivation` | FI-low alert or Portfolio-low alert clearing | Notice | Both |
+
+**Phase 2 rebalancing alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `phase2_opportunistic_deploy` | Phase 2 swing trigger → deployed state | Notice | Both |
+| `phase2_opportunistic_recover` | Phase 2 swing trigger → steady state | Notice | Both |
+| `phase2_semi_annual_reallocation` | Phase 2 semi-annual realignment fires | Info | Both |
+
+**Withdrawal alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `withdrawal_executed` | Monthly withdrawal completed successfully | Info | Both |
+| `withdrawal_failed` | SELL or ACH failure during withdrawal cycle | Critical | Both |
+| `cascade_growth_source` | Withdrawal cascade reached Growth stage (§7.3.2 step 3) | Critical | Both |
+| `withdrawal_capacity_exhausted` | Cascade exhaustion permanent halt set (§11.2.7) | Critical | Both |
+
+**Cash deployment:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `large_cash_deployment` | §7.7.1 large-deployment plan executed | Notice | Both |
+
+**Annual review:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `annual_review_completed` | Jan 15 annual review cycle completes | Notice | Both |
+| `freeze_decision` | Annual review froze (or did not freeze) CPI raise | Notice | Both |
+
+**Token alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `token_state_change` | Valid Phase 3 or STOP INCOME state transition | Notice | Both |
+| `token_invalid_state` | Mismatch or partial-count state observed | Warning | Both |
+| `token_unavailable` | Daily-token cycle fails to enumerate USB devices | Notice (escalating per §10.4) | Both |
+| `stopincome_stuck_alert` | STOP INCOME paused >12 months threshold reached; quarterly re-alert | Notice | Both |
+
+**Operational pause alerts (per §11.3):**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `pause_initiated` | `operational_pause` set on first cycle | Notice | Both |
+| `pause_re_alert` | Subsequent cycle while paused | Notice | Both |
+| `pause_auto_resumed` | Auto-resume cycle clears pause | Notice | Both |
+| `pause_consecutive_escalation` | `consecutive_pause_count` ≥ 4 same-reason | Warning | Both |
+
+**ACH and broker alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `ach_update_failed` | Single ACHScheduleUpdate failure | Notice | Both |
+| `ach_update_warning` | `ach_update_warning_threshold_cycles` consecutive failures | Warning | Both |
+| `broker_disconnect` | Cycle aborts at input refresh (Critical transient) | Critical | Both |
+
+**Master/slave alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `slave_promotion_pending` | Slave observes master staleness ≥ `slave_wake_staleness_hours`; 48h grace begins | Critical | Both |
+| `slave_promoted` | Auto-promotion completed | Critical | Both |
+| `slave_promotion_cancelled` | Master heartbeat returned during grace window | Info | Both |
+| `split_brain_resolved` | Tiebreak completed automatically (§11.2.11) | Notice | Both |
+
+**Data / signal alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `data_file_stale` | Lookback price files stale, signal UNAVAILABLE | Notice | Both |
+| `signal_recovered` | Signal returns to available after UNAVAILABLE period | Info | Both |
+
+**Configuration / sanity alerts:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `fi_overweight_persistent_suppression` | §7.5.1 suppression persists > threshold weeks | Warning | Both |
+| `alerter_failure_recovered` | Post-hoc: alerter dispatch failed previously; channels recovered | Warning | Both |
+
+**Mandatory weekly:**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `weekly_summary` | Every weekly cycle (§12.3) | Info | Both |
+
+The `large_rebalance` alert includes a **residual-exceptions
+section** in its body listing any positions skipped during the
+transition because they were already at or below residual
+(§7.2.1, §8.2.5 ruling per Item 20).
+
+The catalog is not closed: additional alert types may be added as
+the system evolves. Each addition follows the same pattern — pick
+a stable `alert_id`, add a row to this catalog, edit
+`alert_templates.yaml` to define the message wording.
+
+### 12.7 Resolved questions (Observability)
+
+- **Weekly summary mandatory or optional:** mandatory.
+- **Buffer condition taxonomy:** five-state {idle, draining,
+  delayed, refilling, exhausted} per §12.3.
+- **Off-box log backup:** out of scope (operator infrastructure).
+- **Alert catalog location:** §12.6 (this spec); message templates
+  in sibling `alert_templates.yaml`.
+
+---
+
+## §13. Testing Strategy
+
+This section specifies how IRAPM correctness is established before
+production deployment and maintained over the system's lifetime. The
+guiding principle: **the simulator (IPMS) is the primary correctness
+authority for strategy logic**; unit and integration tests cover the
+mechanical layers around it.
+
+### 13.1 Test layers
+
+| Layer | Purpose | Tool |
+|---|---|---|
+| Unit tests | Pure-function correctness (decision logic, signal computation, state transitions in isolation) | pytest |
+| Integration tests | Subsystem interactions (decision → action sequence, state machine transitions across cycles) | pytest with fixture-based fake broker |
+| Simulator tests (IPMS) | Strategy correctness over historical and synthetic market data | IPMS framework |
+| Recovery tests | Failure recovery scenarios (state file restoration, slave wake, paused-recovery flow) | pytest with disk-state fixtures |
+| Dry-run tests | End-to-end with real broker connection, no order execution | IRAPM dry-run mode (§13.7) |
+
+### 13.2 Unit test coverage requirements
+
+- Synthetic Growth Lookback signal: per-step correctness, edge cases
+  (single bar, all stale, partial alignment, non-positive prices)
+- Decision layer functions: tested for each branch in §7.3 (CB_INACTIVE, CB1,
+  cascade), §7.4 (refill in each CB state, residual floor clamping),
+  §7.5 (rebalance triggers, Phase 2 swing triggers), §7.6 (annual
+  review)
+- State machine transitions: each transition table row in §6.1, §6.2,
+  §6.3, §6.4
+- Schedule state computation (§3.13): inflation compounding, freeze
+  list handling, range inclusivity
+- Plan equality and serialization
+- Money discipline: Decimal handling, rounding mode
+
+### 13.3 Integration test scenarios
+
+Multi-cycle scenarios where state evolves across cycles:
+
+- Phase 1 → Phase 2 calendar transition with mid-confirmation CB
+  pending
+- Phase 1 → Phase 3 token-triggered transition while cascade is
+  active (transition executes regardless of cascade state per §4.2;
+  Phase 3 cascade machinery handles ongoing cascade after transition)
+- CB1 confirmation → 90-day timer → CB2 (timer-based, withdrawal sourcing) → withdrawal via cascade
+- Annual review with various prior-year CB-day patterns
+- Cash buffer refill handling for various inflow patterns (deposit,
+  conversion, dividend)
+- Large cash deployment per §7.7.1 in each CB state and each phase
+- Withdrawal sourcing across CB state transitions mid-month
+- Operational pause auto-resume scenarios: partial-transition,
+  order-rejection (single and N=4 consecutive); disk-full
+- Cascade exhaustion → `withdrawal_capacity_exhausted` permanent halt
+
+### 13.4 Simulator tests (IPMS)
+
+The IPMS simulator is the authoritative test environment for
+end-to-end strategy correctness. It exercises:
+
+- Multi-decade backtests with historical price data
+- Sensitivity analysis (parameter sweeps over rebalance thresholds,
+  buffer targets, etc.)
+- Stress scenarios (1929, 1973-74, 2000-02, 2008-09, hypothetical
+  worse)
+- Phase 1 → Phase 3 trigger at various points in market history
+- Phase 3 four-regime validation per §4.1.1 (using IRAPM parameter
+  values; see §14.7)
+
+The IPMS specification (separate document) defines the simulator's
+own correctness criteria. IRAPM correctness depends on IPMS being
+trustworthy.
+
+**Historical validation evidence (legacy).** The Phase 3 adaptive
+design was validated against the 2005–2025 historical sequence at
+seven trigger portfolios spanning all four regimes, results recorded
+in the (now deprecated) `PHASE_3_DESIGN.md` §10.2 and the archive
+file `Retirement/RPM_PHASE3_ADAPTIVE.txt`. Key historical findings:
+
+- 100% survival across all 7 trigger portfolios over the 2005–2025
+  window.
+- Inflation freeze engaged exactly twice per scenario (2008 GFC and
+  2022 bear market), consistent with the freeze logic specified
+  in §7.6.
+- Worst-case widow scenario ($735K trigger) preserved real value
+  at 103% after 20 years of withdrawals.
+- Cascade exhaustion: zero months in all scenarios.
+
+**Important caveat.** That validation used the **legacy parameter set**
+(`INFLATION_PRE = 3.0%`, floor/ceiling brackets indexed *once* at
+trigger and fixed thereafter). IRAPM adopts a **different parameter
+set** (`INFLATION_PRE = 3.5%`, brackets continue growing post-trigger;
+see §4.1.1.1). The historical results therefore demonstrate *that the
+strategy class survives the 2005–2025 sequence*, but they do **not**
+validate the IRAPM-current parameter values. A fresh validation
+sweep is required and tracked in §14.7.
+
+IRAPM's simulator test suite should independently re-derive the
+historical-sequence results using IRAPM's decision and action layers
+(and the IRAPM parameter values) before deployment. Divergence
+between IRAPM's outputs at the legacy parameter set and the
+legacy results would indicate an IRAPM implementation defect;
+divergence between IRAPM's outputs at the IRAPM parameter set and
+the legacy results is *expected* and is the subject of §14.7's
+re-validation.
+
+**Open follow-up validation work** (not blocking IRAPM ratification):
+
+1. Stressed historical windows (1929-style, 1966-style) to test
+   design under worse sequences than 2005–2025.
+2. Trigger years other than 2027 to verify pre-trigger inflation
+   indexing produces consistent real outcomes at later triggers.
+3. Forward Monte Carlo at the trigger portfolios to characterize
+   distribution of outcomes beyond the single historical path.
+
+### 13.5 Invariant assertions
+
+The invariants in §3.14, §7.8, §8.4 become test assertions that run
+in EVERY integration and simulator test. A test failure that violates
+an invariant is a hard fail regardless of whether the test's specific
+assertion passes.
+
+The full invariant set:
+
+- Domain: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14
+- Decision layer: D1, D2, D3, D4, D5, D6, D7, D8, D9, D10
+- Action layer: A1, A2, A3, A4, A5, A6, A7, A8
+
+### 13.6 Phase 3 four-regime testing
+
+Per the four-regime taxonomy in §4.1.1.6, the test suite must verify
+correct `I_0` calculation in each regime:
+
+- **sub_floor regime:** small portfolio at trigger; verify the
+  sustainable-floor path (`sustainable_floor_monthly` per §4.1.1.4)
+  produces the expected `I_0` and is the binding constraint.
+- **floor regime:** moderate portfolio where `I_sustainable_monthly`
+  would produce below-floor income; verify clamp to the indexed
+  floor (`floor_T` per §4.1.1.2).
+- **calc regime:** medium portfolio where `I_sustainable_monthly`
+  lands within the floor/ceiling band; verify direct closed-form
+  result (§4.1.1.3).
+- **ceiling regime:** large portfolio where `I_sustainable_monthly`
+  exceeds the indexed ceiling; verify clamp to the indexed ceiling
+  (`ceiling_T` per §4.1.1.2).
+
+Test vectors should be generated by independent solver runs (e.g.,
+numerical sustainability simulator) against the IRAPM parameter set
+and used as golden values for the closed-form path. Equivalence
+within rounding tolerance demonstrates the closed-form implementation
+is correct; this complements but does not substitute for §14.7
+end-to-end historical re-validation.
+
+### 13.7 Dry-run cycle mode (mandatory)
+
+**Definition.** Dry-run mode is a non-executing IRAPM cycle. The
+system runs a complete cycle — connecting to the broker, querying
+real positions, computing the signal from real price data, evaluating
+state, generating a real Plan — but the action layer's
+order-submitting, ACH-updating, and cash-moving operations are
+intercepted and logged as "would execute X" rather than actually
+invoked. Alerts ARE dispatched (so the operator sees what the system
+would alert in real operation). State file is NOT written (preserving
+pre-run state for the real cycle that follows).
+
+Dry-run is **not paper trading**: there is no separate paper-trading
+account at IBKR, and dry-run does not maintain a parallel simulated
+portfolio. It is a single-cycle simulation against the real account,
+with all external mutations suppressed. A dry-run cycle reflects what
+*this* cycle would do *now* against current broker state.
+
+Dry-run is also **not a duration-based mode** — it is a per-cycle
+flag. Each invocation runs one cycle then exits. To validate behavior
+over a longer period, the operator runs multiple dry-run cycles
+spaced over multiple days; results are independent (no state carries
+forward in dry-run mode).
+
+Dry-run is invoked via `--dry-run` CLI flag or `dry_run: true` in
+`ruleset.yaml`. The `ruleset.yaml` form is useful for
+**default-to-dry-run** deployments: a fresh CL260 box can boot with
+`dry_run: true` and run cycles harmlessly until the operator flips
+the flag false to activate live trading.
+
+**Mandatory use cases for dry-run mode:**
+
+- **Pre-deployment validation:** run dry-run cycles for several weeks
+  before activating live trading.
+- **Post-pause verification:** when the operator returns to the
+  system after one or more auto-resume cycles have occurred, run a
+  dry-run cycle to verify the system is operating correctly. The
+  dry-run will surface any state inconsistencies that the
+  auto-resume retries glossed over. (Auto-resume retries are
+  designed to be safe but cannot rule out subtle drift in long
+  absences.)
+- **Cascade-exhaustion review:** if `withdrawal_capacity_exhausted`
+  is set, dry-run cycles can be used to confirm the portfolio's
+  continued state and to test what the system would do if the
+  operator manually injected funds (via the existing "cash appears,
+  system reacts" mechanism in §2.9).
+- **Periodic Phase 3 mechanism testing:** verify Phase 3 token
+  detection, grace window, and transition Plan generation work
+  end-to-end without triggering an actual transition.
+- **Configuration change validation:** when changing `ruleset.yaml`,
+  run dry-run cycles to verify the new configuration produces
+  sensible Plans before going live.
+
+### 13.8 Resolved questions (Testing Strategy)
+
+- **Dry-run mode:** mandatory; specified in §13.7.
+- **Phase 3 regime tests:** math and validation criteria specified
+  in §4.1.1 and §13.6 (self-contained in IRAPM).
+- **Simulator authority:** IPMS is primary correctness authority for
+  strategy; unit tests cover mechanics.
+
+---
+
+## §14. Open Questions
+
+This section lists items deliberately deferred from this specification
+to subsequent work. Each is bounded — the spec is implementation-ready
+without these resolved, but they should be addressed before
+production deployment.
+
+### 14.1 PHASE_3_DESIGN.md reconciliation (CLOSED)
+
+**Status: closed in v1.1 + v1.2.** Useful concepts (token semantics
+correction, physical security model, hold-previous-state design
+property, role-swap-not-failback, failure-quiet, reversible-where-
+possible, stuck-token alert, manual ACH fallback, worked example for
+resume semantics, historical validation cross-reference) were imported
+into IRAPM v1.1. The sustainable-withdrawal math (constants, bracket
+indexing, closed-form `I_sustainable`, sub-floor protection, regime
+classification, payment ceiling) was imported into IRAPM v1.2 §4.1.1.
+
+PHASE_3_DESIGN.md is now **deprecated** and should be moved out of
+the active document set. IRAPM is self-contained for Phase 3
+implementation.
+
+This item is retained in §14 as a historical record. See §14.7 for
+the validation work created by the parameter-set divergence between
+PHASE_3_DESIGN.md's ratified design and IRAPM's adopted parameter
+values.
+
+### 14.2 Simulator-tunable parameters
+
+Several parameters are stated in this spec with provisional defaults,
+to be tuned via IPMS simulator runs:
+
+- **Phase 3 target weights.** Default 25/25/25/25 across
+  FBCG/AVUV/PYLD/JPIE; simulator should validate or refine.
+- **Phase 3 specific FI holdings.** Default PYLD+JPIE; simulator may
+  evaluate alternative FI combinations.
+- **CB1 → CB2 timer duration.** Default 90 days; simulator
+  should evaluate sensitivity (30, 60, 90 day variants).
+- **SGOV buffer target months.** Default 24; simulator should
+  validate against severe historical scenarios.
+- **Phase 2 opportunistic trigger and recovery thresholds.** Default
+  -10% / +2%; simulator should evaluate alternative bands.
+- **Annual review freeze threshold days.** Default 30 cumulative
+  CB1+ days; simulator should evaluate.
+- **Position residual minimum.** Default $1500; should be small
+  enough to feel like a position but large enough to avoid
+  accidental drift below; minimal simulator sensitivity expected.
+
+### 14.3 Ruleset.yaml drafting
+
+This specification defines the **structure** of configuration but
+does not provide a complete ruleset.yaml file. The next implementation
+step is to produce a draft ruleset.yaml containing all configurable
+parameters with their default values, organized for operator
+readability. The draft should be validated against the full
+parameter list distributed across §2.3, §6, §7, §10, §13, and §14.2.
+
+### 14.4 Operational runbook
+
+This specification defines failure modes (§11) but does not provide
+a complete operator runbook. The runbook should cover, at minimum:
+
+- Initial deployment procedure
+- Recovery procedures for each Critical-blocking failure in §11.2
+- Manual master/slave role-swap procedure (per §9.4.2, the no-wait
+  alternative to letting auto-promotion run)
+- Token replacement procedures
+- Annual operator-initiated dry-run verification procedure
+- Phase 3 latch verification (without triggering)
+- Data file refresh schedule and procedure
+- Backup and restore procedures (state file, logs)
+- Hardware replacement procedures (failed CL260 box, failed token,
+  failed pSLC SSD)
+- **Manual IBKR ACH amount update procedure** (per §8.2.7 escalation):
+  step-by-step instructions for logging into the IBKR Portal,
+  navigating to the recurring-withdrawal management page, updating
+  the recurring monthly amount, and verifying the change took
+  effect. ACH update failures do NOT halt the system — IRAPM
+  continues operating at the prior ACH amount until the operator
+  resolves the IBKR-side issue, at which point the system's next
+  ACHScheduleUpdate attempt succeeds naturally. The procedure must
+  be written for the survivor as audience — assume no programming
+  or systems-admin skill, only basic web-browser familiarity.
+
+The runbook is operator-facing documentation; this specification is
+system-facing.
+
+### 14.5 Simulator-vs-production drift testing
+
+The IPMS simulator and IRAPM production system must remain behaviorally
+equivalent for shared logic (decision layer, signal computation,
+state machines). A test framework for verifying this equivalence on
+identical inputs should be developed. Drift between IPMS and IRAPM is
+a class of bug that the IPM v1 generation suffered from.
+
+### 14.6 Phase 3 trigger-year computation edge cases
+
+The schedule_state structure (§3.13) uses `trigger_year` as a fixed
+integer. Edge cases at fiscal year boundaries (e.g., Phase 3 latches
+on December 31 vs January 1) may produce off-by-one effects in
+freeze evaluation or CPI compounding. Simulator should verify
+behavior at these boundaries; if necessary, refine to use trigger
+*date* with explicit calendar-year derivation rules.
+
+### 14.7 Phase 3 re-validation at IRAPM parameter set
+
+The Phase 3 math imported in §4.1.1 originally validated successfully
+(100% survival across 7 trigger portfolios over the 2005–2025
+historical sequence; freeze engaged exactly twice per scenario;
+worst-case widow scenario preserved real value at 103% — recorded
+in the deprecated PHASE_3_DESIGN.md §10.2 and in
+`Retirement/RPM_PHASE3_ADAPTIVE.txt`). That validation used the
+**legacy parameter set**:
+
+- `INFLATION_PRE = 3.0%/yr`
+- Floor and ceiling brackets indexed *once* at trigger and **fixed
+  thereafter**.
+
+IRAPM adopts a **different parameter set**:
+
+- `INFLATION_PRE = 3.5%/yr`
+- Floor and ceiling brackets continue growing at `INFLATION_PRE`
+  *post-trigger*.
+
+The behavioral differences from these parameter changes:
+
+- **Higher initial trigger-year brackets at any future trigger.** A
+  trigger in 2035 sees `floor_T ≈ $4,090` under IRAPM vs `~$3,914`
+  under PHASE_3_DESIGN. Slight upward shift of the floor regime
+  range; slight upward shift of the ceiling.
+- **Growing brackets during Phase 3 lifetime.** Under PHASE_3_DESIGN,
+  the floor and ceiling that bind `I_0` at trigger remain valid
+  bracket anchors for the duration. Under IRAPM, the brackets
+  themselves grow at 3.5%/yr post-trigger. This does **not** affect
+  `I_0` (which is set once at trigger and held). It **does** affect
+  any consumer of `floor_Y` or `ceiling_Y` for `Y > T` — e.g.,
+  alerting that compares scheduled income against the
+  contemporaneous floor/ceiling for "is this regime still sane"
+  diagnostics.
+
+Required validation work before production deployment:
+
+1. **Re-run historical-sequence sweep** at IRAPM parameter values
+   across the same 7 trigger portfolios used in the original
+   validation (and ideally additional portfolios spanning the regime
+   boundaries at the new bracket values).
+2. **Confirm 100% survival** at the new parameter set, or document
+   any survival shortfalls and decide whether parameter values need
+   adjustment.
+3. **Confirm regime classifications** at the new parameter set —
+   regime boundaries shift with bracket values, so portfolios near
+   the legacy regime boundaries may classify differently under
+   IRAPM.
+4. **Reconcile the implementation against the new validation
+   results.** Replace the illustrative reference values in §4.1.1.8
+   with the freshly-validated test-vector data.
+
+The operator has stated that the original validation samples had
+critical flaws that invalidate the results regardless of parameter
+changes, and that *all* tests will be re-run as part of IRAPM
+deployment. This open question merely formalizes that intent: no
+production deployment without fresh validation at the IRAPM
+parameter set.
+
+This is the **only blocking open question** for production Phase 3
+deployment. The other §14 items are tunable refinements or
+implementation work (ruleset.yaml, runbook). §14.7 alone gates
+production-deployment confidence for Phase 3.
+
+---
+
+## §15. Glossary
+
+**Action layer.** The subsystem that executes a Plan (§3.12, §8).
+Has no decision authority; only consumes Plans from the decision layer.
+
+**ACHScheduleUpdate.** A Plan entry type (§3.12, §8.2.7) that updates
+IBKR's recurring monthly ACH withdrawal amount on the broker side.
+
+**Active (income state).** The income state in which scheduled
+withdrawals execute (§3.10a, §6.2). See **Income state**.
+
+**Income state.** Orthogonal to phase. Either ACTIVE (withdrawals
+execute per phase's withdrawal calculation) or PAUSED (withdrawals
+zeroed), controlled by STOP INCOME tokens (§3.10a, §6.2). Income
+state changes do not affect CB state, rebalancing, refill, or the
+annual review.
+
+**Allowlist.** The fixed set of symbols (§2.2) that IRAPM operates
+on. Per phase: Phase 1/3 = FBCG/AVUV/PYLD/JPIE/SGOV; Phase 2 =
+FBCG/AVUV/GBIL/SGOV. Anything outside is invisible to IRAPM (I3).
+
+**Annual review.** A combined event run once per year on the
+configured date (§7.6). Performs freeze evaluation and recomputes
+buffer/refill/cash targets in Phase 1 and Phase 3 only. In Phase 2,
+the annual review cycle runs but performs no recompute work (all
+targets are constants or frozen-forward).
+
+**box_id.** Identifier for one of the two CL260 boxes. Uses the
+OS-level hostname or auto-generated UUID (§9.4.2). No separate
+configuration field.
+
+**Bucket.** A named grouping of one or more positions per active
+phase: Core Growth, Core Fixed Income, Buffer (§3.3). A bucket's
+value is the sum of its positions' market values.
+
+**Buffer (SGOV).** The 24-month cash-equivalent reserve held in
+SGOV outside the core portfolio, drawn during cascade conditions
+to avoid forced selling at depressed prices.
+
+**Buffer condition tag.** One of {idle, draining, delayed,
+refilling, exhausted} reported in the weekly summary alert (§12.3).
+
+**Cascade.** The withdrawal sourcing sequence (SGOV → FI → Growth)
+triggered when CB2
+is active (§7.3.2).
+
+**CB (Circuit Breaker).** A discrete state that governs withdrawal
+and rebalance behavior based on the Synthetic Growth Lookback signal
+(§3.10, §6.3).
+
+**CB_INACTIVE.** The default circuit-breaker state when no trip
+threshold has been crossed. The CB subsystem is not currently
+constraining rebalance or withdrawal behavior. Renamed from earlier
+drafts' "CB0," which incorrectly implied a level-zero circuit-breaker
+trip; "CB" means "tripped," so "untripped" is its own concept, not
+a level of tripping (§3.10, §6.3).
+
+**CB1.** Lookback ≤ -10%, confirmed for 2 weeks. Rebalancing
+suspended; withdrawals from FI bucket only (Growth never sold for
+withdrawals during CB1, per I14).
+
+**CB1 → CB2 timer.** A transition from CB1 to CB2 fires when CB1 has
+persisted ≥ 60 days. Behaves like CB2 for withdrawals; reached via
+slow path (§3.10, §6.3.3).
+
+**CB2.** Lookback ≤ -20%, confirmed for 2 weeks. Rebalancing
+suspended; withdrawals diverted to cascade.
+
+**Cascade exhaustion.** Failure mode where withdrawal sourcing
+reaches all three cascade stages (SGOV, FI, Growth) at residual
+floor with demand still unmet (§7.3.2 step 4, §11.2.7). Triggers
+the `withdrawal_capacity_exhausted` permanent halt per §11.3.
+
+**Cycle.** A single execution of the system's main loop (§3.8). Four
+types: weekly, monthly-withdrawal, annual-review, daily-token.
+
+**Decision layer.** The subsystem that consumes operating state and
+produces Plans without performing any action (§7).
+
+**Drift.** The difference between a position's current value and its
+target value, expressed in dollars or as a percentage (§3.5).
+
+**FI (Fixed Income).** The bonds-and-bills bucket of the core
+portfolio. Phase 1/3: PYLD + JPIE. Phase 2: GBIL.
+
+**FI-low alert.** A guard state activated when the FI bucket falls
+below threshold (§3.10, §6.4.1). Triggers cascade routing for
+withdrawals.
+
+**FI-sacrosanct (I5).** The invariant that FI is never sold to fund
+a Growth purchase. Applies to rebalancing trades only; cash refills
+and withdrawal sourcing are not constrained by I5.
+
+**Frozen years.** A list of calendar years in which the schedule's
+CPI raise was skipped due to CB1+ days exceeding the freeze threshold
+(§3.13, §7.6).
+
+**Growth.** The equities bucket of the core portfolio. All phases:
+FBCG + AVUV.
+
+**Guard.** An independent state that gates system behavior, separate
+from the CB machine. The two guards are FI-low alert and
+Portfolio-low alert.
+
+**I_0.** The starting monthly income for an income-producing phase
+(§3.13). Phase 1: $3,000 (2027 USD). Phase 3: computed at trigger
+per §4.1.1.
+
+**Income state.** Orthogonal to phase. Either ACTIVE (withdrawals
+execute) or PAUSED (withdrawals zero) (§3.10a, §6.2). Controlled by
+STOP INCOME tokens.
+
+**IPMS.** The IRAPM simulator (separate codebase at C:/portfolio/IPMS).
+Authoritative test environment for strategy correctness.
+
+**Lookback signal.** See Synthetic Growth Lookback.
+
+**Master / slave.** The two-box coordination roles. Master runs
+cycles and writes its local state file; slave runs only a daily
+slave-check, reading its local state file (populated by rsync from
+master). State-write IS the heartbeat: master's daily writes prove
+end-to-end IRAPM functioning, replicated to slave via cron+rsync.
+The hybrid local-state + rsync architecture has no shared dependency
+to fail (§9.4.2). Role is per-box infrastructure, not part of the
+operating-mode tuple.
+
+**Role-swap, not failback.** Design property of the master/slave
+coordination: when a failed master is repaired and returns online,
+the current master continues running and the returned box becomes
+slave. The system does not auto-restore the original master to
+primacy. Role swaps reduce state-transition surface area and let
+the operator inspect either box's local state file to discover the
+current `master_box_id` (§9.4.2).
+
+**Notice.** Severity level (§11.1) for significant state changes
+requiring operator awareness; less urgent than Critical, more so
+than Warning. Replaces ambiguous "Alert" terminology.
+
+**Operating-mode tuple.** The 6-element effective operating mode at
+any moment: (phase, income_state, cb_state). Five elements are independent
+state-machine values. (Earlier revisions modeled cb1_extended as a derived boolean computed
+from CB1 plus the active timer) included for observability and
+clean downstream branching. Master/slave role is excluded as
+per-box infrastructure (§6).
+
+**Operating state file.** The atomic-write JSON file on each box's
+pSLC SSD persisting state across cycles (§6.7, §9.4.1). Master
+writes; slave reads (populated by rsync). Distinct from the token
+observation file (§10.3), which is slave-writable for token
+observations only.
+
+**operational_pause.** A structure in the state file that gates
+cycle execution while paused. Set automatically by Critical-blocking
+failures; auto-resumes after `pause_auto_resume_hours` (default 48).
+Replaces the v1.3-era `paused_pending_recovery` flag (§11.3).
+
+**withdrawal_capacity_exhausted.** A permanent-halt flag in the state
+file, set when cascade sourcing reaches all three stages at residual
+floor with demand unmet (§7.3.2 step 4, §11.2.7). Suppresses future
+withdrawal attempts but does not stop other system functions. Unlike
+`operational_pause`, this flag has no auto-resume; the portfolio
+cannot fund withdrawals and external operator action is required
+(§11.3).
+
+**Phase.** One of PHASE_1, PHASE_2, PHASE_3 (§3.9, §4). Determines
+asset allocation, withdrawal calculation, and active subsystems.
+
+**Phase 3 grace window.** The 24-hour delay between detection of
+Phase 3 token removal and Phase 3 latch (§10.6.2).
+
+**Phase transition.** A coordinated reallocation of the portfolio
+from one phase's target allocation to the next phase's. Triggered
+by calendar date (Phase 1 → Phase 2) or token removal (Phase 1/2
+→ Phase 3) (§7.2).
+
+**Plan.** A structured, serializable description of what the system
+intends to do this cycle (§3.12). Generated by the decision layer,
+consumed by the action layer.
+
+**Plan entry types.** The structured Plan (§3.12) contains zero or
+more typed entries: Order, Withdrawal, BufferRefill, CashRefill,
+LargeCashDeployment, PhaseTransition, CBStateTransition,
+ACHScheduleUpdate, Alert. Each entry has its own action-layer
+execution semantics (§8.2).
+
+**LargeCashDeployment.** A plan entry type (§3.12, §7.7.1, §8.2.8)
+that deploys a large cash surplus across underweight core positions
+in a single cycle. Triggered when cash surplus exceeds the
+large-deployment threshold; typical case is Phase 1 annual Roth
+conversion inflows.
+
+**Large cash deployment.** The §7.7.1 mechanic that handles bulk
+cash inflows (Phase 1 Roth conversions, large deposits) by deploying
+to all underweight core positions in a single cycle, distinct from
+the bite-by-bite cash buffer surplus rule (§7.7).
+
+**Portfolio-low alert.** A guard state activated when the core
+portfolio falls below ruleset-configured threshold. Triggers cascade
+routing and suspends SGOV refill (§3.10, §6.4.2).
+
+**Position residual minimum.** The dollar floor below which a
+position is treated as exhausted-for-this-cycle (default $1,500;
+configurable). Defends against accidentally liquidating positions
+that may be needed in future phases (I12, I13).
+
+**Refill (SGOV).** The mechanism that returns the SGOV buffer to
+target by selling Growth (§7.4). Operates outside the rebalancer.
+Suspended during cascade conditions and the 60-day post-recovery
+delay.
+
+**Schedule state.** A 4-tuple `(I_0, trigger_year, cpi,
+frozen_years)` that fully determines scheduled monthly income for
+any year in an income-producing phase (§3.13).
+
+**SGOV.** The buffer bucket. Treated as cash-equivalent; held outside
+core portfolio accounting.
+
+**STOP INCOME.** The hardware-token mechanism for pausing scheduled
+withdrawals (§4.4, §10).
+
+**Synthetic Growth Lookback.** The signal that drives the CB state
+machine. Equal-weighted composite return of Growth-bucket symbols
+over a 6-month window (§5).
+
+**Pre-transition validation.** Validation performed on the last
+weekly cycle falling at least 5 trading days before a Phase 1 →
+Phase 2 calendar transition (§4.3 step 1). Earlier drafts called
+this "T-7 validation" but the exact-day timing was unreachable
+by the weekly cycle schedule; the operative requirement is
+5+ trading days of buffer for operator response.
+
+**Token state (valid / invalid).** Valid Phase 3 states are
+all-inserted (4 tokens) or all-removed (0 tokens). Valid STOP
+INCOME states are all-removed (income active) or all-inserted
+(income paused; one token per box). All other configurations
+are invalid; the system holds previous state and alerts (§10.5).
+
+**Trigger year.** The calendar year in which a phase activated. For
+Phase 1: 2027. For Phase 3: the year the token activation latched.
+Immutable after activation (§3.13).
+
+**UNAVAILABLE.** A sentinel value returned by the lookback signal
+(§5.2) or token reading (§10.4) when computation cannot proceed. The
+system holds previous state when components return UNAVAILABLE.
+
+---
+
+*End of IRAPM Specification.*
