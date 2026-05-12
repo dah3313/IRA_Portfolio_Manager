@@ -107,6 +107,10 @@ module/block function and what the variables refer to.  There shall be no
 Changelogs inside the modules, there will be a single changelog for IRAPM
 and if a change is significant enough for a changelog entry it will go there
 with a brief statement of the change. 
+Furthermore there shall be no references to historical or superceded data in the modules.
+The data and code in the modules shall be treated as current truth with the only exception 
+being lookbacks to IRAPM_SPECIFICATION.MD and DECISIONS.md for clairification while coding.
+The coding philosophy shall be "Clean, Simple, Elegant" 
 ruleset.yaml will contain all tunable financial values, there shall be no hard
 coded financial values in the code blocks themselves.
 The only piece of the old IPM that may be reusable is the 'clock.py' as it allows
