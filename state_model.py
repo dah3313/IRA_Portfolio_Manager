@@ -60,12 +60,24 @@ class IncomeState(str, Enum):
 
 
 class CBState(str, Enum):
-    """Three core CB states. The CB1→CB2 transition has two triggers:
-    signal-based (depth, with confirmation) and timer-based (duration,
-    `cb1_to_cb2_timer_days` of continuous CB1)."""
+    """Three core CB states. CB1 is signal-based only; resource conditions
+    (Portfolio-low, FI-low) bypass CB1 and trigger CB2 directly. The CB1→CB2
+    transition has two triggers: signal-based (depth, with confirmation) and
+    timer-based (duration, `cb1_to_cb2_timer_days` of continuous CB1)."""
     CB_INACTIVE = "CB_INACTIVE"
     CB1 = "CB1"
     CB2 = "CB2"
+
+
+class CBEntryCondition(str, Enum):
+    """Trigger conditions that can place the CB machine into CB2 (§6.3.1).
+    A CB2 episode may have one or more of these active simultaneously; the
+    cb2_entry_conditions set on CBMachine tracks which conditions have been
+    active at any point during the current episode. CB2 exit requires every
+    condition in the set to clear with its recovery buffer (§6.3.3)."""
+    SIGNAL = "signal"
+    PORTFOLIO_LOW = "portfolio_low"
+    FI_LOW = "fi_low"
 
 
 class LookbackStatus(str, Enum):
@@ -106,40 +118,89 @@ class Phase3GracePendingAbort(BaseModel):
     tokens_observed: TokensObserved
 
 
-class CBPendingTransition(BaseModel):
-    """One in-progress CB transition awaiting confirmation. Multiple may
-    coexist (e.g., during oscillation near a threshold). Each is
-    independently confirmed when its cycles_confirmed reaches
-    confirmation_window_weeks."""
+class PendingCounter(BaseModel):
+    """Counter tracking consecutive weekly cycles a CB entry/exit condition
+    has held. Increments when the condition holds; resets to 0 when the
+    condition fails to hold. cycles_confirmed == 0 means no observation in
+    progress (first_observed_at is None). When cycles_confirmed reaches
+    confirmation_window_weeks (default 2), the corresponding transition
+    commits and the counter resets.
+    """
     model_config = ConfigDict(extra="forbid")
 
-    from_state: CBState
-    to_state: CBState
-    cycles_confirmed: int = Field(ge=0)
-    first_observed_at: datetime
+    cycles_confirmed: int = Field(default=0, ge=0)
+    first_observed_at: Optional[datetime] = None
+
+
+class CBPendingConfirmations(BaseModel):
+    """Per-path pending-confirmation counters for the CB state machine.
+    The five paths cover signal-based CB1 entry and exit, and the three
+    CB2 entry paths (signal, Portfolio-low, FI-low). CB2 exit checks use
+    these paths' clearing conditions and recovery buffers (§6.3.3) but
+    are evaluated freshly each cycle from current values plus the
+    cb2_entry_conditions set — no separate exit counters are tracked here.
+
+    Timer-based CB1 → CB2 does NOT use these counters; it fires
+    immediately when the cb1_active_timer_started_at crosses
+    cb1_to_cb2_timer_days.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cb1_signal_entry: PendingCounter = Field(default_factory=PendingCounter)
+    cb1_signal_exit: PendingCounter = Field(default_factory=PendingCounter)
+    cb2_signal: PendingCounter = Field(default_factory=PendingCounter)
+    cb2_portfolio_low: PendingCounter = Field(default_factory=PendingCounter)
+    cb2_fi_low: PendingCounter = Field(default_factory=PendingCounter)
 
 
 class CBMachine(BaseModel):
-    """Circuit breaker state plus the CB1-active timer and any pending
-    transition counters.
+    """Circuit breaker state, the CB1-active timer, the CB2 entry-conditions
+    set, and per-path pending-confirmation counters.
 
-    CB1 → CB2 has two trigger paths:
+    CB2 has three independent entry paths (§6.3.1):
     1. Signal-based: signal ≤ cb2_threshold_rate for confirmation_window_weeks
-       consecutive weekly cycles. Tracked via pending_transitions.
+       consecutive weekly cycles.
+    2. Portfolio-low: core portfolio below threshold for the confirmation
+       window.
+    3. FI-low: core FI bucket below threshold for the confirmation window.
+
+    CB1 → CB2 has two paths:
+    1. Signal-based: signal ≤ cb2_threshold_rate for confirmation_window_weeks
+       (tracked via pending_confirmations.cb2_signal).
     2. Timer-based: cb1_active_timer_started_at is more than
        cb1_to_cb2_timer_days old. Fires immediately when crossed; does
-       not use pending_transitions.
+       not use a pending counter. `signal` is added to cb2_entry_conditions
+       on timer fire (§6.3.5).
 
-    The CB state machine has a single path CB_INACTIVE → CB1 → CB2 with
-    two independent triggers for the CB1 → CB2 transition. Long CB1
-    spans promote to CB2 directly via the timer trigger; there is no
-    intermediate state.
+    cb2_entry_conditions tracks which conditions have been active during
+    the current CB2 episode. CB2 exits only when every condition in the
+    set has cleared with its recovery buffer (§6.3.3, §6.3.4); the set
+    is cleared on exit.
     """
     model_config = ConfigDict(extra="forbid")
 
     state: CBState
     cb1_active_timer_started_at: Optional[datetime] = None
-    pending_transitions: list[CBPendingTransition] = Field(default_factory=list)
+    cb2_entry_conditions: set[CBEntryCondition] = Field(default_factory=set)
+    pending_confirmations: CBPendingConfirmations = Field(
+        default_factory=CBPendingConfirmations
+    )
+
+    @field_validator("cb2_entry_conditions", mode="before")
+    @classmethod
+    def coerce_entry_conditions(cls, v):
+        """Accept list/tuple/set/None from JSON and coerce to set. JSON has
+        no native set; the state file stores cb2_entry_conditions as an
+        array, but in-memory we want set semantics for membership tests."""
+        if v is None:
+            return set()
+        if isinstance(v, set):
+            return v
+        if isinstance(v, (list, tuple)):
+            return set(v)
+        raise ValueError(
+            f"cb2_entry_conditions must be a list/set, got {type(v).__name__}"
+        )
 
 
 class LookbackSignal(BaseModel):
@@ -211,7 +272,11 @@ class ScheduleState(BaseModel):
 class BufferState(BaseModel):
     """Recomputed annual values for SGOV and cash buffers. Updated at
     phase transitions and annual reviews. Code reads from here rather
-    than recomputing each cycle."""
+    than recomputing each cycle.
+
+    refill_delay_started_at is set when CB2 exits (any path) and is
+    cleared when the post-recovery delay elapses or CB2 re-enters.
+    """
     model_config = ConfigDict(extra="forbid")
 
     sgov_target_dollars: Decimal
@@ -328,6 +393,11 @@ def save_state(state: OperatingState, path: str) -> None:
     This helper produces the JSON bytes; the atomic-write file mechanics
     should be implemented in the persistence layer. Reference signature
     here for clarity on the data flow.
+
+    Note on cb2_entry_conditions: in-memory the field is a `set` for
+    fast membership tests; on serialization Pydantic emits it as a JSON
+    array (sets are not JSON-native). The reverse coercion is in
+    CBMachine.coerce_entry_conditions.
     """
     import json
     import os
@@ -393,7 +463,7 @@ def new_initial_state(
     cash_target = i_0 + cash_offset
 
     return OperatingState(
-        schema_version="1.0",
+        schema_version="1.1",
         last_cycle_id=uuid4(),
         last_cycle_at=now,
         phase=Phase.PHASE_1,

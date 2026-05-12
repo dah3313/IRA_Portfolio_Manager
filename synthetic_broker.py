@@ -94,9 +94,42 @@ populates open orders synchronously, so this is reached only via
 arm_next_placement_to_not_confirm() fault injection."""
 
 ACTIVITY_LOOKBACK_HOURS = 48
-"""Maximum age of completed orders and fills returned by
-get_recent_activity() and used for idempotent order rediscovery.
-Mirrors the design's 48-hour lookback for operational_pause auto-resume."""
+"""Reference value documenting IRAPM's 48-hour design window: the
+operational_pause auto-resume window and the idempotent-rediscovery
+lookback in IBKRBroker.place_order(). Retained as a module-level
+constant for cross-implementation symmetry with IBKRBroker.
+
+NOTE: SyntheticBroker.get_recent_activity() does NOT cap the caller's
+`since` parameter to this value (would violate the protocol contract
+with IBKRBroker, which honors `since` verbatim). The constant is
+documentary; callers who want the 48h-bounded view pass `since=now -
+48h` themselves."""
+
+SETTLEMENT_CALENDAR_DAYS = 1
+"""Number of calendar days that must elapse between the moment cash
+enters the unsettled bucket and the moment evolve_pending_state() will
+promote it to settled.
+
+WHY CALENDAR DAYS, NOT BUSINESS DAYS:
+  The synthetic broker is a thin model. Business-day arithmetic
+  (weekends, exchange holidays) is the simulator's concern — IPMS
+  drives the clock and decides when 'a day has passed'. If the
+  simulator advances the clock from Friday → Monday, three calendar
+  days elapse and unsettled cash from a Friday SELL settles correctly
+  on the Monday advance. If the simulator advances hour-by-hour, the
+  promotion correctly waits until at least one full calendar day has
+  elapsed since the SELL.
+
+  Real IBKR uses T+1 in business days; the synthetic model is
+  intentionally simpler. Tests that need exact business-day behavior
+  should drive the simulator clock to land on business-day boundaries.
+
+WHY NOT ZERO:
+  Pre-Change-2 behavior was zero — every evolve_pending_state() call
+  promoted all unsettled cash regardless of how recent the SELL.
+  This allowed simulations where IRAPM math could 'see' cash as
+  settled on the same simulated day as the SELL, masking spec
+  violations that production would catch."""
 
 
 # =============================================================================
@@ -284,6 +317,16 @@ class SyntheticBroker:
         # Account state
         self._cash_settled = initial_cash
         self._cash_unsettled = Decimal("0")
+        # Timestamp of the earliest SELL fill currently contributing to
+        # _cash_unsettled. Used by evolve_pending_state() to decide
+        # whether enough simulated time has elapsed to promote the
+        # whole unsettled block to settled (per SETTLEMENT_CALENDAR_DAYS).
+        # None when _cash_unsettled is zero (no SELL fills outstanding).
+        # If a test directly mutates _cash_unsettled without setting this
+        # field, the next evolve_pending_state() will promote it on the
+        # FIRST call (no settlement delay) — backward-compat for tests
+        # that pre-date Change 2.
+        self._cash_unsettled_since: Optional[datetime] = None
         self._positions: dict[str, Position] = {}
         self._market_prices: dict[str, Price] = {}
 
@@ -528,13 +571,10 @@ class SyntheticBroker:
         recent_completed: list[OrderResult] = []
         recent_fills: list[Fill] = []
 
-        # Bound the lookback at ACTIVITY_LOOKBACK_HOURS to match the
-        # idempotency window even if caller passes an older `since`.
-        effective_since = max(
-            since,
-            now - timedelta(hours=ACTIVITY_LOOKBACK_HOURS),
-        )
-
+        # Honor caller's `since` verbatim — matches IBKRBroker behavior.
+        # (Pre-Change-3 the synthetic broker silently capped this to
+        # ACTIVITY_LOOKBACK_HOURS, creating a sim-vs-real contract
+        # divergence when callers passed older `since` values.)
         for order in self._orders.values():
             order_result = self._order_to_result(order)
             if order.status in (
@@ -543,13 +583,13 @@ class SyntheticBroker:
                 OrderStatusValue.PARTIAL,
             ):
                 open_orders.append(order_result)
-            elif order.submitted_at >= effective_since:
+            elif order.submitted_at >= since:
                 # Completed (filled/cancelled/rejected) within the window
                 recent_completed.append(order_result)
 
             # Collect this order's fills that fall in the window
             for fill in order.fills:
-                if fill.fill_time >= effective_since:
+                if fill.fill_time >= since:
                     recent_fills.append(fill)
 
         # Sort for protocol contract: open and completed by submitted_at
@@ -786,10 +826,13 @@ class SyntheticBroker:
           - Recurring ACH disbursements may have happened (if a
             next_scheduled_date is in the past, decrement cash by
             amount_dollars and advance the next_scheduled_date).
-          - Unsettled cash may now be settled (T+1 simulation —
-            simplistic: all unsettled cash becomes settled in this
-            call; IPMS controls when this gets called relative to
-            "settlement date" by its own clock advancement).
+          - Unsettled cash from SELL fills is promoted to settled
+            once at least SETTLEMENT_CALENDAR_DAYS calendar days have
+            elapsed since the earliest SELL in the current unsettled
+            block. See the SETTLEMENT_CALENDAR_DAYS docstring for
+            the rationale (Change 2 in the broker review: this prevents
+            simulations where same-day SELLs appear settled, which
+            would mask spec violations production would catch).
 
         This method is intentionally NOT in the protocol — it's a
         simulator hook, not part of the broker contract."""
@@ -813,10 +856,25 @@ class SyntheticBroker:
                 else:
                     order.status = OrderStatusValue.PARTIAL
 
-        # 2. Settle unsettled cash. Simplistic — caller controls when.
+        # 2. Settle unsettled cash, but only if SETTLEMENT_CALENDAR_DAYS
+        # have elapsed since the earliest unsettled SELL. Tests/sims
+        # that mutate _cash_unsettled directly without setting
+        # _cash_unsettled_since get promoted immediately (backward-compat).
         if self._cash_unsettled > 0:
-            self._cash_settled += self._cash_unsettled
-            self._cash_unsettled = Decimal("0")
+            if self._cash_unsettled_since is None:
+                # Direct mutation by test/sim with no aging info —
+                # promote immediately (legacy behavior).
+                self._cash_settled += self._cash_unsettled
+                self._cash_unsettled = Decimal("0")
+            else:
+                elapsed = now - self._cash_unsettled_since
+                if elapsed >= timedelta(days=SETTLEMENT_CALENDAR_DAYS):
+                    self._cash_settled += self._cash_unsettled
+                    self._cash_unsettled = Decimal("0")
+                    self._cash_unsettled_since = None
+                # else: not enough time has elapsed; leave the block
+                # unsettled. Next evolve_pending_state() call will
+                # re-check.
 
         # 3. Process recurring ACH disbursements whose next_scheduled_date
         # has elapsed. Each disbursement decrements settled cash and
@@ -849,6 +907,10 @@ class SyntheticBroker:
             "connected": self._connected,
             "cash_settled": str(self._cash_settled),
             "cash_unsettled": str(self._cash_unsettled),
+            "cash_unsettled_since": (
+                self._cash_unsettled_since.isoformat()
+                if self._cash_unsettled_since is not None else None
+            ),
             "positions": {
                 symbol: pos.model_dump(mode="json")
                 for symbol, pos in self._positions.items()
@@ -952,6 +1014,12 @@ class SyntheticBroker:
             elif order.side == OrderSide.SELL:
                 # Cash in
                 self._cash_unsettled += (notional - commission)
+                # Mark the unsettled block's age (Option B semantics:
+                # the EARLIEST SELL contributing to the current block
+                # wins; later SELLs do not reset the clock). If a prior
+                # block was already aging, keep its earlier timestamp.
+                if self._cash_unsettled_since is None:
+                    self._cash_unsettled_since = fill.fill_time
                 # Position down
                 existing = self._positions.get(symbol)
                 if existing is None:
@@ -986,4 +1054,5 @@ __all__ = [
     "SyntheticBroker",
     "FillPolicy",
     "BROKER_IMPL_TAG",
+    "SETTLEMENT_CALENDAR_DAYS",
 ]

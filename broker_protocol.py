@@ -104,7 +104,7 @@ from broker_types import (
 #   BrokerInconsistency  → broker returned data that violates an invariant
 #                          we depend on (account mismatch, place_order
 #                          succeeded but order not in open orders within
-#                          5 sec, place_order returned an order ref we
+#                          15 sec, place_order returned an order ref we
 #                          didn't supply, etc.). This is the "something is
 #                          deeply wrong" category — operational_pause with
 #                          pause_reason='broker_inconsistency'; NOT eligible
@@ -161,7 +161,7 @@ class BrokerInconsistency(BrokerError):
       - Connected account ID doesn't match the configured expected
         account ID at startup
       - place_order() succeeded but the order doesn't appear in the
-        open-orders table within 5 seconds (the post-placement
+        open-orders table within 15 seconds (the post-placement
         confirmation check)
       - get_recent_activity() returns an order with a client_order_id
         format the broker didn't receive from us (suggests order
@@ -221,8 +221,15 @@ class Broker(Protocol):
         connection may re-query the broker for fresher data.
 
         Per the per-cycle connection lifecycle, this is called at
-        cycle start. Idempotent: calling connect() when already
-        connected is a no-op (does not re-handshake).
+        cycle start. Idempotent and self-healing: calling connect()
+        when already connected is a no-op IF the underlying transport
+        is still alive. If the implementation detects the transport
+        has been lost since the last successful connect (e.g., TWS
+        restart between cycles), it performs a real reconnect rather
+        than returning early. This aligns connect()'s view of
+        readiness with is_ready()'s and supports a fail-safe operating
+        posture: operators (and the cycle launcher) calling connect()
+        on a stale broker get an actual fresh connection.
 
         Raises:
           BrokerUnreachable: TCP/DNS/auth failure within timeout_sec.
@@ -368,7 +375,7 @@ class Broker(Protocol):
 
         POST-PLACEMENT CONFIRMATION
           After submitting (when no existing order was found), the
-          implementation waits up to 5 seconds for the order to appear
+          implementation waits up to 15 seconds for the order to appear
           in the broker's open-orders table. If the order does not
           appear within that window, raises BrokerInconsistency —
           this catches the rare TWS failure mode where placeOrder
@@ -414,7 +421,7 @@ class Broker(Protocol):
             the action layer can branch cleanly; the rejection_reason
             is in the exception's `.reason`.
           BrokerInconsistency: order submitted but didn't appear in
-            open orders within 5 sec; or other internal-consistency
+            open orders within 15 sec; or other internal-consistency
             violation.
         """
         ...

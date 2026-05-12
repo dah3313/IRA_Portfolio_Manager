@@ -119,12 +119,19 @@ generous for a healthy local TWS — typical handshake completes in
 2-5 sec. The longer window is to tolerate occasional Gateway hiccups
 without aborting the cycle."""
 
-POST_PLACEMENT_CONFIRMATION_WINDOW_SEC = 5.0
+POST_PLACEMENT_CONFIRMATION_WINDOW_SEC = 15.0
 """Window within which place_order() must see the submitted order
 in a recognized state (PendingSubmit, PreSubmitted, Submitted, Filled,
-etc.) before raising BrokerInconsistency. Five seconds is generous
-for normal IBKR processing (typical confirmation < 1 sec) and short
-enough that a cycle stalling on it is operator-visible quickly."""
+etc.) before raising BrokerInconsistency.
+
+Fifteen seconds is generous for normal IBKR processing (typical
+confirmation < 1 sec) and leaves headroom for occasional API-callback
+lag during heavy-load periods or near IBKR's 23:45 ET daily reset.
+The cost-benefit is asymmetric: a false-positive BrokerInconsistency
+is the one halt category NOT eligible for 48h auto-resume (requires
+operator review), so a slightly longer wait is cheap insurance.
+A cycle stalling on it for the full 15 sec is still operator-visible
+quickly (cycles run in the background, not interactively)."""
 
 POST_PLACEMENT_ACTIVITY_LOOKBACK_HOURS = 48
 """How far back place_order() looks when searching for an existing
@@ -321,8 +328,17 @@ class IBKRBroker:
           5. Set self._connected = True. Subsequent state-query methods
              will work.
 
-        Idempotency: if already connected, this is a no-op (does not
-        re-handshake).
+        IDEMPOTENCY & SELF-HEALING (Change 4):
+          If our internal flag says we're connected, cross-check with
+          ib_async.isConnected() before treating the call as a no-op.
+          When the library reports the underlying connection has been
+          lost (TWS restart, network blip, killed process between
+          cycles), we flip our flag back to False and proceed with a
+          real reconnect. This aligns connect() with is_ready()'s view
+          of reality and supports the fail-safe / self-resolving policy:
+          an operator (or the cycle launcher) calling connect() on a
+          stale-flag broker gets an actual fresh connection rather than
+          a silent no-op that leaves them in the broken state.
 
         Translation of ib_async exceptions:
           asyncio.TimeoutError                → BrokerUnreachable
@@ -342,8 +358,33 @@ class IBKRBroker:
             returned data we don't trust.
         """
         if self._connected:
-            logger.debug("connect() called when already connected; no-op.")
-            return
+            # Cross-check the library's view before declaring no-op.
+            # If ib_async disagrees, the underlying socket has dropped
+            # since the last successful connect() and our internal
+            # flag is stale — fall through to a real reconnect.
+            library_says_connected = False
+            if self._ib is not None:
+                try:
+                    library_says_connected = bool(self._ib.isConnected())
+                except Exception as e:
+                    # If isConnected() itself raised, treat as not
+                    # connected. Don't propagate — we're about to
+                    # reconnect anyway.
+                    logger.warning(
+                        "connect(): isConnected() raised during stale-flag "
+                        "cross-check; treating as not-connected and "
+                        "reconnecting: %s", e,
+                    )
+            if library_says_connected:
+                logger.debug("connect() called when already connected; no-op.")
+                return
+            # Stale flag detected. Reset and proceed to a real reconnect.
+            logger.info(
+                "connect(): internal flag was True but ib_async reports "
+                "not connected (TWS restart or connection drop suspected). "
+                "Resetting state and reconnecting."
+            )
+            self._connected = False
 
         # ---- Lazy import of ib_async ----
         try:
@@ -1220,8 +1261,8 @@ class IBKRBroker:
     #   2. If found: return that order's state with
     #      idempotent_rediscovery=True. No new submission.
     #   3. If not found: submit, then confirm the order appears in
-    #      open-orders within 5 seconds. Failure to confirm raises
-    #      BrokerInconsistency.
+    #      open-orders within POST_PLACEMENT_CONFIRMATION_WINDOW_SEC.
+    #      Failure to confirm raises BrokerInconsistency.
     # =========================================================================
 
     def place_order(

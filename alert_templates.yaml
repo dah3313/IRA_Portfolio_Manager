@@ -36,21 +36,11 @@
 # on some networks. One-segment messages arrive reliably.
 #
 # Channel discipline: **all alerts dispatch via BOTH email AND SMS**, no
-# exceptions. The operator may be in locations with cell coverage but no
-# WiFi or data plan (rural travel, cabins, cruise ships in port). SMS uses
-# the cellular voice/text network which has fundamentally wider coverage
-# than internet-based email delivery. For a system whose purpose is to
-# keep operating unattended during long absences, "operator reachable by
-# cell but not internet" is a real and common scenario.
-#
-# Implication: SMS templates must be self-sufficient. A survivor or
-# operator reading only the SMS should know what happened and what
-# (if anything) to do. The email body is rich-context backup with the
-# same information plus details. Both fields are mandatory for every
-# alert entry.
-#
-# This is a deliberate departure from spec §12.6's per-alert channel
-# routing — see DECISIONS.md entry D-AT-1.
+# exceptions. SMS templates must be self-sufficient (a survivor or
+# operator reading only the SMS should know what happened and what to do).
+# The email body is rich-context backup with the same information plus
+# details. Both fields are mandatory for every alert entry. See
+# DECISIONS.md entry D-AT-1 for rationale.
 #
 # Section ordering matches §12.6's grouping.
 # =============================================================================
@@ -215,102 +205,65 @@ phase3_grace_aborted:
 
 
 # -----------------------------------------------------------------------------
-# Circuit breaker and guard alerts
+# Circuit breaker alerts
 # -----------------------------------------------------------------------------
 
 cb_transition:
-  # Fires on any CB state change: CB_INACTIVE↔CB1, CB1↔CB2.
-  # CB1 → CB2 has two trigger paths: signal-based (drawdown depth) or
-  # timer-based (CB1 has been active ≥ cb1_to_cb2_timer_days). The
-  # {trigger_reason} placeholder is one of:
-  #   - "signal_threshold" (signal hit cb2_threshold_rate × 2 cycles)
-  #   - "cb1_timer_expired" (CB1 has been active for 90 days)
-  #   - "signal_recovery" (recovery transitions)
-  # Placeholders: {timestamp}, {from_state}, {to_state}, {signal_value},
-  #               {confirmation_weeks}, {trigger_reason}, {consequence_summary}
+  # Fires on any CB state change: CB_INACTIVE↔CB1, CB1↔CB2,
+  # CB_INACTIVE→CB2 (resource-triggered, bypasses CB1).
+  #
+  # CB2 has three independent entry paths (§6.3.1):
+  #   - signal: Growth lookback ≤ cb2_threshold_rate × 2 cycles
+  #   - portfolio_low: core portfolio below threshold × 2 cycles
+  #   - fi_low: core FI bucket below threshold × 2 cycles
+  # Plus the CB1→CB2 timer path (cb1_timer) which records `signal` in
+  # the active entry-conditions set. Resource conditions (portfolio_low,
+  # fi_low) bypass CB1 and trigger CB2 directly.
+  #
+  # CB1 has one entry path (signal-based). CB2 exits when all conditions
+  # in cb2_entry_conditions have cleared with their recovery buffers.
+  #
+  # Placeholders:
+  #   {timestamp}, {from_state}, {to_state}, {signal_value},
+  #   {trigger_reason}: ENTRY: one of "signal", "portfolio_low", "fi_low",
+  #                     "cb1_timer"; EXIT: comma-separated list of cleared
+  #                     conditions (e.g. "signal, portfolio_low")
+  #   {active_conditions}: comma-separated cb2_entry_conditions snapshot
+  #                       (empty string when transitioning to CB_INACTIVE)
+  #   {trigger_detail}: human-readable elaboration of trigger_reason
+  #                    (e.g. "core portfolio $28,450 < $54,000 threshold"
+  #                    for portfolio_low; "signal -22.1% ≤ -20% for 2 weeks"
+  #                    for signal)
+  #   {consequence_summary}: what changes operationally
   subject: "IRAPM: Circuit Breaker {from_state} → {to_state}"
   body: |
     The system's Circuit Breaker state has changed.
 
     Transition: {from_state} → {to_state}
     Trigger: {trigger_reason}
+    Detail: {trigger_detail}
     Signal at transition: {signal_value}
+    Active CB2 entry conditions: {active_conditions}
     At: {timestamp}
 
     What this means in practice:
     {consequence_summary}
 
     No action required. The CB framework is automatic — it adjusts the
-    system's behavior based on market conditions to protect the
-    portfolio from forced selling at depressed prices. The transition
-    will reverse automatically when market conditions improve and the
-    recovery threshold is met (also with confirmation).
+    system's behavior based on market and portfolio conditions to
+    protect the portfolio from forced selling at depressed prices and
+    to extend runway when resources run low.
+
+    For CB2: the transition will reverse automatically when ALL the
+    active entry conditions have cleared with their recovery buffers
+    (signal: +5% above trigger; resource conditions: +10% above
+    trigger), each confirmed for 2 consecutive weekly cycles.
+
+    For CB1: reverses automatically when signal recovers above
+    cb1_threshold + 2% for 2 weeks.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM: CB {from_state}→{to_state} ({trigger_reason}) at signal {signal_value}."
-
-fi_low_alert:
-  # Fires when FI bucket value falls below fi_low_alert_threshold_months
-  # of current monthly withdrawal. Replaces the prior fi_depleted guard,
-  # which has been demoted to a simple alert (no cascade routing).
-  # Re-fires weekly while condition persists; stops firing when FI
-  # recovers above threshold. The operational pause framework + position
-  # residual minimums handle actual sale-prevention at the depletion edge.
-  # Placeholders: {timestamp}, {fi_value_dollars}, {threshold_dollars},
-  #               {months_of_coverage}
-  subject: "IRAPM WARNING: FI bucket low — {months_of_coverage} months of withdrawals"
-  body: |
-    The Fixed-Income bucket has fallen below the early-warning threshold
-    at {timestamp}.
-
-    FI bucket value: ${fi_value_dollars}
-    Threshold: ${threshold_dollars}
-    Coverage: {months_of_coverage} months of current scheduled withdrawals
-
-    No immediate action required. This is an early-warning alert — the
-    system continues normal operation. If FI continues to deplete, the
-    position_residual_minimum_dollars floor (default $1,500/symbol) will
-    eventually prevent further FI sales, and the operational pause
-    framework will halt withdrawals if all sources are residual-locked.
-
-    The alert will stop firing automatically when FI recovers above
-    the threshold. No deactivation alert is sent.
-
-    This alert re-fires weekly while the condition persists.
-
-    Cycle ID: {cycle_id}
-  sms: "IRAPM WARN: FI low. ${fi_value_dollars} = {months_of_coverage}mo coverage. See email."
-
-portfolio_low_alert:
-  # Fires when total core (Growth + FI, excluding buffer and cash) falls
-  # below max(portfolio_low_alert_floor_dollars,
-  #          portfolio_low_alert_floor_months × monthly_withdrawal).
-  # Replaces the prior portfolio_depleted guard. Same alert-cadence and
-  # auto-clearing semantics as fi_low_alert.
-  # Placeholders: {timestamp}, {core_value_dollars}, {threshold_dollars},
-  #               {months_of_coverage}
-  subject: "IRAPM WARNING: Portfolio low — {months_of_coverage} months of withdrawals"
-  body: |
-    The total core portfolio has fallen below the early-warning threshold
-    at {timestamp}.
-
-    Core portfolio value: ${core_value_dollars}
-    Threshold: ${threshold_dollars}
-    Coverage: {months_of_coverage} months of current scheduled withdrawals
-
-    No immediate action required. This is an early-warning alert — the
-    system continues normal operation. If the portfolio continues to
-    deplete, the position_residual_minimum_dollars floors will prevent
-    sales below residual, and the operational pause framework will halt
-    withdrawals if needed.
-
-    The alert will stop firing automatically when the portfolio recovers
-    above the threshold. No deactivation alert is sent.
-
-    This alert re-fires weekly while the condition persists.
-
-    Cycle ID: {cycle_id}
-  sms: "IRAPM WARN: Portfolio low. ${core_value_dollars} = {months_of_coverage}mo coverage. See email."
+  sms: "IRAPM: CB {from_state}→{to_state} ({trigger_reason}). Signal {signal_value}. See email."
 
 
 # -----------------------------------------------------------------------------
@@ -553,9 +506,13 @@ withdrawal_capacity_exhausted:
 # -----------------------------------------------------------------------------
 
 large_cash_deployment:
-  # Fires when §7.7.1 large-deployment plan executes.
+  # Fires when §7.7.1 large-deployment plan executes. Two modes per
+  # §7.7.1: target_weight_proportional (default; used in CB_INACTIVE,
+  # CB1, and CB2-resource-only) and defensive (SGOV-first then FI-only;
+  # used when CB2 has the signal condition currently holding). The
+  # {deployment_mode} placeholder identifies which mode fired.
   # Placeholders: {timestamp}, {cash_deployed_dollars}, {trigger_threshold},
-  #               {deployment_summary}
+  #               {deployment_mode}, {deployment_summary}
   subject: "IRAPM: Large cash deployment — ${cash_deployed_dollars}"
   body: |
     A large cash deployment executed at {timestamp}.
@@ -563,15 +520,24 @@ large_cash_deployment:
     Cash deployed: ${cash_deployed_dollars}
     Trigger: surplus exceeded ${trigger_threshold} (the larger of the
     fixed dollar threshold and 5% of portfolio value)
+    Deployment mode: {deployment_mode}
 
     Deployment breakdown:
     {deployment_summary}
 
     This mechanic handles bulk inflows (planned annual Roth conversions,
-    large deposits) by allocating the cash across active core positions
-    in proportion to the current phase's target weights — i.e., each
-    position receives cash_deployed × target_weight[symbol]. No reading
-    of current position values; no proportional-to-deficit math.
+    large deposits) without the standard cash buffer rule's bite-by-bite
+    single-position-per-cycle behavior.
+
+    Mode selection (§7.7.1):
+    - target_weight_proportional: cash allocated to each core position
+      in proportion to the current phase's target weights. Used when
+      market conditions are nominal (CB_INACTIVE, CB1, or CB2 active
+      via resource conditions only).
+    - defensive: cash goes to SGOV first, then to FI-only positions.
+      Used when CB2 is active with the signal condition currently
+      holding (market drawdown — don't buy Growth at depressed
+      valuations).
 
     Any resulting drift is handled by the next cycle's 5/25 rebalance
     evaluation (Phase 1/3) or the next semi-annual reallocation (Phase 2).
@@ -579,7 +545,7 @@ large_cash_deployment:
     No action required.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM: Large cash deployment ${cash_deployed_dollars}. See email for breakdown."
+  sms: "IRAPM: Large cash deployment ${cash_deployed_dollars} ({deployment_mode}). See email."
 
 
 # -----------------------------------------------------------------------------
@@ -1239,7 +1205,8 @@ weekly_summary:
     CIRCUIT BREAKER STATE
     Current CB state: {cb_state}
     {cb_extended_detail}
-    Pending CB transitions: {pending_cb_transitions}
+    Active CB2 entry conditions: {active_cb2_conditions}
+    Pending CB confirmations: {pending_cb_confirmations}
 
     BUFFER STATE
     SGOV buffer market value: ${sgov_value}

@@ -184,11 +184,24 @@ class Ruleset(BaseModel):
     # -------------------------------------------------------------------------
     # §2. Circuit breakers (§3.10, §6.3)
     # -------------------------------------------------------------------------
+    # Signal-based thresholds and hysteresis
     cb1_threshold_rate: Decimal
     cb2_threshold_rate: Decimal
     cb1_recovery_buffer_rate: Decimal
     cb2_recovery_buffer_rate: Decimal
     cb1_to_cb2_timer_days: int = Field(gt=0)
+    # CB2 resource-trigger thresholds and recovery hysteresis (v1.6 — see
+    # DECISIONS.md D-SPEC-6). Portfolio-low: dollar floor combined with a
+    # months-of-withdrawal multiplier via max(). FI-low: months-of-
+    # withdrawal threshold only. Both have an independent recovery buffer
+    # rate (default 10%) — CB2 exit on a resource path requires the value
+    # to clear `threshold × (1 + recovery_buffer_rate)` for the
+    # confirmation window.
+    portfolio_low_threshold_dollars: Decimal
+    portfolio_low_threshold_months: int = Field(gt=0)
+    portfolio_low_recovery_buffer_rate: Decimal
+    fi_low_threshold_months: int = Field(gt=0)
+    fi_low_recovery_buffer_rate: Decimal
 
     # -------------------------------------------------------------------------
     # §3. Synthetic Growth Lookback signal (§5)
@@ -250,27 +263,20 @@ class Ruleset(BaseModel):
     large_cash_deployment_threshold_rate: Decimal
 
     # -------------------------------------------------------------------------
-    # §11. Low-resource alerts (§6.4)
-    # -------------------------------------------------------------------------
-    fi_low_alert_threshold_months: int = Field(gt=0)
-    portfolio_low_alert_floor_dollars: Decimal
-    portfolio_low_alert_floor_months: int = Field(gt=0)
-
-    # -------------------------------------------------------------------------
-    # §12. Annual review (§7.6)
+    # §11. Annual review (§7.6)
     # -------------------------------------------------------------------------
     annual_review_date: str
     freeze_evaluation_threshold_days: int = Field(gt=0)
 
     # -------------------------------------------------------------------------
-    # §13. Misc alert / order / ACH parameters
+    # §12. Misc alert / order / ACH parameters
     # -------------------------------------------------------------------------
     fi_overweight_suppression_alert_weeks: int = Field(gt=0)
     order_fill_timeout_seconds: int = Field(gt=0)
     ach_update_warning_threshold_cycles: int = Field(gt=0)
 
     # -------------------------------------------------------------------------
-    # §14. Hardware token configuration (§10.8)
+    # §13. Hardware token configuration (§10.8)
     # -------------------------------------------------------------------------
     phase3_grace_window_hours: int = Field(gt=0)
     phase3_token_count_required: int = Field(gt=0)
@@ -280,7 +286,7 @@ class Ruleset(BaseModel):
     token_mismatch_critical_cycles: int = Field(gt=0)
 
     # -------------------------------------------------------------------------
-    # §15. Master/slave coordination (§9.4.2)
+    # §14. Master/slave coordination (§9.4.2)
     # -------------------------------------------------------------------------
     master_heartbeat_time: str
     rsync_replication_time: str
@@ -290,19 +296,19 @@ class Ruleset(BaseModel):
     slave_promotion_grace_hours: int = Field(gt=0)
 
     # -------------------------------------------------------------------------
-    # §16. Operational pause framework (§11.3)
+    # §15. Operational pause framework (§11.3)
     # -------------------------------------------------------------------------
     pause_auto_resume_hours: int = Field(gt=0)
     pause_consecutive_escalation_count: int = Field(gt=0)
 
     # -------------------------------------------------------------------------
-    # §17. Operator-configured operational parameters
+    # §16. Operator-configured operational parameters
     # -------------------------------------------------------------------------
     ach_destination: str
     dry_run: bool
 
     # -------------------------------------------------------------------------
-    # §18. Scheduler (§9.6)
+    # §17. Scheduler (§9.6)
     # -------------------------------------------------------------------------
     cycle_schedule: str
 
@@ -322,6 +328,9 @@ class Ruleset(BaseModel):
         "cb2_threshold_rate",
         "cb1_recovery_buffer_rate",
         "cb2_recovery_buffer_rate",
+        "portfolio_low_threshold_dollars",
+        "portfolio_low_recovery_buffer_rate",
+        "fi_low_recovery_buffer_rate",
         "lookback_min_bar_coverage_rate",
         "phase1_initial_monthly_dollars",
         "phase2_opportunistic_trigger_rate",
@@ -333,7 +342,6 @@ class Ruleset(BaseModel):
         "cash_buffer_tolerance_dollars",
         "large_cash_deployment_threshold_dollars",
         "large_cash_deployment_threshold_rate",
-        "portfolio_low_alert_floor_dollars",
         mode="before",
     )
     @classmethod

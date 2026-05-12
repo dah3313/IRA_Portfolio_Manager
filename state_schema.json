@@ -24,7 +24,7 @@
       "description": "Schema version of this state file. Loader checks this on read; mismatch triggers controlled migration or refusal to start.",
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+$",
-      "examples": ["1.0"]
+      "examples": ["1.1"]
     },
 
     "last_cycle_id": {
@@ -95,37 +95,55 @@
     },
 
     "cb_machine": {
-      "description": "Circuit breaker state and associated timing.",
+      "description": "Circuit breaker state, the CB1-active timer, and per-path pending-confirmation counters. CB2 has three independent entry paths (signal, Portfolio-low, FI-low), each with its own pending-confirmation counter; CB1↔CB_INACTIVE has signal-based entry and exit counters. The cb2_entry_conditions set tracks which conditions have triggered during the current CB2 episode — CB2 exits only when ALL conditions in this set have cleared with their respective recovery buffers (§6.3.3, §6.3.4).",
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "cb1_active_timer_started_at"],
+      "required": [
+        "state",
+        "cb1_active_timer_started_at",
+        "cb2_entry_conditions",
+        "pending_confirmations"
+      ],
       "properties": {
         "state": {
-          "description": "Current CB state. Three values only: CB_INACTIVE → CB1 → CB2. CB1 → CB2 transitions have two trigger paths: signal-based (signal ≤ cb2_threshold_rate for confirmation_window_weeks) OR timer-based (cb1_active_timer has been running for ≥ cb1_to_cb2_timer_days).",
+          "description": "Current CB state. Three values only: CB_INACTIVE → CB1 → CB2. CB1 is signal-based only; resource conditions (Portfolio-low, FI-low) trigger CB2 directly, bypassing CB1. CB1 → CB2 has two trigger paths: signal-based (signal ≤ cb2_threshold_rate for confirmation_window_weeks) OR timer-based (cb1_active_timer has been running for ≥ cb1_to_cb2_timer_days).",
           "type": "string",
           "enum": ["CB_INACTIVE", "CB1", "CB2"]
         },
         "cb1_active_timer_started_at": {
-          "description": "Timestamp when current CB1 episode began. Null when state is CB_INACTIVE or CB2 (timer not running). When set, used by the timer-based CB1 → CB2 transition: if (now - cb1_active_timer_started_at).days >= cb1_to_cb2_timer_days, transition to CB2 fires.",
+          "description": "Timestamp when current CB1 episode began. Null when state is CB_INACTIVE or CB2 (timer not running). When set, used by the timer-based CB1 → CB2 transition: if (now - cb1_active_timer_started_at).days >= cb1_to_cb2_timer_days, transition to CB2 fires immediately and `signal` is added to cb2_entry_conditions.",
           "oneOf": [
             {"type": "null"},
             {"type": "string", "format": "date-time"}
           ]
         },
-        "pending_transitions": {
-          "description": "Per-direction confirmation counters for in-progress signal-based CB transitions. Each entry tracks how many consecutive weekly cycles the signal trigger condition has held. A counter reaching confirmation_window_weeks (default 2) commits the transition. Timer-based CB1 → CB2 does not use this — it fires immediately when the timer threshold is crossed.",
+        "cb2_entry_conditions": {
+          "description": "Set of CB2 entry conditions that have been active at any point during the current CB2 episode (§6.3.4). Subset of {signal, portfolio_low, fi_low}. Initialized when CB2 is entered (containing the triggering condition); accumulates additional conditions if they independently trigger during the same CB2 episode; cleared on CB2 exit. CB2 exit requires every condition in this set to clear with its recovery buffer — prevents a transient signal recovery during a resource-triggered CB2 from prematurely routing exit through a path that ignores the still-active resource condition. Empty array when state is CB_INACTIVE or CB1.",
           "type": "array",
           "default": [],
+          "uniqueItems": true,
           "items": {
-            "type": "object",
-            "required": ["from_state", "to_state", "cycles_confirmed", "first_observed_at"],
-            "additionalProperties": false,
-            "properties": {
-              "from_state": {"type": "string", "enum": ["CB_INACTIVE", "CB1", "CB2"]},
-              "to_state": {"type": "string", "enum": ["CB_INACTIVE", "CB1", "CB2"]},
-              "cycles_confirmed": {"type": "integer", "minimum": 0},
-              "first_observed_at": {"type": "string", "format": "date-time"}
-            }
+            "type": "string",
+            "enum": ["signal", "portfolio_low", "fi_low"]
+          }
+        },
+        "pending_confirmations": {
+          "description": "Per-path pending-confirmation counters tracking how many consecutive weekly cycles each entry/exit condition has held. Each counter increments when its condition holds, resets to zero when the condition fails to hold. A counter reaching confirmation_window_weeks (default 2) commits the corresponding transition. Timer-based CB1 → CB2 does NOT use these — it fires immediately when the timer threshold is crossed. The five tracked paths cover CB1 signal entry/exit and CB2 entry on each of the three paths; the corresponding CB2 exit checks use the same paths' clearing conditions and recovery buffers (§6.3.3) but are evaluated freshly each cycle from current values plus the cb2_entry_conditions set.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cb1_signal_entry",
+            "cb1_signal_exit",
+            "cb2_signal",
+            "cb2_portfolio_low",
+            "cb2_fi_low"
+          ],
+          "properties": {
+            "cb1_signal_entry": {"$ref": "#/$defs/pendingCounter"},
+            "cb1_signal_exit": {"$ref": "#/$defs/pendingCounter"},
+            "cb2_signal": {"$ref": "#/$defs/pendingCounter"},
+            "cb2_portfolio_low": {"$ref": "#/$defs/pendingCounter"},
+            "cb2_fi_low": {"$ref": "#/$defs/pendingCounter"}
           }
         }
       }
@@ -203,7 +221,7 @@
           "format": "date-time"
         },
         "refill_delay_started_at": {
-          "description": "Timestamp when the post-cascade-recovery refill delay timer started. Null when no delay is active. Set when any CB recovery transition fires (CB2 → CB1, CB1 → CB_INACTIVE). Cleared when delay elapses or any CB transition reverses recovery.",
+          "description": "Timestamp when the post-CB2-exit refill delay timer started. Null when no delay is active. Set when CB2 exits (CB2 → CB1 or CB2 → CB_INACTIVE), regardless of which entry conditions cleared. Cleared when the delay elapses or CB2 re-enters during the window.",
           "oneOf": [
             {"type": "null"},
             {"type": "string", "format": "date-time"}
@@ -286,6 +304,27 @@
   },
 
   "$defs": {
+    "pendingCounter": {
+      "description": "Counter tracking consecutive weekly cycles a condition has held. Increments when the condition holds; resets to 0 when the condition fails to hold. cycles_confirmed == 0 means no observation in progress (first_observed_at is null). When cycles_confirmed reaches confirmation_window_weeks (default 2), the corresponding transition commits and the counter is reset.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cycles_confirmed"],
+      "properties": {
+        "cycles_confirmed": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "first_observed_at": {
+          "description": "Timestamp of the first cycle that observed this condition holding. Null when cycles_confirmed is 0.",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "format": "date-time"}
+          ],
+          "default": null
+        }
+      }
+    },
     "scheduleStateInstance": {
       "description": "A schedule_state per §3.13 — represents the inflation-adjusted withdrawal schedule for a phase. The tuple (I_0, trigger_year, cpi, frozen_years) determines what the scheduled monthly withdrawal is for any given calendar year.",
       "type": "object",

@@ -305,6 +305,13 @@ is not reachable.
 
 **Plan invariant:** D11 codifies the algorithm as a test assertion.
 
+**v1.6 extension.** D-SPEC-6 (CB2 entry-path consolidation) extends
+this algorithm with a CB-state-dependent mode branch: the
+target-weight-proportional algorithm is now the default mode used in
+CB_INACTIVE, CB1, and CB2-resource-only; a `defensive` mode (SGOV-first
+then FI-only) applies when CB2 is active with the signal condition
+currently holding. D11 is scoped to the proportional mode in v1.6.
+
 ---
 
 ### D-RY-9: Percentage scaling — `_pct` → `_rate` migration
@@ -426,61 +433,52 @@ that isn't really a state but is computed each cycle."
 
 ### D-RY-12: Guards demoted to alerts
 
-**Decision:** Remove the FI-depleted and Portfolio-depleted guard
-state machines entirely. Replace with two simple Warning-severity
-alerts: `fi_low_alert` (FI bucket < 6 months of withdrawals),
-`portfolio_low_alert` (total core < max($50K, 18 months)). Alerts
-re-fire weekly while condition persists and stop firing
-automatically when condition clears (no separate deactivation
+**SUPERSEDED by D-SPEC-6 (v1.6).** The "demote guards to alerts"
+direction taken in v1.3 and the "stateless threshold checks preserve
+the gate behaviors" clarification added in v1.4 are both superseded
+by D-SPEC-6's CB2 entry-path consolidation. The Portfolio-low and
+FI-low conditions are now CB2 entry paths with full state-machine
+treatment (2-week confirmation, recovery hysteresis, persisted active-
+conditions set). The original D-RY-12 entry below is preserved for
+historical reference; D-SPEC-6 documents the current design.
+
+**Decision (original, superseded).** Remove the FI-depleted and
+Portfolio-depleted guard state machines entirely. Replace with two
+simple Warning-severity alerts: `fi_low_alert` (FI bucket < 6 months
+of withdrawals), `portfolio_low_alert` (total core < max($50K, 18
+months)). Alerts re-fire weekly while condition persists and stop
+firing automatically when condition clears (no separate deactivation
 alert). Parameters renamed: `fi_depleted_threshold_months` →
 `fi_low_alert_threshold_months`, `portfolio_depleted_floor_*` →
 `portfolio_low_alert_floor_*`. The two `_clear_hysteresis_rate`
 parameters are removed. The `guards` field is removed from
 state_schema.json and state_model.py.
 
-**Rationale:** The guards' two roles (cascade routing + alerting)
-were partially redundant with existing machinery. The §11.3
-operational pause framework catches order rejection when residual
-floors prevent sales (the actual depletion edge). The
+**Rationale (original, superseded).** The guards' two roles (cascade
+routing + alerting) were partially redundant with existing machinery.
+The §11.3 operational pause framework catches order rejection when
+residual floors prevent sales (the actual depletion edge). The
 `position_residual_minimum_dollars` floors prevent sales below
 per-symbol residual independent of guards. The remaining role —
 "alert the operator before residual floors engage" — is achieved by
 the new simple alerts. Net effect: same safety properties, fewer
 state machines, no hysteresis bookkeeping.
 
-**v1.4 clarification (preserved behaviors).** The original decision
-above understated the operational role of `portfolio_low_alert`'s
-underlying threshold. The v1.4 consistency sweep clarified that
-**three behaviors** from the prior `portfolio_depleted` guard are
-preserved as stateless threshold checks (no persisted state, no
-hysteresis), evaluated independently at the relevant decision
-points, all codified under invariant I10:
-
-  (a) **SGOV refill suspended** when core portfolio is below the
-      threshold (§7.4 of spec) — don't drain a depleted portfolio.
-  (b) **5/25 rebalancing suspended** when core portfolio is below
-      the threshold (§7.5 of spec) — don't churn a depleted
-      portfolio with trades disproportionate to its size.
-  (c) **Withdrawal routing diverts to SGOV-first cascade** when
-      core portfolio is below the threshold, regardless of CB state
-      (§7.3.2 of spec) — extend runway by drawing on the buffer
-      first; gives the core room to recover before more selling
-      pressure.
-
-These are *not* state-machine behaviors. There is no "guard active"
-flag, no persisted hysteresis, no auto-clear-on-rise-above-threshold
-event. Each decision point independently re-evaluates the same
-threshold against current portfolio value. The alert and the gates
-fire from the same condition but are otherwise independent
-evaluations.
-
-The `fi_low_alert` remains purely informational with no behavioral
-effect; only `portfolio_low_alert` has the three preserved gates.
-
-This clarification restates the truth about D-RY-12 without
-reversing it: the safety properties of the prior guards are
-preserved, just implemented as stateless checks rather than as
-parallel state machines with hysteresis bookkeeping.
+**v1.4 clarification (preserved behaviors) — also superseded.** The
+v1.4 consistency sweep clarified that three behaviors from the prior
+`portfolio_depleted` guard were preserved as stateless threshold
+checks (no persisted state, no hysteresis), evaluated independently
+at the relevant decision points, all codified under invariant I10:
+(a) SGOV refill suspended when core portfolio is below the threshold;
+(b) 5/25 rebalancing suspended when core portfolio is below the
+threshold; (c) withdrawal routing diverts to SGOV-first cascade when
+core portfolio is below the threshold, regardless of CB state. These
+clauses are no longer separate stateless checks — under D-SPEC-6 they
+follow from "CB2 is active via the Portfolio-low entry path" plus
+the existing CB2-suppresses-refill, CB2-suppresses-rebalance, and
+CB2-routes-cascade rules. The behavioral surface is the same; the
+mechanism is now a single state machine rather than three independent
+threshold checks at three decision points.
 
 ---
 
@@ -979,3 +977,532 @@ event.
 Decimal-strict types; module-level docstring in `broker_types.py`
 describes the Decimal-only invariant; `_to_decimal` helper in
 `ibkr_broker.py` handles the safe float→Decimal conversion.
+
+
+### D-BROKER-7: Post-placement confirmation window widened from 5s to 15s
+
+**Context.** After `placeOrder()` returns, `IBKRBroker.place_order()`
+waits for the order to appear in a recognized state (PendingSubmit /
+Submitted / Filled / Inactive-with-whyHeld / etc.) before returning
+an `OrderResult` to the caller. If the order does not surface within
+the window, the order's true state is unknown and the broker raises
+`BrokerInconsistency`. The original implementation used a 5-second
+window. An external review (the GemBroker.txt code review,
+2026-05-12) raised the concern that 5 seconds is tight against IBKR
+API-callback lag during heavy-load periods (market open volatility,
+FOMC announcement windows, etc.) — a false-positive
+`BrokerInconsistency` would halt the cycle and require operator
+review.
+
+**Decision.** Widen `POST_PLACEMENT_CONFIRMATION_WINDOW_SEC` from
+5.0 to 15.0 seconds.
+
+**Reasoning.**
+
+The asymmetry of costs drives this. False positives in this check
+are uniquely expensive in IRAPM's failure-handling design:
+
+- A `BrokerInconsistency` is the only halt category NOT eligible
+  for the 48-hour `pause_auto_resume` (per §15.4, §11.2.14, and
+  D-SPEC-5's broader logic about which halts can self-resolve).
+  The operator must investigate and explicitly clear the pause.
+- All other halt categories (order_rejection, partial_phase_transition,
+  disk_full) auto-resume — false positives there cost at most one
+  re-attempted cycle.
+- Real-world IBKR API callback latency during heavy market
+  periods can drift well beyond 5s for the open-orders snapshot
+  to surface a freshly-placed order.
+
+Three seconds of additional headroom against API-callback lag is
+essentially free: in the success case, `_wait_for_order_recognition`
+returns the moment the order surfaces (typically <1s), so the
+wider ceiling is only relevant when something is genuinely wrong.
+Fifteen seconds remains short enough that a real lost order is
+detected within a single cycle's runtime; the cycle does not hang
+indefinitely.
+
+**Why not even wider (30s, 60s)?** Diminishing returns. Past ~10-15s
+any lag is almost certainly a real connection problem, not transient
+API-callback queue depth. Pushing the window into the tens of
+seconds would just delay surfacing genuine inconsistencies. 15s
+is the operationally-defensible point: generous enough to absorb
+IBKR's worst-typical-case callback lag, short enough that a real
+broker problem still produces a same-cycle alert.
+
+**Policy framing.** The choice aligns with IRAPM's general posture
+(per the broker-layer review session, 2026-05-12) of leaning hard
+toward fail-safe and self-resolving. Where a halt costs more to
+clear than to avoid in the first place, prefer the generous window.
+
+**Implementation in v1.5 spec / code.** Constant
+`POST_PLACEMENT_CONFIRMATION_WINDOW_SEC = 15.0` in
+`ibkr_broker.py` module-level constants with expanded docstring
+explaining the asymmetric-cost rationale. §11.2.14 reference
+updated from "(default 5s)" to "(default 15s)". §15.5 post-placement
+confirmation paragraph rewritten to reference the constant by name
+and include the asymmetric-cost framing. Protocol-level docstrings
+in `broker_protocol.py` (BrokerInconsistency class, exception-model
+comment block, `place_order` POST-PLACEMENT CONFIRMATION section,
+`place_order` Raises section) updated from "5 sec" to "15 sec".
+
+
+### D-BROKER-8: SyntheticBroker T+1 settlement aging model
+
+**Context.** The SyntheticBroker is used by IPMS (the simulator)
+and by unit tests. Its `evolve_pending_state()` method promotes
+unsettled SELL proceeds to settled cash between cycles. The
+original implementation promoted all unsettled cash immediately
+on every `evolve_pending_state()` call, regardless of how much
+calendar time had elapsed since the SELL fill. In the IPMS
+weekly-cycle simulation this is fine (a week elapses between
+evolves, more than T+1), but it diverged from IBKR's real T+1
+settlement behavior in ways that could mask a class of bugs:
+specifically, any cycle logic that reads unsettled vs settled cash
+balances mid-week would see different values in simulation vs
+production.
+
+The external review (GemBroker.txt) flagged this as a sim-vs-real
+gap. Claude's deeper review identified the same issue plus a
+related `get_recent_activity()` `since`-parameter divergence (see
+D-BROKER-9 below).
+
+**Decision.** Implement a calendar-day-based settlement-aging
+model in the SyntheticBroker:
+
+- A single `_cash_unsettled_since: Optional[datetime]` instance
+  field tracks when the current unsettled-cash block began
+  accumulating. The first SELL of a block sets the timestamp;
+  subsequent SELLs do NOT reset it (earliest-wins semantics).
+- `evolve_pending_state()` promotes unsettled→settled only when
+  `≥ SETTLEMENT_CALENDAR_DAYS` (=1, a new module constant) of
+  calendar time has elapsed since `_cash_unsettled_since`.
+- On promotion, the timestamp clears so the next SELL starts a
+  fresh block.
+- Backward-compatibility fallback: if `_cash_unsettled_since` is
+  None (direct test mutation of `unsettled_cash` without going
+  through `_apply_fills_to_account`), promote immediately. This
+  preserves existing test behavior while supporting the new
+  fill-driven path.
+- `snapshot()` exposes `cash_unsettled_since` for forensic
+  inspection.
+
+**Why Option B (single timestamp) over Option A (per-fill
+tracking).** Two competing models:
+
+- **Option A: per-fill timestamps.** Each fill carries its own
+  `settled_at` date; `evolve_pending_state()` promotes individual
+  fills whose dates have elapsed.
+- **Option B: single block timestamp.** All unsettled cash is one
+  block with one timestamp; promote-all-or-none.
+
+Option B was chosen for simplicity and because it matches the
+behavior the simulator actually needs: between weekly cycles, all
+fills from the prior cycle settle together, so per-fill
+granularity earns nothing in practice. The earliest-wins semantics
+for the timestamp means SELLs added to a block don't extend the
+block's settlement date — which matches "each SELL settles T+1
+from its own fill date" to within the resolution that matters
+(>=1 calendar day).
+
+**Why calendar days, not business days.** IBKR's actual T+1 is
+business days, but the simulator and test fixtures don't have a
+holiday calendar. Calendar days are a conservative approximation
+(real settlement is slower over weekends, so calendar-day
+promotion is in the right direction). The simulator does not
+place SELL+ACH sequences inside a single weekend, so the
+approximation has no operational consequence.
+
+**Why not zero (immediate promotion).** Because it masks the
+bug class described in the Context section. The settlement-aging
+model is correctness insurance against future cycle logic that
+may read settled-vs-unsettled cash distinctions; matching the
+production broker's behavior closes that gap proactively.
+
+**Implementation in v1.5 spec / code.** Module constant
+`SETTLEMENT_CALENDAR_DAYS = 1` and instance field
+`_cash_unsettled_since` in `synthetic_broker.py`.
+`_apply_fills_to_account()` records timestamp on first SELL of
+block; `evolve_pending_state()` gates promotion on elapsed-time
+threshold; backward-compat fallback for direct mutations.
+`SETTLEMENT_CALENDAR_DAYS` added to `__all__`. Constant documented
+with full rationale (calendar-vs-business-days choice,
+why-not-zero motivation). No spec change required: the production
+broker contract in §15.2 does not specify settlement timing
+behavior; this is an IPMS-side fidelity improvement.
+
+
+### D-BROKER-9: SyntheticBroker get_recent_activity() honors `since` verbatim
+
+**Context.** Both broker implementations expose
+`get_recent_activity(since: Optional[datetime]) -> RecentActivity`.
+The IBKRBroker honors the caller's `since` value subject only to
+IBKR's own retention windows (48h for completed orders per the
+§15.5 idempotency lookback). The SyntheticBroker, however,
+silently capped the caller's `since` at
+`ACTIVITY_LOOKBACK_HOURS = 48` hours: a caller passing
+`since=72h_ago` would silently receive only 48h of activity.
+
+This was a contract divergence: the Protocol contract in §15.2
+does not document any silent cap, and a test or simulator query
+looking further back than 48h would get different results from
+the two broker implementations.
+
+**Decision.** Remove the silent 48h cap. `get_recent_activity()`
+in the SyntheticBroker honors the caller's `since` value verbatim.
+The `ACTIVITY_LOOKBACK_HOURS` constant is retained as documentary
+only — its docstring clarifies that it documents IBKR's 48h
+completed-orders retention window for reference, not as an
+active limit in the synthetic implementation.
+
+**Reasoning.**
+
+The broker layer's value comes from contract uniformity across
+implementations. Silent divergences are precisely the bug class
+that the Protocol abstraction exists to prevent. If the test
+suite or simulator looks back further than 48h, getting different
+results from the two implementations defeats the substitutability
+guarantee.
+
+In production, the 48h horizon is enforced by IBKR's own
+retention — IBKRBroker's `get_recent_activity()` cannot return
+records older than that, so callers organically respect the
+horizon. The SyntheticBroker holds all activity in memory and
+thus *can* return arbitrarily old records; honoring the caller's
+`since` simply means "return everything you have since that
+timestamp". If a caller asks for too much, they get too much
+— which is what they asked for.
+
+**Why the constant was kept.** The 48h value is operationally
+meaningful (it matches the idempotency lookback in §15.5 and the
+operational_pause auto-resume window in §11.3). Retaining it as
+a named constant with a docstring preserves the design-intent
+documentation even though the synthetic implementation no longer
+enforces it.
+
+**Implementation in v1.5 spec / code.**
+`SyntheticBroker.get_recent_activity()` in `synthetic_broker.py`
+honors `since` verbatim. `ACTIVITY_LOOKBACK_HOURS` docstring
+corrected to clarify its documentary-only role. No spec change
+required: the Protocol contract is unaltered; the change brings
+the synthetic implementation into compliance with the contract
+as already specified.
+
+
+### D-BROKER-10: IBKRBroker.connect() is idempotent and self-healing
+
+**Context.** `IBKRBroker.connect()` maintains an internal
+`_connected: bool` flag set on successful connection and cleared
+in `disconnect()`. The original implementation treated this flag
+as authoritative: if `_connected == True`, `connect()` returned
+immediately as a no-op. This created a stale-flag failure mode:
+between cycles, the underlying transport could drop (TWS
+restarted by IBKR-pushed update, network blip, kill -9 of
+Gateway, etc.) without the broker instance being notified. The
+internal flag remained True; `is_ready()` would correctly
+report "not ready" (because it queries the library), but a
+cycle launcher calling `connect()` to recover would silently
+succeed without actually reconnecting, leaving the broker in
+a permanently-broken state until the process restarted.
+
+**Decision.** When `_connected == True`, `connect()` cross-checks
+the library's view (`ib_async.IB.isConnected()`) before treating
+the call as a no-op. If the library disagrees, the broker:
+
+1. Logs the stale-flag detection at INFO level (not Warning —
+   this is expected when TWS has restarted between cycles).
+2. Resets `_connected = False`.
+3. Falls through to the normal reconnect path (lazy ib_async
+   import, IB() construction, ib.connect(), account verification,
+   etc.).
+
+If `isConnected()` itself raises (extremely unusual but
+possible), the exception is logged at Warning level and treated
+as "not connected" — falling through to a fresh reconnect. The
+worst case is one unneeded reconnect; the alternative (
+propagating the exception) would leave the broker in a worse
+state.
+
+**Reasoning.**
+
+This aligns `connect()`'s behavior with `is_ready()`'s view of
+reality. The two methods queried the same underlying library
+but reached different conclusions about connection state, which
+is a recipe for cycle-level confusion ("why did is_ready() fail
+immediately after connect() succeeded?"). With the self-healing
+behavior, the two methods agree: if the library says
+not-connected, both methods treat it as not-connected.
+
+The broader policy framing (from the broker-review session,
+2026-05-12): IRAPM should lean hard toward fail-safe and
+self-resolving. A `connect()` that silently no-ops on a stale
+flag is the opposite — it pretends to succeed while leaving
+the operator in a broken state that requires manual
+intervention. The self-healing version makes `connect()` a
+reliable repair primitive: an operator (or the cycle launcher)
+calling it gets either a working connection or a clear
+`BrokerUnreachable` exception.
+
+**Why not also do this in is_ready() or other methods.** Those
+methods are read-only state queries — they should report
+reality, not attempt repair. The repair semantics belong in
+the one method whose purpose is to establish a connection.
+Keeping the repair pathway concentrated in `connect()` matches
+the Protocol's documented intent (per §15.3: "each cycle
+opens a fresh broker connection at the start").
+
+**Why not do this in SyntheticBroker too.** The SyntheticBroker
+has no underlying transport to drop. Its `_connected` flag IS
+the connection state. The change does not apply.
+
+**Implementation in v1.5 spec / code.** `IBKRBroker.connect()`
+in `ibkr_broker.py` performs the cross-check before declaring
+no-op. Docstring updated with "IDEMPOTENCY & SELF-HEALING"
+section describing the behavior. Protocol-level docstring in
+`broker_protocol.py` updated to reflect the self-healing
+semantics (was: "Idempotent: calling connect() when already
+connected is a no-op"; now: "Idempotent and self-healing:
+calling connect() when already connected is a no-op IF the
+underlying transport is still alive"). §15.3 of the spec adds
+an "Idempotent and self-healing connect" paragraph documenting
+the behavior and the fail-safe policy framing.
+
+
+---
+
+## v1.6 design change: CB2 entry-path consolidation (2026-05)
+
+### D-SPEC-6: CB2 entry-path consolidation (supersedes D-RY-12)
+
+**Context.** Two specification problems were discovered during a
+review of the "hysteresis" tunable parameters:
+
+1. **Internal contradiction.** §3.10 described FI-low and
+   Portfolio-low as guards with cascade routing and hysteresis;
+   §6.4 described them as "just alerts" with no state and no
+   cascade-routing side effects. §7.3.2 and I10 sided with the
+   guard-with-cascade-routing description. The v1.4 "stateless
+   threshold checks" clarification (D-RY-12 amendment) was meant
+   to reconcile this but left the spec body with three different
+   accounts of what these conditions actually did.
+
+2. **Mismatch with operator intent.** The operator's stated
+   bootstrap design was to manually pre-fund the SGOV buffer to
+   $72K (24 months) and place the remaining ~$28K across the four
+   core positions, then let the Portfolio-low condition trigger
+   immediately on Day 1 to route withdrawals through cascade
+   while annual ~$130K Roth conversions built the core. Under the
+   §6.4 "just alerts" reading this would not happen — the
+   withdrawals would chew through the small FI bucket until
+   residual floors prevented sales, triggering operational_pause.
+   Under the §3.10 / §7.3.2 reading it would work, but only
+   because three independent stateless threshold checks at three
+   decision points happened to agree.
+
+**Decision.** Collapse the FI-low and Portfolio-low conditions
+into CB2 entry paths with full state-machine treatment. CB2 now
+has three independent entry conditions, each with 2-week
+confirmation and per-condition recovery hysteresis:
+
+- **Signal:** Growth lookback ≤ `cb2_threshold_rate` (default
+  -0.20); recovery requires signal ≥ -0.15 (+5% buffer) for 2
+  consecutive cycles.
+- **Portfolio-low:** core portfolio < `max(portfolio_low_threshold_dollars,
+  portfolio_low_threshold_months × current_monthly_withdrawal)`
+  (defaults $50K / 18 months); recovery requires core ≥ trigger
+  threshold × 1.10 (+10% buffer) for 2 consecutive cycles.
+- **FI-low:** core FI bucket < `fi_low_threshold_months ×
+  current_monthly_withdrawal` (default 6 months); recovery
+  requires FI ≥ trigger threshold × 1.10 (+10% buffer) for 2
+  consecutive cycles.
+
+CB2 exits only when **ALL conditions that have been active during
+the current CB2 episode** have cleared with their respective
+recovery buffers. The state file persists a `cb2_entry_conditions`
+set (subset of `{signal, portfolio_low, fi_low}`) tracking which
+conditions have triggered during the episode; cleared on exit.
+
+CB1 remains signal-based only; resource conditions bypass CB1 and
+trigger CB2 directly (resource conditions want SGOV cascade, not
+FI-only sourcing).
+
+**Reasoning — bootstrap walk-through.** The clean way to describe
+the design is to trace the operator's intended bootstrap:
+
+- Day 0: pre-fund SGOV to $72K + $14K Growth + $14K FI + $4K cash.
+- Day 1 cycle: core = $28K < $54K threshold → Portfolio-low
+  condition holds → confirmation counter increments to 1.
+- Day 8 cycle: condition still holds → counter increments to 2
+  → CB2 entry fires with `cb2_entry_conditions = {portfolio_low}`.
+- Day 8 onward: rebalancing suspended (CB2 rule); withdrawals
+  source from SGOV cascade (CB2 rule); refill suspended (CB2
+  rule). $3K/month flows out of SGOV.
+- Year 2 (Roth conversion lands): ~$130K cash arrives. Large
+  cash deployment (§7.7.1) fires. Mode selection: signal is
+  nominal (not ≤ -0.20), so deployment uses target-weight
+  proportional mode (not defensive). The ~$130K splits 25/25/25/25
+  across FBCG/AVUV/PYLD/JPIE. Core jumps from ~$28K to ~$154K.
+- Next cycle: Portfolio-low condition no longer holds; counter
+  begins clearing. Two cycles later: CB2 exits to CB_INACTIVE.
+- 60 days post-exit: refill resumes, drawing $6K/month from core
+  back into SGOV until buffer reaches $72K target. By mid-Year 3
+  SGOV is restored.
+
+**Reasoning — why state machine, not stateless checks.** The
+v1.4 stateless-threshold-checks formulation worked for the simple
+case but had two structural problems:
+
+1. **Three decision points, three threshold checks, no
+   coordination.** §7.3.2's cascade-routing check, §7.4's
+   refill-suspension check, and §7.5's rebalance-suspension check
+   each re-evaluated the same Portfolio-low threshold
+   independently. If the threshold was crossed in one direction
+   mid-cycle (because the cycle's own actions moved portfolio
+   value), the three checks could disagree about whether the
+   condition was active. Bug-prone.
+
+2. **No hysteresis means flicker risk.** Portfolio value
+   oscillating near the threshold from monthly withdrawals
+   followed by dividend inflows would cause the alert to toggle
+   on/off, the refill to suspend/resume, and the rebalance to
+   suspend/resume — each at slightly different times depending
+   on when the evaluations ran. The 10% recovery buffer plus
+   2-week confirmation eliminates this.
+
+Making it a CB2 entry path means: one state machine, one
+evaluation point per cycle (§6.5 step 5), one set of behavioral
+consequences (the CB2 row in §6.6). The bug class disappears.
+
+**Reasoning — deployment-mode branch.** §7.7.1 large cash
+deployment now branches by whether CB2 is signal-active or
+resource-only:
+
+- **Signal-active CB2 (market drawdown):** defensive mode —
+  deploy to SGOV first, then FI only, no Growth purchases. Don't
+  buy Growth at depressed valuations.
+- **Resource-only CB2 (bootstrap or survivor):** target-weight
+  proportional mode (same as CB_INACTIVE / CB1). Market is fine,
+  portfolio is just small; deploy proportionally to build it
+  toward target allocation.
+
+This branch is essential to the bootstrap design case. Without
+it, a Roth conversion landing during a resource-triggered CB2
+would route to SGOV+FI only — leaving Growth at $14K against
+$108K FI, creating a structural FI-overweight that 5/25 could
+not fix (I5 forbids selling FI to fund Growth). The current
+branch makes the proportional deployment in resource-only CB2 the
+mechanism that *clears* the Portfolio-low condition, since it
+restores the core to target weights and (more importantly) raises
+core total above the threshold + 10% recovery buffer.
+
+The branch is evaluated each cycle from the current signal
+value (not from any persisted entry cause), so the mode can
+switch within an episode if conditions evolve: a CB2 entered
+via Portfolio-low that subsequently sees the signal drop below
+-20% switches to defensive mode automatically; if the signal
+later recovers above -20%, mode switches back to proportional.
+
+**Reasoning — rebalancing suspended in all CB2.** Considered
+keeping rebalancing active during resource-only CB2 (since the
+market is fine and drift correction is on-thesis), but suppressing
+rebalancing in *all* CB2 was chosen for two reasons: (1) it keeps
+"CB2 suspends rebalancing" as a uniform rule operators can
+remember; (2) the bootstrap drift case is bounded (one year max,
+until Roth conversion arrives) and the post-deployment rebalance
+fires cleanly when CB2 exits. The operator-error case (manually
+pouring $100K of fresh FI into the bucket while CB2 is active)
+remains pathological under I5 — but that is an operator-discipline
+issue rather than a safety failure, and the same I5 problem exists
+under any model.
+
+**Reasoning — eliminated state machines.** Three named state
+machines disappear: the FI-low guard, the Portfolio-low guard, and
+the implicit guard-composition logic that combined their effects
+at decision points. The §6.6 operating-mode tuple shrinks from
+6-element to 3-element `(phase, income_state, cb_state)`. The
+guards-orthogonal-to-CB concept disappears entirely. Net
+simplification per the operator's stated goal of "brutally
+simplify IRAPM mechanics without losing function."
+
+**Spec sections rewritten (v1.6 changelog enumerates all 24
+sub-items):** §3.10 (CB states), §6.3 (full subsection rewrite
+into §6.3.1-§6.3.6), §6.4 (reduced to redirect), §6.5 (cycle
+evaluation order step 7 removed), §6.6 (tuple + behavioral
+table), §6.7 (state persistence including `cb2_entry_conditions`),
+§7.3.2 (withdrawal sourcing), §7.4 / §7.4.1 (refill block +
+recovery delay), §7.5 / §7.5.1 (rebalancing CB-state precondition),
+§7.7.1 (deployment-mode branch), §7.8 D11 (scoped to proportional
+mode), §3.14 I10 (restated for any-CB2-condition), §2.3.1
+(parameters: 5 new, "Low-resource alerts" subsection removed),
+§2.4 (modules), §2.9 (documented bootstrap regime), §12.6 (alert
+catalog: guard alerts removed, cb_transition trigger_reason
+documented), §9 (alert snapshot), §10 (Phase 3 latch), §13.3
+(integration scenarios), §13.5 (invariant list), §16 (glossary).
+§4.6 and §6.9 resolved-questions sections deleted entirely
+(content either captured in current-state rules or stale per the
+no-historical-residue rule). Bonus: three historical-residue
+paragraphs stripped during the sweep (Channels column rationale,
+Pre-transition validation T-7 explainer, operational_pause v1.3-era
+reference).
+
+**Parameters added (5):**
+
+- `portfolio_low_threshold_dollars: 50000` — replaces
+  `portfolio_low_alert_floor_dollars`.
+- `portfolio_low_threshold_months: 18` — replaces
+  `portfolio_low_alert_floor_months`.
+- `portfolio_low_recovery_buffer_rate: 0.10` — new (the 10%
+  recovery hysteresis).
+- `fi_low_threshold_months: 6` — replaces
+  `fi_low_alert_threshold_months`.
+- `fi_low_recovery_buffer_rate: 0.10` — new (the 10% recovery
+  hysteresis).
+
+The `confirmation_window_weeks: 2` parameter is added to the
+Circuit breakers section of §2.3.1 to centralize the confirmation
+window value that applies to all CB entry/exit paths.
+
+**Parameters removed (3):** `portfolio_low_alert_floor_dollars`,
+`portfolio_low_alert_floor_months`, `fi_low_alert_threshold_months`
+(replaced as above).
+
+**Persistent state added (1 field):** `cb2_entry_conditions` —
+subset of `{signal, portfolio_low, fi_low}`. Per-condition
+pending-confirmation counters are also tracked but live within
+the existing CB-machine state structure.
+
+**Alert changes:** `guard_activation` and `guard_deactivation`
+removed from §12.6 alert catalog. The existing `cb_transition`
+alert body carries a `trigger_reason` field with one of
+`{signal, portfolio_low, fi_low, cb1_timer}` for CB2 entries and
+a list of cleared conditions for CB2 exits.
+
+**Plan invariant updates.** D11 (previously: LargeCashDeployment
+plan entry contains only BUY orders proportional to target
+weights) is scoped to the `target_weight_proportional` mode in
+v1.6, since the `defensive` mode has a different plan shape
+(SGOV-first then FI-only). D12 (no Plan generated during Phase 3
+latched-but-pending window) is unchanged.
+
+**§6.3.6 — Phase 3 latched-but-pending interaction.** Resource
+conditions depend on `current_monthly_withdrawal`, which is
+undefined in the latched-but-pending window (per I15). Resource-
+based CB2 evaluation suppresses in this window; signal-based CB2
+continues to evaluate normally. Resource-based evaluation begins
+on the cycle after the Phase 3 transition cycle initializes
+`schedule_state.phase3`. If the survivor inherits a small
+portfolio, Portfolio-low triggers on that cycle and CB2 entry
+fires after 2-week confirmation. The first month's withdrawal may
+execute under CB_INACTIVE sourcing if it falls in the
+pre-confirmation window; this is bounded by the cash buffer (one
+month) and SGOV buffer (24 months).
+
+**Implementation in v1.6 spec.** All sections listed above, plus
+v1.6 changelog entry at the top of the document. Spec file size
+grew from ~322KB to ~328KB (net +95 lines, 527 added / 432
+removed). Code changes pending: ruleset.yaml parameter renames
+(D-RY-12's three parameter names need superseding with the five
+new ones above), state_model.py adds `cb2_entry_conditions` field,
+plan-generation code adds the deployment-mode branch in
+LargeCashDeployment, and `cb_transition` alert body construction
+adds the `trigger_reason` field. The §13.3 integration tests
+specify four new CB2-path scenarios to validate the implementation.
