@@ -1506,3 +1506,97 @@ plan-generation code adds the deployment-mode branch in
 LargeCashDeployment, and `cb_transition` alert body construction
 adds the `trigger_reason` field. The §13.3 integration tests
 specify four new CB2-path scenarios to validate the implementation.
+
+
+### D-SPEC-7: Spec hygiene pass — Resolved-Questions purge and embedded changelog extraction (v1.7)
+
+**Context.** Two patterns of historical residue had accumulated in
+the v1.6 spec body and were violating the operator's stated rule
+that the spec holds only current truth:
+
+1. **"Resolved Questions" subsections.** Eight `### N.M Resolved
+   questions` subsections (§7.10, §8.5, §9.7, §10.10, §11.5,
+   §12.7, §13.8, §15.13) accumulated as design-discussion residue
+   from earlier revisions. A scan during the Simplify Quest
+   continuation (Candidate 3 in `SIMPLIFY_QUEST_CANDIDATES.md`)
+   classified all 34 entries across the eight sections. Every
+   entry was either:
+   - a restatement of a normative rule already stated elsewhere
+     in the spec body,
+   - a pure pointer ("see §X"), or
+   - a "See DECISIONS.md D-...-N" reference whose substance was
+     already captured.
+
+   None represented substantive design rationale not captured
+   elsewhere. The 146 lines were pure historical residue.
+
+2. **Embedded version changelog.** Lines 9–195 of the v1.6 spec
+   were six dense version-change blocks (v1.1 → v1.6). The
+   spec's own Owner Preamble at line 200 stated: *"there will be
+   a single changelog for IRAPM"*. The embedded changelog
+   violated this rule; the Owner Preamble was written against
+   modules but the spec is itself a module. The version-change
+   blocks were also redundant with DECISIONS.md: every v1.5+
+   change was captured by an existing D-BROKER-N or D-SPEC-N
+   entry.
+
+**Decision.** Two paired actions, landed together as v1.7:
+
+1. **Delete all eight Resolved Questions subsections.** No
+   migration to DECISIONS.md needed for any entry; each was
+   verified to be a (c)-bucket "trivia/working-out/pointer" entry
+   per the v1.7 classification pass. 131 lines removed from the
+   spec body.
+
+2. **Extract the embedded changelog to `CHANGELOG.md`.** New
+   top-level file in the repo. The v1.1 through v1.6 entries
+   were preserved verbatim (minor formatting normalization);
+   a v1.7 entry was added describing this cleanup pass.
+   ~180 lines removed from the spec header. Spec header
+   collapsed to: Version, Status, pointers to `CHANGELOG.md`
+   and `DECISIONS.md`, single-source-of-truth claim, Owner
+   Preamble (preserved — it's normative coding guidance).
+
+**Net effect.** Spec dropped from 6998 → 6687 lines, a 4.4%
+reduction. No design changes; pure consolidation and residue
+removal.
+
+**Reasoning.**
+
+The operator's stated principle is *"if it's not useful at
+coding time, it goes"*. Applied to the Resolved Questions
+sections: an entry like "**Dry-run mode:** mandatory; specified
+in §13.7" tells a coder nothing they don't get from reading §13.7
+itself (which is titled "Dry-run cycle mode (mandatory)" — the
+pointer adds zero information). Applied to the embedded
+changelog: "what changed between v1.4 and v1.5" is irrelevant to
+writing v1.6 code; the coder needs the *current* rule, not the
+edit history that produced it. DECISIONS.md captures the *why*
+of significant changes; CHANGELOG.md now captures the *what*.
+
+The Owner Preamble was preserved in-spec because it is normative
+coding guidance — actionable rules a coder applies while writing
+code — not history. Owner Preamble explicitly itself states the
+single-changelog principle, so honoring that principle is also a
+v1.7 deliverable.
+
+**Bonus finds during the pass (deferred to Candidate 2).** While
+classifying §11.5, two stale `withdrawal_capacity_exhausted =
+"permanent halt"` references were surfaced in the spec body that
+contradict D-SPEC-5 (which clarified this halt as indefinite with
+a single auto-clear path, not strictly permanent):
+
+- Line 2326 in v1.6 (§6.7 state schema description block).
+- Line 4972 in v1.6 (§11.1 severity model).
+
+A third contradictory reference at line 5383 (in the §11.5
+Resolved Questions entry being deleted) was removed by the v1.7
+purge itself. The remaining two will be fixed as part of
+Candidate 2 (§11.3 catalog cleanup), which is the next
+simplify-quest task.
+
+**Implementation in v1.7 spec.** Spec header replaced (lines
+1–212 of v1.6 → lines 1–33 of v1.7). Eight Resolved Questions
+subsections deleted (each as a header-through-pre-separator
+block, preserving the major-section `---` separator that
+followed). New `CHANGELOG.md` file created. No code changes.

@@ -2,214 +2,34 @@
 
 ## Specification
 
-**Version:** 1.6 (low-resource guards collapsed into CB2 entry paths: three independent CB2 entry conditions, signal vs resource-only deployment-mode branch, eliminated independent guard state machines)
-**Status:** Implementation-ready pending ruleset.yaml drafting, operational runbook, paper-trading verification of the §15.12 uncertainty-flagged items, and re-validation per §14.7
-**Supersedes:** v1.5 (broker layer formalized: protocol abstraction, per-cycle connection lifecycle, idempotency model, master/slave coordination via IBKR-as-arbiter, ACH conservative-failure design, invariant I16 captured decision_clock), v1.4 (consistency sweep — I10 portfolio_low_alert cascade-routing clarification, withdrawal_capacity_exhausted single-auto-clear semantics, ruleset.yaml §11 corrected to match I10), v1.3, v1.2, v1.1, v1.0 (consolidated drafts); IPM v1 (retired due to accumulated bug load and lost trust in the codebase); SPECIFICATION1.md through SPECIFICATION6.md (incremental drafts); PHASE_3_DESIGN.md (formerly authoritative for Phase 3 intent and math; concepts imported into v1.1, math imported into v1.2; **now deprecated**)
+**Version:** 1.7
+**Status:** Implementation-ready pending ruleset.yaml drafting, operational
+runbook, paper-trading verification of the §15.12 uncertainty-flagged items,
+and re-validation per §14.7.
 
-**v1.6 changes:** Consolidated FI-low and Portfolio-low independent
-guard state machines into CB2 entry conditions. (1) §3.10 rewritten:
-CB2 now has three independent entry paths (signal,
-Portfolio-low, FI-low), each with 2-week confirmation; the
-"independent guard states orthogonal to CB machine" concept is
-removed. CB1 remains signal-based only (resource conditions bypass
-CB1 and trigger CB2 directly, since they want SGOV cascade rather
-than FI-sourcing). (2) §6.3 fully rewritten into six subsections:
-entry conditions (§6.3.1), CB1↔CB_INACTIVE transitions (§6.3.2),
-CB2 exit conditions with per-path 10% resource recovery buffer and
-ALL-conditions-clear semantics (§6.3.3), `cb2_entry_conditions`
-persisted set tracking conditions active during the episode
-(§6.3.4), CB1→CB2 timer mechanics with `signal` added to the entry
-set on timer fire (§6.3.5), resource-condition suppression during
-the Phase 3 latched-but-pending window (§6.3.6). (3) §6.4 reduced
-to a 12-line redirect — guards no longer exist as independent
-states. (4) §6.5 cycle evaluation order: step 7 (Guards) removed;
-remaining steps renumbered; annual-review-day ordering note
-restated for CB2 resource evaluation. (5) §6.6 operating-mode
-tuple simplified from 6-tuple to 3-tuple `(phase, income_state,
-cb_state)`; behavioral-effects table compressed with CB2 split
-into "signal active" and "resource only" rows reflecting the
-deployment-mode branch. (6) §6.7 state persistence: `Guards` field
-removed; `cb2_entry_conditions` added; per-condition
-pending-confirmation counters specified for each of the four
-entry/exit paths; CB transition log's `trigger_reason` field
-documented as `{signal, portfolio_low, fi_low, cb1_timer}` for
-entries and cleared-conditions list for exits; resource condition
-*currently-holding* status noted as recomputed each cycle, only
-counters and the cb2_entry_conditions set persist. (7) §6.8 alert
-trigger list narrowed from "(Phase, Income, CB, guard)" to
-"(Phase, Income, CB)". (8) §6.9 and §4.6 resolved-questions
-sections deleted (content either captured in current-state rules
-or stale). (9) §7.3.2 withdrawal sourcing: "(CB2, or
-Portfolio-low alert)" collapsed to "(CB2)"; consistency-violation
-branch messages updated to reference CB2 entry paths. (10) §7.4
-SGOV refill block condition simplified to "CB state is not CB2";
-§7.4.1 recovery delay trigger simplified to "after CB2 exits".
-(11) §7.5 / §7.5.1 explicit CB-state precondition added: 5/25
-rebalancing suppressed during CB1 or CB2 (regardless of CB2 entry
-path); §7.5.2.b skip conditions cleaned of guard references.
-(12) §7.7.1 large cash deployment: two deployment modes
-(`target_weight_proportional` default; `defensive` when CB2 signal
-condition currently holds) with mode-selection table by phase, CB
-state, and signal condition. This resolves the bootstrap-Roth case
-without violating I5 (FI-sacrosanct): proportional deployment in
-resource-only CB2 clears the Portfolio-low condition without
-requiring rebalance trades that would sell FI to fund Growth. (13)
-§7.8 D11 scoped to proportional mode (defensive mode has different
-plan shape). (14) §3.14 I10 restated: refill suspended whenever
-any CB2 condition is active. (15) §2.3 parameter list and §2.3.1
-Circuit breakers table updated: new params
-`portfolio_low_threshold_dollars`, `portfolio_low_threshold_months`,
-`portfolio_low_recovery_buffer_rate`, `fi_low_threshold_months`,
-`fi_low_recovery_buffer_rate`, `confirmation_window_weeks`; old
-"Low-resource alerts" param subsection removed. (16) §2.4 modules
-list: FI-low and Portfolio-low guard modules removed. (17) §2.9
-bootstrap consideration text replaced with the documented 5-step
-bootstrap regime (manual $72K SGOV pre-fund + $28K split across
-core → CB2 fires Day 1 via Portfolio-low → SGOV drains through
-Year 1 → Year-2 Roth conversion clears CB2 via proportional
-deployment → SGOV refill resumes after 60-day delay). (18) §12.6
-alert catalog: `guard_activation` and `guard_deactivation` removed;
-`cb_transition` alert body documented as carrying `trigger_reason`
-field. (19) §9 alert message snapshot updated to include CB2 entry
-conditions when CB2 active. (20) §4 sweep: "regardless of cascade
-or guard state" → "regardless of CB state" in three places (§4.2,
-§4.3, §10); Phase 3 inherits list corrected (90-day timer trigger;
-previously contradicted itself with "(60 days)" parenthetical);
-Phase 3 ceiling rationale updated to reference Portfolio-low CB2
-entry path; §4.1 PHASE_3_DESIGN.md "Reference note" deleted;
-§4.1.2 prior-three-rate-scheme paragraph and §4.3 T-7-days
-paragraph stripped of historical residue. (21) §13.3 integration
-test scenarios: four new CB2-path scenarios added
-(bootstrap-Portfolio-low, FI-low-only, overlapping conditions,
-deployment-mode switching). (22) §13.5 invariant assertions list
-includes D11 and D12 (previously missing). (23) §16 glossary:
-Guard, FI-low alert, Portfolio-low alert entries removed; CB, CB1,
-CB2, Cascade, CB1→CB2 timer entries revised; Portfolio-low and
-FI-low entries added; Operating-mode tuple entry corrected from
-6-element to 3-element; CB_INACTIVE "renamed from CB0" historical
-note stripped; operational_pause "Replaces the v1.3-era" note
-stripped; Pre-transition validation "Earlier drafts called this
-T-7" note stripped. (24) §12 alert section "earlier drafts
-distinguished Email vs Both" historical residue stripped. Net
-effect: eliminated 3 named state machines (FI-low guard,
-Portfolio-low guard, and the implicit guard-composition logic) and
-the guard/CB orthogonality concept; cascade routing is now
-exclusively a CB2 behavior; the bootstrap-Roth design case is
-documented and works cleanly with target-weight-proportional
-deployment in resource-only CB2.
+**Version history:** See `CHANGELOG.md`.
+**Design rationale:** See `DECISIONS.md`.
 
-**v1.5 changes:** Broker layer formalized. (1) New top-level §15
-specifies the Broker Protocol (14 methods, 5 groups), per-cycle
-connection lifecycle, typed exception model
-(BrokerNotReady/BrokerUnreachable/BrokerRejection/BrokerInconsistency),
-idempotency model (cycle_uuid + decision_clock + client_order_id
-deterministic format + pre-place orderRef lookup with 48h window +
-post-placement confirmation), master/slave coordination via
-IBKR-as-arbiter (defense layer 3 to the §9.4 state-file mechanism),
-ContractRef opaque identifier, box.yaml schema, TWS/Gateway
-deployment requirements, ACH conservative-failure design,
-cycle_attempt.json file format, the five uncertainty flags requiring
-paper-trading verification, and resolved-questions discussion of
-the design choices. (2) New invariant I16 (captured decision_clock
-within a cycle attempt) ensuring Plan determinism across restarts.
-(3) §6.7 updated: `cycle_attempt.json` added as per-box,
-not-replicated persistence file; `last_cycle_clientid` field added
-to master/slave coordination state for split-brain detection. (4)
-§9.1 slimmed to operator-deployment concerns (account model,
-authentication, credential storage) with §15 as the pointer for
-the broker-interface contract details; old §9.1.4 failure-modes
-table retired (superseded by §11.2 broker subsections). (5) §11.2
-extended: §11.2.1 updated to reference typed broker exceptions;
-§11.2.11 reworked into two-layer coverage (Layer A state-file
-tiebreak via §9.4.3, Layer B broker-level via §15.6); §11.2.14
-added (Broker inconsistency, NOT auto-resume); §11.2.15 added
-(External account activity overlap, operator-acknowledgment
-required). (6) §13.5 invariants list updated to include I15 and
-I16. (7) §14.4 runbook scope expanded: TWS/Gateway settings
-checklist, box.yaml configuration documentation, paper-trading
-verification of the §15.12 uncertainty flags, operator pause-
-clearing procedures for the three NOT-auto-resume pause reasons,
-broker library maintenance procedure. (8) Spec body's existing
-"v1.4" references (§4 deferred Phase 3 transition behavior; §12
-alert channel unification) preserved — those changes were made in
-v1.4 but the header was not bumped at the time; the v1.5 header
-bump catches both increments.
-
-**v1.4 changes (incidentally captured — header bump deferred from
-v1.4 to v1.5):** I10 portfolio_low_alert cascade-routing scope
-clarification (the alert routes withdrawals through cascade in
-addition to the prior buffer-refill suspension and rebalance
-suspension behaviors); withdrawal_capacity_exhausted indefinite
-halt with single auto-clear on cash-replenish semantics formalized;
-ruleset.yaml §11 substantively corrected to match I10 (the prior
-language asserted "no cascade routing is triggered by these alerts"
-which contradicted I10). DECISIONS.md D-RY-12 amended and D-SPEC-5
-added. The clock.py, state_model.py, ruleset_model.py, and
-ruleset.yaml files swept for residual historical-narrative comments
-during the same pass.
-
-**v1.3 changes:** Eight fixes from external copyedit review.
-(1) §4.1.1.6 regime taxonomy rewritten to partition by the binding
-clamp bound rather than by AND-conditions, closing a gap where
-`sub_floor < I_sustainable < floor_T` fell through all four regimes.
-(2) §10.5, §10.6.2 token-state validity model formalized: only
-specific valid configurations are operative; invalid intermediate
-states hold previous state and alert without aborting the grace
-window. (3) §4.3 step 1 T-7 validation reworded to "last weekly
-cycle 5+ trading days before transition" (the original T-7 was
-unreachable by the weekly schedule). (4) §7.5.2 adds semi-annual
-(Jan 15 / Jul 15) steady-state reallocation to 45/45/10 during
-Phase 2, addressing GBIL dilution from dividend flow. (5) §6.5.1
-and §9.6 "subsume" vocabulary clarified to mean scope-inclusion,
-not runtime cancellation. (6) §4.1.1.7 explicit precision rule for
-the per-month payment ceiling: intermediates full-precision, final
-payment cent-rounded. (7) §9.4.2 staleness threshold converted from
-days to hours throughout the coordination subsystem; grace window
-start point explicitly anchored to SLAVE_PROMOTION_PENDING entry.
-(8) Glossary, §2.3, §3.8, §4.3 ancillary updates supporting the
-above.
-
-**v1.2 changes:** Sustainable-withdrawal math imported from
-PHASE_3_DESIGN.md §5.1–§5.2 into IRAPM §4.1.1 (constants, bracket
-indexing, closed-form `I_sustainable`, sub-floor protection, `I_0`
-clamping, regime classification, per-month payment ceiling,
-implementation order). IRAPM is now self-contained for Phase 3
-implementation. PHASE_3_DESIGN.md is **deprecated**; remaining
-references to it in this document are historical-context-only
-(parameter-divergence notes, prior-validation references).
-Re-validation requirement at the new IRAPM parameter set
-(`INFLATION_PRE = 3.5%`, brackets-continue-growing) added as §14.7.
-
-**v1.1 changes:** PHASE_3_DESIGN.md cross-check imports — corrected token semantics inversion (Phase 3 tokens normally inserted, STOP INCOME tokens normally removed); added physical security model; added stuck-token alert; named failure-quiet and reversible-where-possible operational principles; named role-swap-not-failback property; replaced shared-state master/slave model with hybrid rsync-replicated state + state-write-as-heartbeat; added ACH manual fallback escalation; added resume-semantics worked example; cross-referenced ratified validation results.
-
-This document is the **single source of truth** for IRAPM. All Phase 3
-intent, financial concepts, and sustainable-withdrawal math previously
-held in `PHASE_3_DESIGN.md` have been imported here. `PHASE_3_DESIGN.md`
-is deprecated and should be moved out of the active document set
-(e.g., renamed `PHASE_3_DESIGN.deprecated.md` or relocated to an
-archive directory) to prevent its accidental treatment as authoritative.
-The validation results recorded in that document remain valid as
-*historical evidence* that the original parameter set (3.0% pre-trigger,
-fixed brackets at trigger) produced 100% survival over the 2005–2025
-sequence; they do **not** validate the IRAPM-current parameter set
-(see §14.7).
+This document is the **single source of truth** for IRAPM.
 
 **Owner Preamble**
+
 Each code module and block shall have a succinct comment prior on module/block
-function and what the variables refer to.  There shall be no Changelogs inside
-the modules, there will be a single changelog for IRAPM and if a change is 
-significant enough for a changelog entry it will go there with a brief statement
- of the change. 
-Furthermore there shall be no references to historical or superceded data in the modules.
-The data and code in the modules shall be treated as current truth with the only exception 
-being lookbacks to IRAPM_SPECIFICATION.MD and DECISIONS.md for clairification while coding.
-The coding philosophy shall be "Clean, Simple, Elegant, Robust" as well as: "Fail-Safe and Self-Heal"
-ruleset.yaml will contain all tunable financial values, there shall be no hard
-coded financial values in the code blocks themselves.
-The only piece of the old IPM that may be reusable is the 'clock.py' as it allows
-graceful regression tests.
-Each code module shall be restricted to one functional area i.e. rebalancer.py 
-handles only rebalancing, circuitbreaker.py handles only circuit breaker functions, etc.
+function and what the variables refer to. There shall be no changelogs inside
+the modules; there will be a single changelog for IRAPM and if a change is
+significant enough for a changelog entry it will go there with a brief
+statement of the change. Furthermore there shall be no references to
+historical or superseded data in the modules. The data and code in the
+modules shall be treated as current truth with the only exception being
+lookbacks to `IRAPM_SPECIFICATION.md` and `DECISIONS.md` for clarification
+while coding. The coding philosophy shall be "Clean, Simple, Elegant,
+Robust" as well as "Fail-Safe and Self-Heal". `ruleset.yaml` will contain
+all tunable financial values, there shall be no hard-coded financial values
+in the code blocks themselves. The only piece of the old IPM that may be
+reusable is `clock.py` as it allows graceful regression tests. Each code
+module shall be restricted to one functional area i.e. `rebalancer.py`
+handles only rebalancing, `circuitbreaker.py` handles only circuit breaker
+functions, etc.
 
 ---
 
@@ -3323,23 +3143,6 @@ IBKR-side issue. The §6.5 cycle evaluation order calls for
 emitting an ACHScheduleUpdate entry whenever Income state
 transitioned this cycle (between step 3 and step 4).
 
-### 7.10 Resolved questions (Decision Logic)
-
-- **Day-of-month for scheduled withdrawal ACH:** operator preference
-  (configured in ruleset).
-- **Withdrawal day on holiday/weekend:** shift to next trading day.
-- **Tie-breaking when two positions equally overweight:** larger
-  position by current $ value (deterministic).
-- **Phase 3 sub_floor protection logic:** four-regime taxonomy and
-  math both in §4.1.1.
-- **Cash buffer refill source when no overweight position:**
-  proportional from largest bucket.
-- **Annual review freeze trigger:** RESOLVED — Jan 15, scoped to
-  CPI freeze decision + buffer/refill recompute + cash recompute,
-  trigger is CB1+ ≥ 30 cumulative days.
-- **Action layer atomicity for partial plan failures:** specified in
-  §8.3.
-
 ---
 
 ## §8. Action Layer
@@ -3680,15 +3483,6 @@ These properties must always hold and become test assertions (§13.5):
 - **A7:** Alert dispatch failure does not fail the cycle.
 - **A8:** ACHScheduleUpdate failures do not fail the cycle; they
   re-attempt on subsequent cycles.
-
-### 8.5 Resolved questions (Action Layer)
-
-- **Order timeout value:** 60s default; market orders only; reasonable
-  for liquid ETFs in the allowlist.
-- **Broker-side ACH amount update conflict behavior:** fail the
-  update, alert (Notice), retry next cycle (§8.2.7).
-- **Fractional share fill reporting:** dollar-denominated fills are
-  authoritative for IRAPM accounting (§8.2.1).
 
 ---
 
@@ -4355,23 +4149,6 @@ buffer refills, phase transitions), no settlement separation is
 needed: IBKR allows unsettled SELL proceeds to fund same-day BUY
 orders within an IRA.
 
-### 9.7 Resolved questions (External Interfaces)
-
-- **Cycle scheduling:** operator preference; default Wed 10:00 ET.
-- **ACH update timing:** ACHScheduleUpdate retries on next cycle if
-  rejected (§8.2.7).
-- **Shared state location:** infrastructure choice; spec requires only
-  atomic read/write capability from both boxes.
-- **Log rotation:** daily, 90-day retention for most logs, indefinite
-  for CB transition + annual review (§9.4.5).
-- **Manual role-swap:** "stop master, wait for slave to wake, restart
-  original master into slave role" mechanic; no special command needed.
-- **Multi-subnet deployment:** out of scope. Both CL260 boxes must
-  be deployed on the same subnet for master/slave coordination
-  (rsync, heartbeat, state sync) to function. Last-octet tiebreak
-  is reliable on same-subnet deployments and is the only supported
-  configuration.
-
 ---
 
 ## §10. Hardware Tokens
@@ -4928,15 +4705,6 @@ specific).
   actually triggering a transition. This is handled via the dry-run
   cycle mode (§13.7).
 
-### 10.10 Resolved questions (Hardware Tokens)
-
-- **Token identification mechanism:** type+presence (file-based
-  detection), not serial-based. Confirmed via §10.1, §10.3.
-- **UNAVAILABLE alert specificity:** generic, since detection failure
-  may prevent type identification.
-- **Replacement of failed tokens:** spare insertion; no system
-  reconfiguration needed.
-
 ---
 
 ## §11. Failure Modes & Recovery
@@ -5375,23 +5143,6 @@ When the system is in `operational_pause.paused == true` state:
   for paused-state re-alerts), since the operator needs persistent
   visibility that the system is not running.
 
-### 11.5 Resolved questions (Failure Modes & Recovery)
-
-- **Auto-resume of operational pause:** most pause conditions
-  auto-resume after `pause_auto_resume_hours` (default 48); the system
-  retries the failed operation against fresh broker state. Only
-  `withdrawal_capacity_exhausted` (cascade exhaustion) is a permanent
-  halt requiring external intervention. Per-condition behavior is
-  specified in the §11.2 catalog and the operational_pause model
-  in §11.3.
-- **Re-alert cadence during pause:** every cycle while paused; not
-  deduplicated. Auto-resume events emit their own alerts
-  (`pause_auto_resumed`, with consecutive-pause-count for context).
-- **Selective blocking:** transient Critical failures alert but do
-  not pause (broker disconnect, signal UNAVAILABLE, ACH update
-  failure); Critical-blocking failures pause with auto-resume per
-  §11.3.
-
 ---
 
 ## §12. Observability
@@ -5684,15 +5435,6 @@ the system evolves. Each addition follows the same pattern — pick
 a stable `alert_id`, add a row to this catalog, edit
 `alert_templates.yaml` to define the message wording.
 
-### 12.7 Resolved questions (Observability)
-
-- **Weekly summary mandatory or optional:** mandatory.
-- **Buffer condition taxonomy:** five-state {idle, draining,
-  delayed, refilling, exhausted} per §12.3.
-- **Off-box log backup:** out of scope (operator infrastructure).
-- **Alert catalog location:** §12.6 (this spec); message templates
-  in sibling `alert_templates.yaml`.
-
 ---
 
 ## §13. Testing Strategy
@@ -5915,14 +5657,6 @@ the flag false to activate live trading.
 - **Configuration change validation:** when changing `ruleset.yaml`,
   run dry-run cycles to verify the new configuration produces
   sensible Plans before going live.
-
-### 13.8 Resolved questions (Testing Strategy)
-
-- **Dry-run mode:** mandatory; specified in §13.7.
-- **Phase 3 regime tests:** math and validation criteria specified
-  in §4.1.1 and §13.6 (self-contained in IRAPM).
-- **Simulator authority:** IPMS is primary correctness authority for
-  strategy; unit tests cover mechanics.
 
 ---
 
@@ -6695,51 +6429,6 @@ covers:
 
 The paper-trading verification procedure (a deployment-prerequisite)
 exercises each of these explicitly before live use.
-
-### 15.13 Resolved questions (Broker Layer)
-
-**Q: Why ib_async rather than ibapi (official IBKR Python API)?**
-
-A: Productivity (ib_async's synchronous façade over async internals
-saves substantial integration code) and active maintenance against
-TWS API evolution. The Protocol abstraction (§15.2) mitigates the
-risk if ib_async maintenance ever lapses — swapping to ibapi is a
-1-2 day project for a competent Python developer rather than a
-rewrite. See DECISIONS.md D-BROKER-1 for the full analysis
-including the widow-survivability framing.
-
-**Q: Why per-cycle reconnection rather than persistent connection?**
-
-A: Eliminates stale-snapshot bugs (the largest historical source
-of TWS integration errors), simplifies error handling (failure
-isolated to one cycle), and IRAPM doesn't benefit from sub-second
-responsiveness. See §15.3 and DECISIONS.md D-BROKER-2.
-
-**Q: Why query IBKR for recent activity on every cycle, not just
-on restart-suspected cycles?**
-
-A: Exercising the code path in the common case ensures it doesn't
-develop rust. Defense layer 3 (§15.6) is the killer split-brain
-defense; making it conditional would create a code path that
-rarely runs and thus rarely gets tested. See DECISIONS.md
-D-BROKER-3.
-
-**Q: Why 48 hours for the idempotency lookback?**
-
-A: Matches the operational_pause auto-resume window (§11.3). A
-cycle that crashed yesterday and is restarting today is still
-within this window; any orders that landed will be found. Beyond
-48h, the cycle is being restarted via different mechanisms (manual
-operator intervention) that don't rely on automatic idempotency.
-
-**Q: Why `client_id = 0` is forbidden.**
-
-A: TWS reserves `client_id = 0` for "master client" mode where
-the client receives event callbacks for orders placed by all
-clients. This sounds useful but creates different runtime behavior
-between the two boxes (only one box can use clientId 0 at a time)
-and makes testing harder. Using `client_id = 11` and `client_id =
-12` keeps the two boxes symmetric.
 
 ---
 
