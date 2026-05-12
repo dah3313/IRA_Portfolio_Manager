@@ -20,9 +20,10 @@
 #   [SPEC]         — value specified in IRAPM spec body; carries spec authority
 #                    but not necessarily IPMS validation
 #   [PROVISIONAL]  — reasonable starting value but should be tuned via IPMS
-#                    simulator before production deployment (per §14.2)
-#   [LEGACY-DRIFT] — value differs from PHASE_3_DESIGN.md legacy parameters;
-#                    requires re-validation per §14.7 before production
+#                    simulator before production deployment (per §14.1)
+#   [LEGACY-DRIFT] — value differs from the parameter set used in the
+#                    historical-sequence validation; requires re-validation
+#                    per §14.6 before production
 #
 # Naming convention:
 #   - Flat keys with subsystem-prefixed names (e.g., `cb1_threshold_rate`)
@@ -42,10 +43,9 @@
 # §0. Global inflation rate
 # -----------------------------------------------------------------------------
 # Single canonical inflation rate used for ALL withdrawal-schedule raises
-# across Phase 1 and Phase 3. Replaces the prior three-rate scheme
-# (phase1_inflation_rate / phase3_inflation_pre / phase3_cpi_post).
-# A separate Phase 3 I_0 calculation uses 4% as a deliberately-conservative
-# input to the one-time sustainability formula — see §6 of this file.
+# across Phase 1 and Phase 3. A separate Phase 3 I_0 calculation uses 4% as
+# a deliberately-conservative input to the one-time sustainability formula —
+# see §6 of this file.
 
 inflation_rate: 0.035                   # [SPEC] §4.1, §4.1.2, §7.6
 
@@ -109,8 +109,8 @@ cb2_recovery_buffer_rate: 0.05          # [VALIDATED] §6.3.2
 # "long grinding drawdown" case — a market that has been moderately
 # depressed for months should be treated like a severe drawdown for cascade
 # routing purposes, even if it never deepens enough to trip the cb2 signal
-# threshold. This replaces the prior CB1-extended derived state with a
-# direct state transition (simpler — one CB state machine path).
+# threshold. The CB state machine has a single path CB_INACTIVE → CB1 →
+# CB2 with two independent triggers for the CB1 → CB2 transition.
 # [PROVISIONAL] — to be tuned via IPMS.
 cb1_to_cb2_timer_days: 90               # [PROVISIONAL] §6.3.3
 
@@ -207,11 +207,8 @@ phase2_reallocation_dates:              # [VALIDATED] §7.5.2.b
 # subject to freeze decisions at annual review, clamped each cycle by a
 # 7.5% withdrawal-rate ceiling.
 #
-# This design replaces the prior bracket-math scheme (§4.1.1 in earlier
-# spec revisions, with floor/ceiling/regime classification). The annuity
-# formula is simpler, has no deferred-design components, and is operator-
-# verified across reasonable portfolio sizes ($500K–$1.5M → I_0 of
-# $1.9K–$5.7K/month).
+# The annuity formula is operator-verified across reasonable portfolio
+# sizes ($500K–$1.5M → I_0 of $1.9K–$5.7K/month).
 
 # I_0 calculation: assumed nominal annual portfolio return. Used ONLY in
 # the one-time I_0 computation at Phase 3 latch. NOT a return target the
@@ -289,12 +286,12 @@ phase2_deployed_target_weights:         # [SPEC] §7.5.2.a
   FBCG: 0.50
   AVUV: 0.50
 
-# Phase 3 target weights. Default 25/25/25/25 per §4.1 spec body and §14.2
+# Phase 3 target weights. Default 25/25/25/25 per §4.1 spec body and §14.1
 # (simulator-tunable). PYLD and JPIE return as active FI positions (they
 # were drawn-to-residual during Phase 2). GBIL has no role in Phase 3 —
 # the Phase 2 → Phase 3 transition fully liquidates GBIL (§7.2.3).
-# [PROVISIONAL] — to be tuned via IPMS per §14.2.
-phase3_target_weights:                  # [PROVISIONAL] §4.1, §14.2
+# [PROVISIONAL] — to be tuned via IPMS per §14.1.
+phase3_target_weights:                  # [PROVISIONAL] §4.1, §14.1
   FBCG: 0.25
   AVUV: 0.25
   PYLD: 0.25
@@ -319,7 +316,7 @@ phase3_target_weights:                  # [PROVISIONAL] §4.1, §14.2
 # matches the spec's "Not a survivor of arbitrarily long bear markets"
 # non-goal (§1.2): the buffer defines the worst-case endurance window.
 # [PROVISIONAL] — validated in IPM v1; should be re-validated via IPMS
-# against severe historical scenarios per §14.2.
+# against severe historical scenarios per §14.1.
 sgov_buffer_target_months: 24           # [PROVISIONAL] §3.6, §7.4
 
 # Post-recovery refill delay: after any cascade-triggering condition clears
@@ -392,24 +389,34 @@ large_cash_deployment_threshold_rate: 0.05       # [PROVISIONAL] §7.7.1
 # -----------------------------------------------------------------------------
 # §11. Low-resource alerts (§6.4)
 # -----------------------------------------------------------------------------
-# Previously two independent guard state machines (FI-depleted,
-# Portfolio-depleted) with cascade-routing side effects, hysteresis, and
-# state persistence. Simplified to two simple alert thresholds: when
-# crossed, a Warning alert fires and re-fires weekly while the condition
-# holds. No cascade routing is triggered by these alerts — the §11.3
-# operational pause framework catches actual depletion via order
-# rejection, and the position_residual_minimum_dollars floors prevent
-# sale-below-residual. These alerts give the operator advance warning
-# before either of those backstops engage.
+# Two stateless threshold alerts. When crossed, a Warning alert fires and
+# re-fires weekly while the condition holds. No persisted state, no
+# hysteresis.
+#
+# fi_low_alert is purely informational — no behavioral effect.
+#
+# portfolio_low_alert's underlying threshold has three behavioral effects
+# per I10, each evaluated independently as a stateless check at the
+# relevant decision point:
+#   (a) SGOV refill suspended (§7.4) — don't drain a depleted portfolio
+#   (b) 5/25 rebalancing suspended (§7.5) — don't churn a depleted portfolio
+#   (c) Withdrawal routing diverts to SGOV-first cascade regardless of
+#       CB state (§7.3.2) — extend runway via the buffer before more
+#       core selling pressure
+#
+# The §11.3 operational pause framework catches actual depletion via
+# order rejection, and the position_residual_minimum_dollars floors
+# prevent sale-below-residual. The alerts give the operator advance
+# warning before either of those backstops engage.
 
 # FI low alert: warns when core FI bucket value falls below this many
-# months of current monthly withdrawal. Same threshold as the prior
-# fi_depleted guard, just an alert now rather than a state change. (§6.4.1)
+# months of current monthly withdrawal. (§6.4.1)
 fi_low_alert_threshold_months: 6                 # [VALIDATED] §6.4.1
 
-# Portfolio low alert: warns when total core (Growth + FI, excluding buffer
+# Portfolio low alert: fires when total core (Growth + FI, excluding buffer
 # and cash) falls below max(floor_dollars, floor_months × monthly_withdrawal).
-# Same thresholds as the prior portfolio_depleted guard. (§6.4.2)
+# Threshold also gates SGOV refill, rebalancing, and withdrawal routing per
+# I10 — see comment block above. (§6.4.2)
 portfolio_low_alert_floor_dollars: 50000         # [VALIDATED] §6.4.2
 portfolio_low_alert_floor_months: 18             # [VALIDATED] §6.4.2
 
@@ -418,14 +425,16 @@ portfolio_low_alert_floor_months: 18             # [VALIDATED] §6.4.2
 # §12. Annual review (§7.6)
 # -----------------------------------------------------------------------------
 # Once-yearly combined event running on a configured date. Performs:
-#   - Freeze evaluation (Phase 1 and Phase 3 only): if prior-year CB1+
-#     days exceed threshold, the new year's CPI raise is frozen
+#   - Freeze evaluation (Phase 3 only): if prior-year CB1+ days exceed
+#     threshold, the new year's CPI raise is frozen. Phase 1 has no
+#     freeze mechanism.
 #   - Buffer target recompute (Phase 1, Phase 3): scaled to new
 #     current_monthly_withdrawal
 #   - Refill rate recompute (Phase 1, Phase 3): buffer_target / 12
 #   - Cash target recompute (Phase 1, Phase 3): via the offset formula
-# In Phase 2, the annual review cycle runs but performs no recompute
-# work (all targets are constants or frozen-forward; §7.6.3).
+# Runs as the date-gated annual-review step within the weekly cycle. In
+# Phase 2, the annual-review step runs but performs no recompute work
+# (all targets are constants or frozen-forward; §7.6.3).
 
 # Calendar date when the annual review runs. Mid-month date (Jan 15)
 # chosen to avoid overlap with year-end processing or new-year market
@@ -439,7 +448,7 @@ annual_review_date: "01-15"                      # [VALIDATED] §7.6
 # Frozen years are appended to schedule_state.frozen_years and never apply
 # their raise. Phase 3 only — Phase 1 has no freeze mechanism. (§7.6.1)
 # 30 days = roughly 6 weeks of CB activity in the prior year. (§7.6.1)
-# [PROVISIONAL] — to be tuned via IPMS per §14.2.
+# [PROVISIONAL] — to be tuned via IPMS per §14.1.
 freeze_evaluation_threshold_days: 30             # [PROVISIONAL] §7.6.1
 
 
@@ -530,10 +539,9 @@ token_mismatch_critical_cycles: 2                # [SPEC] §10.5
 # -----------------------------------------------------------------------------
 # Two CL260 boxes operate as master + slave. Master writes the operating
 # state file and runs the cycle logic; slave receives state via rsync and
-# can auto-promote if master dies. All coordination timing is in hours
-# for consistency (§9.4.2) — converted from days during v1.3 spec
-# revision after a days-vs-hours mixing caused execution-boundary
-# ambiguity.
+# can auto-promote if master dies. All coordination timing is specified
+# in hours for consistency (§9.4.2) — this avoids days-vs-hours mixing
+# and execution-boundary ambiguity.
 
 # Daily clock times for the coordination sequence (US Eastern time):
 # Master writes heartbeat at heartbeat_time, rsync runs at
@@ -600,7 +608,7 @@ pause_consecutive_escalation_count: 4            # [SPEC] §11.3
 # account setup). The operator configures the destination once via the
 # IBKR Portal; this field records the identifier IRAPM uses when
 # initiating ACH withdrawals. (§2.3, §9.1.5)
-# Update via runbook procedure (§14.4) if the external bank changes.
+# Update via runbook procedure (§14.3) if the external bank changes.
 ach_destination: ""                              # [PROVISIONAL] §2.3, §9.1.5
 
 # Dry-run mode: when true, the system runs full cycles (broker connection,

@@ -373,32 +373,30 @@ class Ruleset(BaseModel):
         )
 
     # =========================================================================
-    # Per-field invariants kept after the #11 trim pass:
+    # Validator philosophy: minimal per-field invariants.
     #
-    # KEPT:
+    # The operator authors ruleset.yaml; misconfigurations slip past
+    # validators rarely, and when they do, they manifest in obvious ways
+    # within one cycle (visibly-wrong math, no-op behavior) and the §11.3
+    # operational pause framework catches the resulting failures at the
+    # broker boundary. Defense in depth: type-level (Field(gt=0) on int
+    # durations), parse_decimal (float-artifact defense for Decimal
+    # fields), extra="forbid" (typo defense), and the §13.5 invariant
+    # test suite at deployment time.
+    #
+    # Per-field invariants present in this class:
     #   - extra="forbid" (in model_config) — typo defense
     #   - Field(gt=0) on int durations (in declarations) — type-level
     #   - parse_decimal (above) — float-artifact defense for Decimal fields
     #   - ach_destination_non_empty — operator-deployment gotcha
-    #   - Format validators for dates/times/cycle_schedule strings — these
-    #     catch "looks like a string but won't parse" failures at config
-    #     load rather than at first scheduled-event time
+    #   - Format validators for dates/times/cycle_schedule strings — catch
+    #     "looks like a string but won't parse" failures at config load
+    #     rather than at first scheduled-event time
     #   - TargetWeights weights-sum-to-1.0 (in TargetWeights model) —
     #     real arithmetic invariant
     #
-    # DROPPED in #11 (the operator authors this file, won't make these
-    # mistakes; if they slip through, they manifest in obvious ways within
-    # one cycle and the operational pause framework catches them):
-    #   - dollar_amounts_positive (gt=0 not enforceable at field level for
-    #     Decimal; would be caught by parse_decimal returning a usable
-    #     value, and any non-positive dollar produces visibly-wrong math)
-    #   - drawdown_triggers_negative
-    #   - hysteresis_positive
-    #   - fraction_in_unit_interval
-    #   - coverage_in_unit_interval
-    #   - annual_rate_sane / scaling-error guard
-    #   - cb_severity_ordering (CB1 firing before CB2 = obvious misconfig)
-    #   - phase3_bracket_real (bracket math removed in §12 simplification)
+    # The full design rationale for this validator scope lives in
+    # DECISIONS.md (D-CODE-2).
     # =========================================================================
 
     @field_validator("ach_destination")

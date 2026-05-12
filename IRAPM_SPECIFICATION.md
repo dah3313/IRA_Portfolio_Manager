@@ -2,9 +2,59 @@
 
 ## Specification
 
-**Version:** 1.3 (copyedit-review fixes; semi-annual Phase 2 steady-state reallocation; token-state validity model; hours-only coordination timing)
-**Status:** Implementation-ready pending ruleset.yaml drafting, operational runbook, and re-validation per §14.7
-**Supersedes:** v1.2, v1.1, v1.0 (consolidated drafts); IPM v1 (retired due to accumulated bug load and lost trust in the codebase); SPECIFICATION1.md through SPECIFICATION6.md (incremental drafts); PHASE_3_DESIGN.md (formerly authoritative for Phase 3 intent and math; concepts imported into v1.1, math imported into v1.2; **now deprecated**)
+**Version:** 1.5 (broker layer formalized: protocol abstraction, per-cycle connection lifecycle, idempotency model, master/slave coordination via IBKR-as-arbiter, ACH conservative-failure design, invariant I16 captured decision_clock)
+**Status:** Implementation-ready pending ruleset.yaml drafting, operational runbook, paper-trading verification of the §15.12 uncertainty-flagged items, and re-validation per §14.7
+**Supersedes:** v1.4 (consistency sweep — I10 portfolio_low_alert cascade-routing clarification, withdrawal_capacity_exhausted single-auto-clear semantics, ruleset.yaml §11 corrected to match I10), v1.3, v1.2, v1.1, v1.0 (consolidated drafts); IPM v1 (retired due to accumulated bug load and lost trust in the codebase); SPECIFICATION1.md through SPECIFICATION6.md (incremental drafts); PHASE_3_DESIGN.md (formerly authoritative for Phase 3 intent and math; concepts imported into v1.1, math imported into v1.2; **now deprecated**)
+
+**v1.5 changes:** Broker layer formalized. (1) New top-level §15
+specifies the Broker Protocol (14 methods, 5 groups), per-cycle
+connection lifecycle, typed exception model
+(BrokerNotReady/BrokerUnreachable/BrokerRejection/BrokerInconsistency),
+idempotency model (cycle_uuid + decision_clock + client_order_id
+deterministic format + pre-place orderRef lookup with 48h window +
+post-placement confirmation), master/slave coordination via
+IBKR-as-arbiter (defense layer 3 to the §9.4 state-file mechanism),
+ContractRef opaque identifier, box.yaml schema, TWS/Gateway
+deployment requirements, ACH conservative-failure design,
+cycle_attempt.json file format, the five uncertainty flags requiring
+paper-trading verification, and resolved-questions discussion of
+the design choices. (2) New invariant I16 (captured decision_clock
+within a cycle attempt) ensuring Plan determinism across restarts.
+(3) §6.7 updated: `cycle_attempt.json` added as per-box,
+not-replicated persistence file; `last_cycle_clientid` field added
+to master/slave coordination state for split-brain detection. (4)
+§9.1 slimmed to operator-deployment concerns (account model,
+authentication, credential storage) with §15 as the pointer for
+the broker-interface contract details; old §9.1.4 failure-modes
+table retired (superseded by §11.2 broker subsections). (5) §11.2
+extended: §11.2.1 updated to reference typed broker exceptions;
+§11.2.11 reworked into two-layer coverage (Layer A state-file
+tiebreak via §9.4.3, Layer B broker-level via §15.6); §11.2.14
+added (Broker inconsistency, NOT auto-resume); §11.2.15 added
+(External account activity overlap, operator-acknowledgment
+required). (6) §13.5 invariants list updated to include I15 and
+I16. (7) §14.4 runbook scope expanded: TWS/Gateway settings
+checklist, box.yaml configuration documentation, paper-trading
+verification of the §15.12 uncertainty flags, operator pause-
+clearing procedures for the three NOT-auto-resume pause reasons,
+broker library maintenance procedure. (8) Spec body's existing
+"v1.4" references (§4 deferred Phase 3 transition behavior; §12
+alert channel unification) preserved — those changes were made in
+v1.4 but the header was not bumped at the time; the v1.5 header
+bump catches both increments.
+
+**v1.4 changes (incidentally captured — header bump deferred from
+v1.4 to v1.5):** I10 portfolio_low_alert cascade-routing scope
+clarification (the alert routes withdrawals through cascade in
+addition to the prior buffer-refill suspension and rebalance
+suspension behaviors); withdrawal_capacity_exhausted indefinite
+halt with single auto-clear on cash-replenish semantics formalized;
+ruleset.yaml §11 substantively corrected to match I10 (the prior
+language asserted "no cascade routing is triggered by these alerts"
+which contradicted I10). DECISIONS.md D-RY-12 amended and D-SPEC-5
+added. The clock.py, state_model.py, ruleset_model.py, and
+ruleset.yaml files swept for residual historical-narrative comments
+during the same pass.
 
 **v1.3 changes:** Eight fixes from external copyedit review.
 (1) §4.1.1.6 regime taxonomy rewritten to partition by the binding
@@ -82,7 +132,8 @@ handles only rebalancing, circuitbreaker.py handles only circuit breaker functio
 - §12. Observability
 - §13. Testing Strategy
 - §14. Open Questions (incl. §14.7 Phase 3 re-validation requirement)
-- §15. Glossary
+- §15. Broker Layer (incl. §15.5 idempotency model, §15.6 master/slave coordination via IBKR-as-arbiter)
+- §16. Glossary
 
 ---
 
@@ -947,6 +998,19 @@ Properties that must always hold true. Tested in §13.5.
   detect this state and defer all withdrawal/rebalance work to the
   transition cycle. See §7.3 for the withdrawal suppression rule and
   §7.5.1 for the rebalance suppression rule.
+- **I16:** Within a single cycle attempt (uniquely identified by
+  `cycle_uuid`), all decision-affecting time queries return the
+  same captured `decision_clock` value. Restart of an existing
+  cycle_uuid reuses the captured value, NOT current wall-clock time.
+  This invariant ensures that Plan generation (which I8 requires to
+  be deterministic given identical inputs) remains deterministic
+  across cycle restarts: a cycle that began at T+0 and is restarted
+  at T+5 minutes uses the original T+0 decision_clock for all
+  timing-sensitive decisions; the regenerated Plan is identical;
+  and the deterministic `client_order_id`s match those of the
+  original attempt, allowing the broker layer's idempotent
+  rediscovery (§15.5) to find and reuse the prior attempt's orders.
+  Persisted in `cycle_attempt.json` (§6.7, §15.11).
 
 ---
 
@@ -2101,10 +2165,14 @@ replicated to the slave's local disk via the daily rsync per §9.4.2:
   default false). Permanent halt flag for cascade-exhausted state;
   see §11.3.
 - **Master/slave coordination:** `master_box_id`,
-  `last_master_write_timestamp`, `master_ipv4_last_octet` in the
-  local state file (per §9.4.2 and §9.4.3, replicated to peer via
-  rsync); `role` (MASTER / SLAVE_SLEEPING / SLAVE_PROMOTION_PENDING /
-  STARTING) in per-box local-only operational state.
+  `last_master_write_timestamp`, `master_ipv4_last_octet`,
+  `last_cycle_clientid` in the local state file (per §9.4.2,
+  §9.4.3, and §15.6, replicated to peer via rsync); `role`
+  (MASTER / SLAVE_SLEEPING / SLAVE_PROMOTION_PENDING / STARTING)
+  in per-box local-only operational state. `last_cycle_clientid`
+  is the broker `client_id` (e.g., 11 or 12) that the most recent
+  cycle ran with; two distinct values appearing within a 24h
+  window triggers the split-brain detector (§15.6, §11.2).
 - **Token observation file** (per-box, `token_observation.json`,
   separate from the operating state file): each box's most recent
   `(box_id, timestamp, phase3_count, stopincome_count, status)`
@@ -2112,6 +2180,20 @@ replicated to the slave's local disk via the daily rsync per §9.4.2:
   file is replicated to master via dedicated slave→master rsync.
   Distinct from the operating state file precisely because slave
   writes it; the operating state file remains master-write-only.
+- **Cycle attempt file** (per-box, `cycle_attempt.json`, separate
+  from the operating state file): the in-flight cycle's
+  `cycle_uuid`, captured `decision_clock` (invariant I16),
+  cycle_type, started_at, last_updated_at, is_complete flag, and
+  append-only `placed_orders` log. Written multiple times per
+  cycle (each successful broker order placement appends a record
+  and rewrites the file atomically); finalized at cycle end with
+  `is_complete=true`. Master-only; NOT replicated via rsync —
+  cross-box duplicate-order detection is handled by the broker
+  layer's `orderRef` mechanism (§15.5), not by replicating this
+  file. On the next cycle's start, an existing file with
+  `is_complete=false` indicates a restart of a previously-
+  interrupted cycle; the cycle reuses the persisted `cycle_uuid`
+  and `decision_clock`. See §15.11 for the full file format.
 
 **State that does NOT persist** (recomputed each cycle from inputs):
 
@@ -3435,48 +3517,25 @@ failures are handled, and what's deferred to implementation choice.
 
 ### 9.1 Broker interface (IBKR)
 
-#### 9.1.1 Required broker capabilities
+The broker interface itself — the Protocol contract, per-cycle
+connection lifecycle, idempotency design, master/slave coordination
+via IBKR-as-arbiter, exception model, and the ContractRef opaque
+identifier — is specified in §15 (Broker Layer). This section retains
+the operator-deployment concerns that frame how IRAPM's broker
+process is authenticated and credentialed.
 
-IRAPM requires the broker to provide:
+#### 9.1.1 Account model
 
-- **Position queries** — current share counts and last prices for all
-  account positions, including non-allowlisted positions (which IRAPM
-  ignores per I3 but must read to confirm allowlist integrity).
-- **Cash balance query** — current USD cash balance.
-- **Market order submission** — buy and sell orders in dollar amounts
-  (fractional shares).
-- **Order status query** — fill status for a submitted order, including
-  partial fills, executed shares/dollars, and average price.
-- **ACH withdrawal management** — set/update the recurring monthly ACH
-  withdrawal amount; initiate one-off withdrawals if needed.
-- **Connection health query** — confirm broker API is reachable and
-  the account is accessible.
-
-#### 9.1.2 Connection model
-
-IRAPM uses the IBKR Gateway API. Connection model:
-
-- **Persistent gateway connection.** The IBKR Gateway runs as a
-  separate process; IRAPM connects to it via local socket.
-- **Connection check at cycle start.** Step 1 of each cycle (§6.5)
-  includes a connection health check (skipped for daily-token cycles,
-  which have no broker dependency). Failure aborts the cycle.
-- **Reconnection on transient failures.** Within a cycle, if a
-  broker call fails with a connection error, IRAPM attempts one
-  reconnection and retries the call. Persistent failure aborts
-  the cycle.
-- **No background polling.** IRAPM does not poll the broker between
-  cycles; all broker interaction happens within cycle execution.
-
-#### 9.1.3 Authentication
-
-IRAPM uses the dedicated 2nd IBKR access account with 2FA disabled,
+IRAPM uses a **dedicated 2nd IBKR access account** with 2FA disabled,
 per operator design. This account has trading and ACH withdrawal
-permissions but is otherwise isolated from the operator's primary
-brokerage interaction. Credentials are stored in `.env` outside the
-codebase and read at process start.
+permissions, but is otherwise isolated from the operator's primary
+brokerage interaction. The recurring ACH destination is restricted
+to the operator's known external bank, set up one-time via the IBKR
+portal (per §15.10 the system does not initiate ACH destinations).
 
-The 2FA-disabled access is an explicit operational design choice
+#### 9.1.2 Authentication and credential storage
+
+The 2FA-disabled API access is an explicit operational design choice
 to enable unattended operation. The risk is mitigated by:
 - Account isolation from operator's primary brokerage account
 - Trading restricted to the IRAPM allowlist (operator-set IBKR
@@ -3484,20 +3543,21 @@ to enable unattended operation. The risk is mitigated by:
 - ACH destination restricted to the operator's known external bank
 - Hardware-level access control on the CL260 boxes (physically
   secured, see §10.1.1)
+- Box-local config (`box.yaml`, §15.8) holds `expected_account_id`;
+  any drift from this fails connection with `BrokerInconsistency`
+  rather than silently connecting to a wrong account.
 
-#### 9.1.4 Failure modes
+Credentials (IBKR username/password) are stored in `.env` outside
+the codebase and read at process start. Credential rotation is an
+operator responsibility tracked in the runbook (§14.4).
 
-| Failure | IRAPM response | Category |
-|---|---|---|
-| Broker unreachable at cycle start | Abort cycle; alert; retry next scheduled cycle | Transient (auto-recovers) |
-| Broker disconnect mid-cycle | Attempt one reconnect + retry; if still fails, abort cycle, alert | Transient (auto-recovers) |
-| Order submission rejected | Log rejection details; abort cycle; alert. Do not retry within cycle | Critical-blocking |
-| Order fill timeout | Cancel pending order; abort cycle; alert | Critical-blocking |
-| Position query returns inconsistent state | Abort cycle; alert (data integrity issue) | Critical-blocking |
-| ACH update rejected | Log, alert; mark cycle as "partial — ACH not updated"; subsequent cycles will retry | Notice (auto-recovers) |
-| Authentication failure | Refuse to start (at process startup) or abort cycle and alert (mid-run) | Critical-blocking |
+#### 9.1.3 Pointer to §15
 
-See §11 for category semantics (transient vs Critical-blocking).
+For the protocol contract, connection lifecycle, idempotency model,
+typed exceptions, master/slave coordination, and deployment
+requirements, see §15. The behavioral contract that the decision
+and action layers depend on is fully specified there.
+
 
 ### 9.2 Price data interface
 
@@ -4668,15 +4728,23 @@ mechanism; severity is metadata about that dispatch).
 
 #### 11.2.1 Broker connectivity loss
 
-- **Symptom:** Cycle aborts at step 1 (input refresh) with broker
-  connection error.
+- **Symptom:** Broker layer raises `BrokerNotReady` or
+  `BrokerUnreachable` (§15.4) — the TWS/Gateway is unreachable,
+  the API handshake timed out, or a connection that was previously
+  established has dropped. May happen at cycle start (most common)
+  or mid-cycle (less common; the per-cycle connection model in
+  §15.3 means each cycle reconnects fresh).
 - **Severity:** Critical (transient).
 - **System response:** Cycle ends; state file unchanged; alert
-  dispatched.
-- **Recovery:** Next scheduled cycle (typically next day) attempts
-  to reconnect. If the cycle that fails is a monthly-withdrawal
-  cycle, the SELL+ACH for that month may be delayed. Operator should
-  check broker status if the alert persists across multiple cycles.
+  dispatched. No `operational_pause` is set — broker connectivity
+  is transient by nature and the next scheduled cycle will retry.
+- **Recovery:** Next scheduled cycle attempts to reconnect. If the
+  failing cycle was a monthly-withdrawal cycle, the SELL+ACH for
+  that month may be delayed. The operator should check
+  TWS/Gateway status (is the process running? did IBKR push a
+  forced upgrade? does the box have network connectivity?) if
+  the alert persists across multiple cycles. The §14.4 runbook
+  has a diagnostic procedure.
 
 #### 11.2.2 Order rejection (broker)
 
@@ -4828,8 +4896,13 @@ mechanism; severity is metadata about that dispatch).
 
 #### 11.2.11 Master/slave split-brain
 
+Split-brain has two detection layers; they are independent and
+serve different purposes.
+
+**Layer A — State-file split-brain (§9.4.3):**
+
 - **Symptom:** Both boxes detect themselves as master with conflicting
-  recent writes.
+  recent writes to the operating state file.
 - **Severity:** Notice (auto-recovered).
 - **System response:** IP last-octet tiebreak applied (§9.4.3) — this
   runs automatically on detection, no operator action required.
@@ -4837,11 +4910,39 @@ mechanism; severity is metadata about that dispatch).
   partition window are surfaced in the alert content for operator
   awareness.
 - **Recovery:** No operator action required to resume operation.
-  The tiebreak resolves the split-brain automatically. Operator
-  review of the cycle log is *informational* — confirms whether any
-  conflicting trades or duplicate ACHs executed during the partition.
-  This is post-hoc audit, not a recovery action. `operational_pause`
-  is NOT set.
+  The tiebreak resolves the state-file conflict automatically.
+
+**Layer B — Broker-level split-brain (§15.6):**
+
+- **Symptom:** The `last_cycle_clientid` field in the operating state
+  file shows two distinct values within a 24h window — meaning two
+  different boxes' cycles both ran broker work within that span.
+- **Severity:** Critical (operator review required).
+- **System response:** Critical `split_brain_detected` alert
+  dispatched. `operational_pause` is set with
+  `pause_reason: "split_brain_detected"`. **This pause is NOT
+  eligible for auto-resume** — the operator must investigate and
+  clear it manually after confirming no duplicate execution
+  occurred at IBKR.
+- **Recovery:** Operator inspects the cycle log and the IBKR
+  account log to verify no duplicate orders were placed. The
+  broker layer's pre-place lookup (§15.5) almost certainly
+  prevented duplicates at execution time — defense layer 3
+  ensures any second cycle attempting the same client_order_id
+  finds the first's order and aborts via idempotent rediscovery.
+  But the *attempt* warrants investigation: why did both boxes
+  run cycles? Was Layer A's IP-tiebreak slow to fire? Operator
+  resolves the underlying cause (network partition, rsync
+  failure, host misconfiguration) and explicitly clears the
+  pause.
+
+The two layers complement each other: Layer A prevents state-file
+divergence in the steady state; Layer B catches the case where
+Layer A didn't fire fast enough to prevent both boxes from
+contacting the broker. Layer B is post-hoc detection — by the
+time it fires, the broker layer's defense layer 3 (§15.6) has
+already prevented duplicate execution. The alert is the receipt
+that proves the system noticed.
 
 #### 11.2.12 Configuration validation failure
 
@@ -4871,6 +4972,62 @@ mechanism; severity is metadata about that dispatch).
   re-pause; `consecutive_pause_count` increments; at N=4 the
   alert severity escalates via `pause_consecutive_escalation`
   prompting operator attention.
+
+#### 11.2.14 Broker inconsistency
+
+- **Symptom:** Broker layer raises `BrokerInconsistency` (§15.4):
+  IBKR returned data that violates an invariant IRAPM depends on.
+  Concrete cases:
+    - Connected account ID doesn't match `expected_account_id`
+      (§15.8) at connect time — defense against wrong-account
+      connection.
+    - Post-placement confirmation timed out (§15.5): an order was
+      submitted but did not appear in IBKR's open-orders table
+      within `POST_PLACEMENT_CONFIRMATION_WINDOW_SEC` (default 5s).
+      The order's true state is unknown.
+    - Pre-place query failed (§15.5): `get_recent_activity()`
+      raised, leaving the idempotency lookup blind; the cycle
+      refused to place rather than risk duplicate execution.
+    - A returned `Trade` carries data the broker layer can't
+      reconcile (impossible `execId` collision, wrong client_id
+      attribution, malformed numeric values, etc.).
+- **Severity:** Critical (operator review required).
+- **System response:** Cycle aborts. `operational_pause` is set
+  with `pause_reason: "broker_inconsistency"`. **NOT eligible
+  for auto-resume** — operator must investigate and clear the
+  pause.
+- **Recovery:** Operator reviews the cycle log, the IBKR
+  account log, and the alert content. Common root causes
+  include: paper-vs-live TWS port confusion (account mismatch),
+  TWS process restart between connect and place_order, IBKR-side
+  API version change that hasn't been verified against the
+  pinned ib_async version. After resolving the root cause,
+  operator explicitly clears the pause.
+
+#### 11.2.15 External account activity overlap
+
+- **Symptom:** `get_recent_activity()` returns orders with empty
+  `client_order_id` (no `orderRef` stamped by IRAPM) on a symbol
+  IRAPM is about to act on, OR — more rarely — on a symbol where
+  IRAPM has an open order. This is detected at the action layer's
+  pre-place check (§15.6 case 4).
+- **Severity:** Critical (operator acknowledgment required).
+- **System response:** Cycle aborts before placing any orders.
+  `operational_pause` is set with `pause_reason:
+  "external_activity_overlap"`. NOT eligible for auto-resume.
+- **Recovery:** Operator reviews the activity in the IBKR portal
+  to identify what was placed manually and why. If the activity
+  was intentional and the operator wants IRAPM to proceed with
+  the new positions as baseline, the operator explicitly clears
+  the pause; the next cycle re-reads broker state and decides
+  against the post-manual-activity reality. If the activity was
+  unintentional (account compromise, accidental order), operator
+  may need to take separate IBKR-side action before clearing.
+
+  The strict pause-on-overlap behavior protects against scenarios
+  where the operator's manual activity and IRAPM's scheduled
+  cycle would race; forcing operator acknowledgment ensures the
+  human is in the loop before any further automated trading.
 
 ### 11.3 Operational pause (auto-resuming)
 
@@ -5403,7 +5560,7 @@ assertion passes.
 
 The full invariant set:
 
-- Domain: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14
+- Domain: I1, I2, I3, I4, I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I15, I16
 - Decision layer: D1, D2, D3, D4, D5, D6, D7, D8, D9, D10
 - Action layer: A1, A2, A3, A4, A5, A6, A7, A8
 
@@ -5557,8 +5714,25 @@ parameter list distributed across §2.3, §6, §7, §10, §13, and §14.2.
 This specification defines failure modes (§11) but does not provide
 a complete operator runbook. The runbook should cover, at minimum:
 
-- Initial deployment procedure
-- Recovery procedures for each Critical-blocking failure in §11.2
+- Initial deployment procedure, including:
+  - **TWS / IB Gateway settings checklist** (per §15.9): API enabled,
+    "Download open orders on connection" CHECKED, Trusted IP
+    127.0.0.1, Memory Allocation ≥ 4096 MB, Read-only API mode OFF,
+    Auto-restart enabled. Each setting verified visually before
+    first cycle execution.
+  - **box.yaml configuration** (per §15.8): `box_id`, broker
+    `host` / `port` / `client_id` / `expected_account_id`,
+    `state_file` and `cycle_attempt_file` paths. Per-box; the two
+    boxes' `client_id` values must differ (11 for box-A, 12 for
+    box-B) and all other fields must match.
+  - **Paper-trading verification** of the five UNCERTAINTY FLAG
+    items in §15.12 before any live trading: order status mapping
+    for TWS Inactive, `reqCompletedOrders` retention window,
+    `reqMktData` snapshot semantics, account-summary cash tags,
+    and `update_recurring_ach` behavior. Each verification
+    produces a recorded test outcome appended to a deployment-
+    verification log.
+- Recovery procedures for each Critical-blocking failure in §11.2.
 - Manual master/slave role-swap procedure (per §9.4.2, the no-wait
   alternative to letting auto-promotion run)
 - Token replacement procedures
@@ -5568,16 +5742,36 @@ a complete operator runbook. The runbook should cover, at minimum:
 - Backup and restore procedures (state file, logs)
 - Hardware replacement procedures (failed CL260 box, failed token,
   failed pSLC SSD)
-- **Manual IBKR ACH amount update procedure** (per §8.2.7 escalation):
-  step-by-step instructions for logging into the IBKR Portal,
-  navigating to the recurring-withdrawal management page, updating
-  the recurring monthly amount, and verifying the change took
-  effect. ACH update failures do NOT halt the system — IRAPM
-  continues operating at the prior ACH amount until the operator
-  resolves the IBKR-side issue, at which point the system's next
-  ACHScheduleUpdate attempt succeeds naturally. The procedure must
-  be written for the survivor as audience — assume no programming
-  or systems-admin skill, only basic web-browser familiarity.
+- **Manual IBKR ACH amount update procedure** (per §15.10 conservative-
+  failure design): step-by-step instructions for logging into the
+  IBKR Portal, navigating to the recurring-withdrawal management
+  page, updating the recurring monthly amount, and verifying the
+  change took effect. ACH update failures do NOT halt the system —
+  IRAPM continues operating at the prior ACH amount until the
+  operator resolves the IBKR-side issue. The procedure must be
+  written for the survivor as audience — assume no programming or
+  systems-admin skill, only basic web-browser familiarity.
+- **Operator pause-clearing procedures.** Three §11.2 failure modes
+  produce operational pauses NOT eligible for auto-resume and
+  require explicit operator clearance:
+  - `broker_inconsistency` (§11.2.14) — investigation procedure
+    for each of the four concrete causes
+  - `external_activity_overlap` (§11.2.15) — review IBKR account
+    log, confirm the manual activity was intentional, decide
+    whether to proceed with new positions as baseline
+  - `split_brain_detected` (§11.2.11 Layer B) — review cycle logs
+    on both boxes, confirm no duplicate orders at IBKR, resolve
+    the underlying cause (rsync failure, network partition,
+    box misconfiguration) before clearing
+- **Broker library maintenance procedure.** Pinned ib_async version
+  in `requirements.txt`. Quarterly check for library updates;
+  major-version upgrades go through paper-trading verification
+  before deployment. If ib_async maintenance ever lapses (the
+  community-fork risk discussed in DECISIONS.md D-BROKER-1), the
+  Protocol abstraction (§15.2) makes migration to `ibapi` a
+  1-2 day project for a competent Python developer rather than a
+  rewrite. Designated technical contact (identified in deployment
+  records) handles this.
 
 The runbook is operator-facing documentation; this specification is
 system-facing.
@@ -5666,7 +5860,576 @@ production-deployment confidence for Phase 3.
 
 ---
 
-## §15. Glossary
+## §15. Broker Layer
+
+This section specifies the design of the broker layer — the subsystem
+that mediates between IRAPM's decision/action code and the external
+broker (Interactive Brokers). The broker layer is the most safety-
+critical subsystem after the decision layer: a bug here can cause
+duplicate trades, missed withdrawals, or wrong-account execution.
+The design is structured around a strict separation between the
+broker-library specifics (ib_async, IBKR's TWS API) and the IRAPM
+cycle logic.
+
+### 15.1 Design goals
+
+1. **Library independence.** No part of IRAPM's decision or action
+   layer imports or references the broker library (`ib_async`). All
+   broker interaction goes through a Protocol (§15.2) whose types
+   are plain IRAPM-owned dataclasses.
+
+2. **Idempotency under restart.** A cycle that crashes after
+   submitting orders, then restarts, must not double-submit. This
+   property holds regardless of where in the cycle the crash
+   occurred (§15.5).
+
+3. **Split-brain safety.** If both master and slave somehow
+   simultaneously execute cycles (network partition causes false
+   slave promotion), the second cycle must detect the first's
+   orders at IBKR and abort without duplicate execution (§15.6).
+
+4. **Fail loud.** Every recognized failure mode raises a typed
+   exception (§15.4) that maps to a specific operational pause
+   reason (§11.2). The system never silently degrades.
+
+5. **Auditable.** Every order placement is logged with its
+   deterministic `client_order_id` and recorded in two places: the
+   broker (as `orderRef`) and the local `cycle_attempt.json` file.
+   Six months later, the operator can reconstruct what IRAPM did
+   from either source.
+
+### 15.2 The Broker Protocol
+
+The contract between IRAPM's cycle code and any broker implementation
+is the `Broker` Protocol (PEP 544 structural typing). Two concrete
+implementations satisfy it:
+
+- **IBKRBroker** — the production implementation, backed by ib_async
+  talking to a local TWS or IB Gateway process.
+- **SyntheticBroker** — the in-memory implementation used by IPMS
+  and unit tests.
+
+The Protocol has 14 methods organized into five groups:
+
+| Group | Methods |
+|---|---|
+| Connection lifecycle | `connect`, `disconnect`, `is_ready` |
+| State queries | `get_positions`, `get_prices`, `get_account_summary`, `get_recent_activity` |
+| Order placement | `place_order`, `get_order_status`, `cancel_order` |
+| Recurring ACH | `get_recurring_ach`, `update_recurring_ach` |
+| Miscellaneous | `get_managed_account_id`, `get_server_time` |
+
+**Data types crossing the protocol boundary** are plain Pydantic
+models in `broker_types.py`: `Position`, `Price`, `AccountSummary`,
+`OrderResult`, `OrderStatus`, `Fill`, `RecentActivity`,
+`RecurringAchInfo`, `AchUpdateResult`, plus the `ContractRef` opaque
+handle (§15.7) and the OrderSide / OrderType / TimeInForce /
+OrderStatusValue / PriceStatus enums. Every numeric field is
+`Decimal`; float values are rejected at parse time with `TypeError`.
+
+**Why a Protocol rather than an abstract base class.** Protocols
+are duck-typed by Python's type system, so an implementation need
+not inherit from anything — it simply needs to provide the named
+methods with compatible signatures. This keeps the implementations
+loosely coupled and matches how `SyntheticBroker` (in the IPMS
+codebase) and `IBKRBroker` (in IRAPM) can satisfy the same contract
+without sharing a class hierarchy. The `@runtime_checkable`
+decoration enables `isinstance(broker, Broker)` for one-time
+startup verification.
+
+### 15.3 Per-cycle connection lifecycle
+
+IRAPM uses a **per-cycle connection model**: each cycle opens a
+fresh broker connection at the start, performs all cycle work,
+and closes the connection at the end. This is opposed to a
+persistent long-running connection.
+
+```
+For each cycle:
+  1. connect()        — TCP, API handshake, initial snapshots fetched
+  2. ensure_ready     — verify account, verify state-of-readiness
+  3. cycle work       — fetch positions, place orders, etc.
+  4. disconnect()     — even on exception paths (finally block)
+```
+
+**Advantages of per-cycle over persistent:**
+
+- **No stale-snapshot bugs.** Each cycle explicitly waits for the
+  initial position/orders/account snapshot to arrive before reading.
+  Persistent connections introduce a subtle "is the cache fresh
+  enough?" question after every gap between cycles.
+
+- **No background asyncio loop to leak.** ib_async's event loop is
+  spun up at connect, torn down at disconnect. No long-running
+  coroutine memory leaks.
+
+- **Failure is isolated to one cycle.** A cycle that fails to
+  connect aborts cleanly (§11.2.1 broker connectivity loss). The
+  next cycle attempts fresh.
+
+- **Reconciliation is implicit.** Every cycle re-fetches positions,
+  open orders, executions. The system never trusts cached state
+  across cycles. This matches the §6.5 cycle evaluation model and
+  the idempotency design (§15.5).
+
+The minor overhead (a few seconds of handshake per cycle) is
+negligible against IRAPM's weekly schedule.
+
+**Context manager.** The protocol provides `broker_session(broker)`
+as a context manager that enforces the lifecycle. Cycle code always
+goes through this; direct `connect()/disconnect()` calls are
+discouraged because the disconnect-in-finally guarantee is the
+context manager's job.
+
+### 15.4 Typed exception model
+
+The broker layer defines four typed exception classes; raw library
+exceptions never escape:
+
+| Exception | Cause | Action-layer response |
+|---|---|---|
+| `BrokerNotReady` | Method called before `connect()`, or connection lost mid-cycle | Cycle aborts at step 1 (§6.5). §11.2.1 broker_connectivity_loss. Next cycle retries; no operational_pause. |
+| `BrokerUnreachable` | TCP/auth/timeout failure (subtype of `BrokerNotReady`) | Same as above; distinguished for log/alert clarity. |
+| `BrokerRejection` | Broker accepted the request and explicitly refused (e.g., order rejected, insufficient buying power) | Cycle aborts. `operational_pause` set with `pause_reason='order_rejection'`. §11.2.2. 48h auto-resume. |
+| `BrokerInconsistency` | Broker returned data violating an invariant (account mismatch, post-placement timeout, etc.) | Cycle aborts. `operational_pause` set with `pause_reason='broker_inconsistency'`. §11.2.X. **NOT eligible for auto-resume** — operator must review. |
+
+`BrokerInconsistency` is the most consequential category. It signals
+"something is deeply wrong, halt and alert" — distinct from
+`BrokerNotReady` (transient) and `BrokerRejection` (broker is healthy
+but disagrees with us). The default 48h auto-resume does not apply;
+the operator must explicitly clear the pause after investigation.
+
+### 15.5 Idempotency model
+
+Every cycle attempt has a unique identifier (`cycle_uuid`) and a
+captured decision-clock value (`decision_clock`). These are
+persisted in a small per-cycle file (`cycle_attempt.json`, §6.7)
+on the master's local pSLC SSD before any broker interaction.
+
+**Captured decision_clock — invariant I16:**
+
+> Within a single cycle attempt (uniquely identified by `cycle_uuid`),
+> all decision-affecting time queries return the same captured
+> `decision_clock` value. Restart of an existing cycle_uuid reuses
+> the captured value, NOT current wall-clock time.
+
+This invariant ensures that Plan generation (which I8 requires to
+be deterministic given identical inputs) remains deterministic
+across cycle restarts. A cycle that begins at T+0 and is restarted
+at T+5 minutes after a crash uses the original T+0 decision_clock
+for all timing-sensitive decisions; the Plan is identical.
+
+**Client_order_id format:**
+
+```
+cycle-{cycle_uuid}-{plan_entry_index}-{symbol}-{side}
+```
+
+Example: `cycle-550e8400-e29b-41d4-a716-446655440000-0-SGOV-SELL`
+
+The format is deterministic from the cycle's Plan: same input
+state → same cycle_uuid (on restart) and same plan_entry_index
+ordering → same client_order_id.
+
+**Pre-place lookup (the killer feature):**
+
+Before submitting any order, `place_order()` calls the protocol's
+own `get_recent_activity()` and searches for an order with matching
+`orderRef` (the broker-side field where `client_order_id` is
+stamped). The lookup window is 48 hours, matching the operational
+pause auto-resume window. If found, the existing order is returned
+with `idempotent_rediscovery=True`; no new submission occurs.
+
+This single mechanism handles **six failure modes** that would
+otherwise cause duplicate execution:
+
+1. **Cycle crash after `placeOrder` returned but before state write.**
+   The order is at IBKR; cycle_attempt.json doesn't know. Restart
+   computes the same client_order_id, finds the existing order,
+   returns it.
+
+2. **Cycle crash mid-`placeOrder`.** Network blip leaves the
+   order's true state unknown. Restart's pre-place lookup detects
+   it if it landed; doesn't double-submit if it didn't.
+
+3. **Slave promotion after master executed orders.** Newly promoted
+   slave generates a fresh cycle_uuid, sees no matching orderRef
+   in its lookup — but only because the dead master's orderRefs
+   used a different cycle_uuid. If the slave's freshly-generated
+   Plan attempts a similar action, it'll use its own client_order_id;
+   IBKR will see two orders for the same logical action. This is
+   why defense layer 3 (the broader split-brain check, §15.6) is
+   needed in addition to the per-cycle idempotency lookup.
+
+4. **PendingSubmit state across restart.** IBKR has the order
+   queued but not yet routed; restart's lookup includes
+   `reqAllOpenOrders` which returns PendingSubmit orders.
+
+5. **External operator activity.** Operator manually placed an
+   order via TWS portal. The recent_activity query returns it with
+   empty `client_order_id` (no orderRef); the action layer treats
+   this as `external_activity_overlap` (§11.2.X).
+
+6. **Library-level retry.** ib_async retries `placeOrder` on a
+   transient error and submits twice. IBKR sees two orders with
+   the same orderRef; reqAllOpenOrders returns both; our pre-place
+   lookup returns the first one and our submission of the second
+   is suppressed. (This is the F6 case from the threat model.)
+
+**Post-placement confirmation:**
+
+After `placeOrder` returns, the implementation waits up to 5
+seconds for the order to appear in a recognized state
+(PendingSubmit / Submitted / Filled / etc.). If it does not, the
+order's true state is unknown — `BrokerInconsistency` is raised.
+
+If during the 5-second window the order transitions to `Inactive`
+with a `whyHeld` reason, `BrokerRejection` is raised with the
+reason.
+
+**State file recording:**
+
+After every successful `place_order` call, the placed order is
+appended to `cycle_attempt.json`'s `placed_orders` list and the
+file is atomically rewritten (write-temp-fsync-rename). This
+provides a secondary record alongside IBKR's. Forensic
+reconstruction can use either source.
+
+### 15.6 Master/slave coordination via IBKR-as-arbiter
+
+The §9.4.2 master/slave coordination design protects against most
+scenarios where two boxes both believe they are master. Defense
+layer 3 — IBKR as the arbiter — extends this with a broker-layer
+mechanism.
+
+**Each box has a fixed, distinct clientId:**
+
+- Box A: `client_id = 11`
+- Box B: `client_id = 12`
+
+Never `client_id = 0` (TWS reserves this for "master client" mode
+with different semantics). Each box's `client_id` is in box-local
+config (`/etc/irapm/box.yaml`, §15.8), never in the shared ruleset.
+
+**Every cycle queries `get_recent_activity()` before placing
+orders.** The query returns three lists (open orders, recently-
+completed orders, recent fills) and includes orders placed by
+**all clients** on the account, not just this client. This is the
+key property: a peer box's orders are visible.
+
+**Conflict detection:**
+
+Before `place_order()` submits, it searches the recent activity
+for any order whose `orderRef` matches the proposed
+`client_order_id`. The four cases:
+
+1. **No match.** Submit normally. (Common case.)
+
+2. **Match with our own current cycle_uuid.** Idempotent
+   rediscovery (§15.5). Return the existing order.
+
+3. **Match with a different cycle_uuid in the orderRef.** This
+   would mean a prior cycle (possibly from the peer box) placed
+   the same logical action under a different cycle. The plan_entry
+   structure makes this extremely unlikely (the cycle_uuid is in
+   position 1 of the four-tuple), but if it happened, treat as
+   idempotent rediscovery to avoid duplication. Log Critical alert
+   for investigation.
+
+4. **Match with empty `orderRef` (no cycle_-prefix in orderRef).**
+   External operator activity. `pause_reason =
+   'external_activity_overlap'` (§11.2.X).
+
+**Post-cycle split-brain detection:**
+
+The cycle records its `last_cycle_clientid` (the client_id used
+for the cycle) in the operating state file alongside other state.
+If two different `last_cycle_clientid` values appear within a 24h
+window, the alerter raises a Critical `split_brain_detected` alert
+and `operational_pause` is set with `pause_reason =
+'split_brain_detected'`. This is post-hoc detection — the cycle
+itself has completed without harm thanks to the pre-place lookup;
+the alert is the receipt that proves the system noticed.
+
+**What this design deliberately does NOT do:**
+
+- It does not use a network filesystem lock to serialize the boxes.
+  Network filesystems introduce a new failure mode (the lock
+  service) that would expand the failure surface.
+
+- It does not attempt to auto-resolve detected split-brain. Auto-
+  resolution code can be wrong; routing through the human via
+  `operational_pause` and Critical alert is correct.
+
+- It does not depend on `clientId=0` "master client" mode. That
+  mode's semantics (sees all clients' orders in event callbacks)
+  are tempting but create different behavior on the two boxes,
+  which makes testing harder.
+
+### 15.7 ContractRef: opaque contract identifier
+
+IRAPM cycle code refers to instruments by symbol strings ("FBCG",
+"SGOV", etc.). IBKR refers to them by `Contract` objects with
+fields like `conId`, `exchange`, `currency`, `secType`. The
+broker layer maintains a `symbol → ContractRef` cache that
+shields the cycle code from this asymmetry.
+
+`ContractRef` is a Pydantic model with three fields:
+
+- `broker_impl: str` — identifier of the broker implementation that
+  minted this ref (`"IBKRBroker"` or `"SyntheticBroker"`). Used by
+  the cross-broker safety check: passing a ContractRef minted by
+  one broker to a different broker's `place_order()` raises
+  `BrokerInconsistency`.
+
+- `symbol: str` — the IRAPM-canonical symbol.
+
+- `payload: dict[str, Any]` — broker-implementation-specific data.
+  For IBKRBroker: `{"conId": 12345, "exchange": "SMART", "currency":
+  "USD", "secType": "STK", "ib_contract": <ib_async Contract>}`.
+  For SyntheticBroker: typically empty. **The cycle layer never
+  reads `payload`** — it's preserved across round-trips for the
+  broker's own use.
+
+The cache is populated lazily: `get_positions()` and `get_prices()`
+both add entries as they encounter symbols. By the time
+`place_order()` needs a contract, it's almost always cached. The
+cache lives only for the duration of one IBKRBroker instance
+(typically one cycle); fresh on next cycle's reconnect.
+
+### 15.8 Box-local configuration (box.yaml)
+
+Per-box configuration that must not be in the shared `ruleset.yaml`:
+
+```yaml
+# /etc/irapm/box.yaml — example values
+box_id: "box-a"
+broker:
+  host: "127.0.0.1"
+  port: 4001                  # IB Gateway live
+  client_id: 11               # 11 for box-A, 12 for box-B
+  expected_account_id: "U1234567"
+state_file: "/var/lib/irapm/state.json"
+cycle_attempt_file: "/var/lib/irapm/cycle_attempt.json"
+```
+
+The fields are per-box because:
+
+- `client_id` must differ between boxes (§15.6).
+- `host`, `port` are deployment-local and may differ if one box
+  uses TWS while the other uses Gateway (not recommended; same
+  port on both is the design intent).
+- `state_file` and `cycle_attempt_file` paths reflect the local
+  filesystem layout.
+- `expected_account_id` is the same on both boxes (both should
+  connect to the same IBKR account), but it's a deployment-time
+  setting rather than a runtime-tunable, so it lives here rather
+  than in `ruleset.yaml`.
+
+`box.yaml` is read at process start; mismatched values between
+the two boxes (other than `client_id`) are operational errors
+that the runbook procedure catches at deployment time.
+
+### 15.9 TWS / IB Gateway deployment requirements
+
+The IBKRBroker implementation assumes specific TWS/Gateway settings.
+The runbook §14.4 verifies these at deployment; deviation produces
+silent or noisy failure modes.
+
+| Setting | Required value | Why |
+|---|---|---|
+| API enabled | Yes | Without this, no API connection possible. |
+| **"Download open orders on connection"** | **Yes (CHECKED)** | **Critical: the idempotency lookup uses `reqAllOpenOrders`. Without this setting, the snapshot is incomplete and duplicate orders can occur.** |
+| "Allow connections from localhost only" | Yes | We never connect from off-box. |
+| Trusted IP 127.0.0.1 | Added | Required for the connection to be accepted. |
+| Memory Allocation | ≥ 4096 MB | Per ib_async docs; prevents Gateway crashes on bulk data fetches. |
+| Read-only API mode | NO (must be OFF) | We need to place orders. |
+| Auto-restart | Enabled | The CL260 box may reboot for OS patches; TWS/Gateway should restart automatically. |
+
+The runbook procedure walks the operator through verifying each
+setting visually before first cycle execution.
+
+### 15.10 ACH update: conservative-failure design
+
+`update_recurring_ach()` is the most operationally-risky broker
+method because:
+
+- The IBKR API surface for ACH updates has historically been
+  limited and changes with TWS releases.
+- An incorrect update could redirect future monthly transfers to
+  the wrong destination or wrong amount.
+- ib_async does not currently expose a verified API path.
+
+**The conservative design choice:**
+
+Both `get_recurring_ach()` and `update_recurring_ach()` return
+**failure states**:
+
+- `get_recurring_ach()` returns `RecurringAchInfo(is_configured=False)`
+  with a Warning log entry.
+- `update_recurring_ach(amount)` returns `AchUpdateResult(success=False)`
+  with a rejection_reason that the operator must update via the
+  IBKR portal manually.
+
+**The action layer treats success=False as a Warning, not a
+Critical:**
+
+- The system continues operating at the prior ACH amount (IBKR
+  continues the existing recurring transfer untouched).
+- An alert with the new amount is sent so the operator knows what
+  to update.
+- The runbook §14.4 has the manual portal procedure with
+  screenshots, written for the survivor as audience.
+- The cycle does NOT pause; subsequent cycles re-emit the ACH
+  update plan entry, the operator handles it at their convenience.
+
+**When this changes:** Once paper-trading verification establishes
+a working ib_async API path for ACH updates, the implementation
+replaces this conservative-failure behavior with real updates.
+Until then, the conservative-failure design protects against the
+single most consequential silent-failure mode in the system.
+
+### 15.11 cycle_attempt.json file format
+
+A small file on the master's local pSLC SSD, separate from the
+operating state file. Written multiple times per cycle (every
+successful order placement appends a record); finalized at cycle
+end with `is_complete=true`.
+
+```json
+{
+  "cycle_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "decision_clock": "2027-08-11T14:00:00Z",
+  "cycle_type": "weekly",
+  "started_at": "2027-08-11T14:00:00Z",
+  "last_updated_at": "2027-08-11T14:00:15Z",
+  "is_complete": false,
+  "placed_orders": [
+    {
+      "client_order_id": "cycle-550e8400-...-0-SGOV-SELL",
+      "broker_order_id": "4017",
+      "symbol": "SGOV",
+      "side": "SELL",
+      "quantity": "143.250",
+      "order_type": "MKT",
+      "limit_price": null,
+      "submitted_at": "2027-08-11T14:00:12Z",
+      "plan_entry_index": 0,
+      "idempotent_rediscovery": false
+    }
+  ],
+  "box_id": "box-a",
+  "client_id": 11
+}
+```
+
+**Lifecycle states:**
+
+- **Fresh:** No `cycle_attempt.json` exists, or the existing file
+  has `is_complete=true`. The cycle generates a new `cycle_uuid`
+  and captures `decision_clock` at this moment.
+- **In-flight:** `cycle_attempt.json` exists with
+  `is_complete=false`. This is the "we are running this cycle"
+  state.
+- **Restart:** Cycle starts and finds an in-flight file. The cycle
+  **reuses** `cycle_uuid` and `decision_clock` from the file;
+  this is invariant I16 holding.
+- **Complete:** Cycle finishes; `is_complete` set to true and the
+  file rewritten.
+
+**Per-box; NOT replicated:**
+
+Unlike `state.json` (replicated via rsync per §9.4.2),
+`cycle_attempt.json` is master-only. If the master dies mid-cycle
+and the slave promotes (§9.4.2 grace window), the slave starts a
+fresh CycleAttempt with its own cycle_uuid — it has no visibility
+into the dead master's in-flight cycle.
+
+This is by design: broker-side idempotency (the orderRef + 48h
+lookback) handles cross-box duplicate detection. The local
+`cycle_attempt.json` is for same-box restart only.
+
+### 15.12 Uncertainty flags
+
+Five places in the implementation that need paper-trading
+verification before production trust. Each is marked
+`UNCERTAINTY FLAG` in the code; the deferred-verification list
+covers:
+
+1. **`OrderStatusValue` mapping for TWS `Inactive` status without
+   `whyHeld`.** The implementation conservatively treats this as
+   REJECTED with `reason='UNKNOWN_INACTIVE'`. Verification needs
+   to confirm this is correct across MKT/LMT × cash/margin.
+
+2. **`reqCompletedOrders` retention window.** TWS docs say "today
+   and previous day" but real behavior varies. The 48h idempotency
+   lookback is conservative against this uncertainty; verification
+   confirms the actual window.
+
+3. **`reqMktData` snapshot semantics.** Timeout behavior for
+   symbols with no active subscription and whether `reqMktDataType(3)`
+   (delayed data) is required for the IRA account configuration.
+
+4. **`get_account_summary` cash tags.** The four tags chosen
+   (TotalCashValue, SettledCash, BuyingPower, computed UnsettledCash)
+   need verification that they sum/relate as expected for an IRA
+   cash account.
+
+5. **`update_recurring_ach` API surface.** The most consequential.
+   No verified path exists in ib_async; the conservative-failure
+   design (§15.10) handles this until verification establishes one.
+
+The paper-trading verification procedure (a deployment-prerequisite)
+exercises each of these explicitly before live use.
+
+### 15.13 Resolved questions (Broker Layer)
+
+**Q: Why ib_async rather than ibapi (official IBKR Python API)?**
+
+A: Productivity (ib_async's synchronous façade over async internals
+saves substantial integration code) and active maintenance against
+TWS API evolution. The Protocol abstraction (§15.2) mitigates the
+risk if ib_async maintenance ever lapses — swapping to ibapi is a
+1-2 day project for a competent Python developer rather than a
+rewrite. See DECISIONS.md D-BROKER-1 for the full analysis
+including the widow-survivability framing.
+
+**Q: Why per-cycle reconnection rather than persistent connection?**
+
+A: Eliminates stale-snapshot bugs (the largest historical source
+of TWS integration errors), simplifies error handling (failure
+isolated to one cycle), and IRAPM doesn't benefit from sub-second
+responsiveness. See §15.3 and DECISIONS.md D-BROKER-2.
+
+**Q: Why query IBKR for recent activity on every cycle, not just
+on restart-suspected cycles?**
+
+A: Exercising the code path in the common case ensures it doesn't
+develop rust. Defense layer 3 (§15.6) is the killer split-brain
+defense; making it conditional would create a code path that
+rarely runs and thus rarely gets tested. See DECISIONS.md
+D-BROKER-3.
+
+**Q: Why 48 hours for the idempotency lookback?**
+
+A: Matches the operational_pause auto-resume window (§11.3). A
+cycle that crashed yesterday and is restarting today is still
+within this window; any orders that landed will be found. Beyond
+48h, the cycle is being restarted via different mechanisms (manual
+operator intervention) that don't rely on automatic idempotency.
+
+**Q: Why `client_id = 0` is forbidden.**
+
+A: TWS reserves `client_id = 0` for "master client" mode where
+the client receives event callbacks for orders placed by all
+clients. This sounds useful but creates different runtime behavior
+between the two boxes (only one box can use clientId 0 at a time)
+and makes testing harder. Using `client_id = 11` and `client_id =
+12` keeps the two boxes symmetric.
+
+---
+
+## §16. Glossary
 
 **Action layer.** The subsystem that executes a Plan (§3.12, §8).
 Has no decision authority; only consumes Plans from the decision layer.

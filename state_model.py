@@ -60,8 +60,9 @@ class IncomeState(str, Enum):
 
 
 class CBState(str, Enum):
-    """Three core CB states. CB1-extended is derived (CB1 + timer threshold)
-    and is NOT a separate persisted state."""
+    """Three core CB states. The CB1→CB2 transition has two triggers:
+    signal-based (depth, with confirmation) and timer-based (duration,
+    `cb1_to_cb2_timer_days` of continuous CB1)."""
     CB_INACTIVE = "CB_INACTIVE"
     CB1 = "CB1"
     CB2 = "CB2"
@@ -129,9 +130,10 @@ class CBMachine(BaseModel):
        cb1_to_cb2_timer_days old. Fires immediately when crossed; does
        not use pending_transitions.
 
-    The timer path replaces the prior CB1-extended derived state. There
-    is no longer a separate CB1-extended status — long CB1 spans simply
-    promote to CB2 directly.
+    The CB state machine has a single path CB_INACTIVE → CB1 → CB2 with
+    two independent triggers for the CB1 → CB2 transition. Long CB1
+    spans promote to CB2 directly via the timer trigger; there is no
+    intermediate state.
     """
     model_config = ConfigDict(extra="forbid")
 

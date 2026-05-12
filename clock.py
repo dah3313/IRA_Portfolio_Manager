@@ -3,21 +3,11 @@
 clock.py — Time Source Abstraction
 ============================================================================
 
-VERSION:       1.1.1
-LAST MODIFIED: 2026-04-25
-RULESET:       1.1.0
-
 PURPOSE:
     A single seam through which every module in the system reads "what
     time is it now".  Production uses SystemClock (real wall-clock time);
     backtests, simulations, and tests use FrozenClock or AdvancingClock
     to drive the system on synthetic dates without touching globals.
-
-CHANGELOG:
-    1.1.1 (2026-04-25): Added safe_year_offset() helper for leap-day-safe
-        anniversary arithmetic.  Used by rebalancer.py 1.2.3 to fix the
-        Feb-29 crash in _annual_fallback_due.
-    1.1.0 (2026-04-25): Initial release of the clock seam.
 
 WHY THIS EXISTS:
     Before this module, ~40 sites across the codebase called
@@ -228,13 +218,13 @@ def safe_year_offset(d: date, years: int) -> date:
         safe_year_offset(date(2027, 1, 1), 8)   -> date(2035, 1, 1)
 
     Why this exists:
-        Pre-1.2.3, rebalancer.py:_annual_fallback_due() did
+        Naive year arithmetic like
             anniversary = date(last.year + 1, last.month, last.day)
-        which crashed when last_rebalance_date landed on Feb 29 of a
-        leap year (e.g., 2032-02-29 is a Sunday, so the regular weekly
-        check would record it).  This helper centralizes the fix so
-        every site that does year arithmetic on persisted dates gets
-        the same defensive behavior.
+        crashes when `last` lands on Feb 29 of a leap year (e.g.,
+        2032-02-29 falls on a Sunday, so the regular weekly check
+        would record it).  This helper centralizes the defensive
+        fallback so every site that does year arithmetic on persisted
+        dates gets the same behavior.
     """
     try:
         return date(d.year + years, d.month, d.day)
