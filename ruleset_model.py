@@ -232,9 +232,13 @@ class Ruleset(BaseModel):
     phase3_i0_calc_return_assumption: Decimal
     phase3_i0_calc_inflation_assumption: Decimal
     phase3_i0_calc_horizon_years: int = Field(gt=0)
-    # Per-cycle safety clamp: monthly payment ceiling as fraction of
-    # current portfolio value.
+    # Per-cycle safety clamps: actual_monthly_payment is the MIN of the
+    # schedule, the portfolio-% ceiling, and the indexed dollar ceiling.
+    # Either ceiling binding emits a `monthly_payment_ceiling_bound` Notice
+    # alert identifying which one bound. (§4.1.1.2)
     phase3_monthly_payment_ceiling_rate: Decimal
+    phase3_dollar_ceiling_base_dollars: Decimal
+    phase3_dollar_ceiling_base_year: int = Field(ge=2020, le=2100)
 
     # -------------------------------------------------------------------------
     # §7. Target allocation weights (§3.5, §4.1, §7.2)
@@ -337,6 +341,7 @@ class Ruleset(BaseModel):
         "phase3_i0_calc_return_assumption",
         "phase3_i0_calc_inflation_assumption",
         "phase3_monthly_payment_ceiling_rate",
+        "phase3_dollar_ceiling_base_dollars",
         "cash_buffer_offset_dollars",
         "cash_buffer_tolerance_dollars",
         "large_cash_deployment_threshold_dollars",

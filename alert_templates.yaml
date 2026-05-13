@@ -391,39 +391,55 @@ withdrawal_failed:
   sms: "IRAPM CRITICAL: Monthly withdrawal FAILED at {failed_at_stage}. Auto-retry in 48h. See email."
 
 monthly_payment_ceiling_bound:
-  # PHASE 3 ONLY. Fires when the scheduled monthly withdrawal would exceed
-  # the 7.5% portfolio-value-based ceiling and is clamped down to the
-  # ceiling. Notice severity — informational, not a failure. The ceiling
-  # is a safety clamp against the portfolio being too small to sustain
-  # the scheduled withdrawal at any given moment.
+  # PHASE 3 ONLY. Fires when the actual monthly withdrawal is clamped
+  # below the scheduled amount by one or both of the per-cycle payment
+  # ceilings (§4.1.1.2): the portfolio-% ceiling (7.5%/yr of current
+  # portfolio value) and the indexed dollar ceiling ($4000 base in
+  # 2027 USD, indexed annually at inflation_rate). Notice severity —
+  # informational, not a failure. The ceilings are safety clamps; the
+  # alert just records that one bound.
   # Placeholders: {timestamp}, {scheduled_amount_dollars},
-  #               {ceiling_amount_dollars}, {portfolio_value_dollars},
-  #               {amount_paid_dollars}
-  subject: "IRAPM Notice: Phase 3 withdrawal capped at ceiling — ${amount_paid_dollars}"
+  #               {portfolio_ceiling_amount_dollars},
+  #               {dollar_ceiling_amount_dollars},
+  #               {portfolio_value_dollars}, {current_year},
+  #               {amount_paid_dollars}, {binding_ceiling},
+  #               {ceiling_description}, {cycle_id}
+  # The `binding_ceiling` value is one of: portfolio_percent, dollar, both.
+  # The `ceiling_description` text is built by the dispatch code from the
+  # binding value — single-ceiling cases name only the binding ceiling;
+  # the `both` case names both with their values.
+  subject: "IRAPM Notice: Phase 3 withdrawal capped at {binding_ceiling} ceiling — ${amount_paid_dollars}"
   body: |
-    The Phase 3 monthly withdrawal was capped by the portfolio-value
-    ceiling at {timestamp}.
+    The Phase 3 monthly withdrawal was capped at {timestamp}.
 
     Scheduled withdrawal: ${scheduled_amount_dollars}
-    Ceiling (portfolio × 7.5% ÷ 12): ${ceiling_amount_dollars}
+    Portfolio-% ceiling (portfolio × 7.5% ÷ 12): ${portfolio_ceiling_amount_dollars}
+    Dollar ceiling ({current_year} indexed): ${dollar_ceiling_amount_dollars}
     Current portfolio value: ${portfolio_value_dollars}
-    Amount paid: ${amount_paid_dollars} (= ceiling)
+    Amount paid: ${amount_paid_dollars}
 
-    The ceiling clamp protects the corpus by limiting the monthly
-    payment to 7.5% annualized of current portfolio value. If the
-    portfolio has drawn down, or the scheduled raises have outpaced
-    portfolio growth, the ceiling can bind and reduce the payment.
+    Binding ceiling: {ceiling_description}
+
+    The ceiling clamps protect the corpus from two distinct failure
+    modes. The portfolio-% ceiling (7.5% annualized of current
+    portfolio value) binds when the portfolio shrinks faster than the
+    schedule — drawdown post-latch or compounding raises outstripping
+    the corpus. The dollar ceiling (base $4000/mo in 2027 USD, indexed
+    annually at the canonical inflation rate) binds when the portfolio
+    is large enough that the annuity formula would authorize
+    withdrawals far above plausible living-expense need.
 
     No automatic state change. The ceiling binding does NOT trigger a
     freeze (freezes are decided independently at annual review based on
     prior-year CB activity). The schedule continues unchanged; the next
-    month's calculation runs the same clamp again.
+    month's calculation runs the same clamps again.
 
-    If the ceiling binds repeatedly, the operator/survivor should
-    consider whether the scheduled withdrawal level remains appropriate.
+    If a ceiling binds repeatedly, the operator/survivor should
+    consider whether the scheduled withdrawal level or the ceiling
+    parameters remain appropriate.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM: Ph3 withdrawal capped. Paid ${amount_paid_dollars} (sched ${scheduled_amount_dollars}). See email."
+  sms: "IRAPM: Ph3 withdrawal capped at {binding_ceiling} ceiling. Paid ${amount_paid_dollars} (sched ${scheduled_amount_dollars}). See email."
 
 cascade_growth_source:
   # Fires when cascade sourcing reaches Growth stage (§7.3.2 step 3).

@@ -248,8 +248,10 @@ phase2_reallocation_dates:              # [VALIDATED] §7.5.2.b
 # (§10). At latch, the survivor's starting monthly income I_0 is computed
 # via a 30-year annuity sustainability formula using the parameters below.
 # After latch, the schedule grows at the canonical inflation_rate (3.5%)
-# subject to freeze decisions at annual review, clamped each cycle by a
-# 7.5% withdrawal-rate ceiling.
+# subject to freeze decisions at annual review, clamped each cycle by
+# TWO independent per-month payment ceilings (whichever is tighter binds):
+# a portfolio-% ceiling (7.5%/yr of current portfolio value) and a dollar
+# ceiling (base $4000/mo indexed annually from 2027 at inflation_rate).
 #
 # The annuity formula is operator-verified across reasonable portfolio
 # sizes ($500K–$1.5M → I_0 of $1.9K–$5.7K/month).
@@ -278,15 +280,41 @@ phase3_i0_calc_inflation_assumption: 0.04   # [SPEC] §4.1.1
 phase3_i0_calc_horizon_years: 30         # [SPEC] §4.1.1
 
 # Per-month payment ceiling as fraction of current portfolio value.
-# Every Phase 3 cycle: actual_monthly_payment = min(scheduled, current_portfolio * this_rate / 12).
-# If the ceiling binds, a Notice alert fires; no other state is affected.
-# 7.5% annual ÷ 12 = 0.625% monthly ceiling. Defends against:
-#   - I_0 calibrated against a temporarily-inflated portfolio at latch
+# Every Phase 3 cycle: actual_monthly_payment is clamped at the MIN of
+# the scheduled amount, this portfolio-% ceiling, and the dollar ceiling
+# below. If this ceiling binds, a Notice alert fires identifying it as
+# the binding ceiling; no other state is affected. 7.5% annual ÷ 12 =
+# 0.625% monthly ceiling. This ceiling scales DOWN with the portfolio,
+# so it dominates as the corpus shrinks. Defends against:
 #   - Portfolio drawdown after latch outpacing scheduled raises
 #   - Compounding inflation raises eventually outstripping the corpus
 # This is a safety clamp, not a target — most cycles won't bind.
-phase3_monthly_payment_ceiling_rate: 0.075  # [SPEC] §4.1.1
+phase3_monthly_payment_ceiling_rate: 0.075  # [SPEC] §4.1.1.2
 
+# Per-month payment ceiling as dollar amount, indexed annually from
+# phase3_dollar_ceiling_base_year using the canonical inflation_rate
+# (3.5%). Every Phase 3 cycle, the dollar ceiling for the current year
+# is computed as:
+#   dollar_ceiling = phase3_dollar_ceiling_base_dollars
+#                    × (1 + inflation_rate) ** (current_year - phase3_dollar_ceiling_base_year)
+# and the actual monthly payment is clamped at the MIN of the schedule,
+# the portfolio-% ceiling above, and this dollar ceiling. If the dollar
+# ceiling binds, a Notice alert fires identifying it as the binding
+# ceiling; no other state is affected.
+#
+# Motivating scenario: a high-portfolio Phase 3 latch (~$2M+) where the
+# annuity formula authorizes I_0 far above any plausible living-expense
+# envelope. The portfolio-% ceiling alone would still permit
+# $12,500/month on a $2M portfolio at 7.5%/yr — well beyond what the
+# survivor needs. The dollar ceiling caps the drain rate at a level
+# anchored to actual living expenses rather than portfolio size.
+#
+# The base value ($4000/mo in 2027 USD) and base year are chosen
+# together: $4000 is generous relative to the Phase 1 baseline of
+# $3000/mo, and indexing from 2027 keeps the cap real-value-stable
+# across the Phase 3 horizon (≈$11,200/mo by 2057).
+phase3_dollar_ceiling_base_dollars: 4000    # [SPEC] §4.1.1.2
+phase3_dollar_ceiling_base_year: 2027       # [SPEC] §4.1.1.2
 
 # -----------------------------------------------------------------------------
 # §7. Target allocation weights (§3.5, §4.1, §7.2)

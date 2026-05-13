@@ -1728,3 +1728,116 @@ classification (which §11.2 entry falls in which category, and
 why) is in the spec body §11 rather than duplicated here —
 this entry captures the framework decision; the spec carries
 current truth.
+
+
+### D-SPEC-9: Phase 3 indexed dollar ceiling — protection against high-portfolio flood
+
+**Context.** The §4.1.1 Phase 3 design adopted in D-RY-14 produces
+the survivor's starting income `I_0` via a 30-year annuity formula
+applied to portfolio value at latch. The formula is operator-
+verifiable at reasonable portfolio sizes ($500K → ~$1.9K, $1.5M
+→ ~$5.7K monthly), and a 7.5%-annualized portfolio-percentage
+ceiling clamps the cycle-by-cycle payment as a safety against
+drawdown and inflation-raise drift.
+
+A high-portfolio Phase 3 latch reveals a gap. If the operator
+dies with $2M+ in the portfolio (plausible: late-Phase-1 with
+strong returns, Roth conversions completed, no withdrawals
+during Phase 2), the annuity formula authorizes `I_0` well
+above any plausible living-expense envelope. The 7.5%
+portfolio-% ceiling still permits ~$12,500/month at $2M — far
+beyond what the survivor needs, and at a rate that drains the
+corpus faster than the design intends. The ceiling protected
+against the corpus *shrinking* faster than the schedule; it did
+not protect against the corpus being *drained* faster than need.
+
+**Decision.** Add a second, independent per-cycle payment
+ceiling: a dollar amount, indexed annually from a base year
+using the canonical `inflation_rate`. The effective ceiling is
+the MIN of the schedule, the portfolio-% ceiling, and the
+dollar ceiling — whichever is tighter binds.
+
+Parameters added:
+- `phase3_dollar_ceiling_base_dollars = 4000` (the dollar
+  ceiling in base-year USD)
+- `phase3_dollar_ceiling_base_year = 2027` (the indexing anchor)
+
+Indexing uses the canonical `inflation_rate` (3.5%), shared with
+the scheduled-monthly raise mechanism. Sample values: $4,000 in
+2027, $5,266 in 2035 (Phase 1→2 boundary), $11,210 in 2057 (the
+latest plausible Phase 3 trigger horizon).
+
+**Why MIN-of-both over alternatives.** Three options were
+considered:
+
+- **A — Dollar ceiling only (replace the 7.5%).** Cleanest
+  parameter surface, fewest moving parts. Rejected because the
+  portfolio-% ceiling is doing real work in the small-portfolio
+  drawdown case: as the corpus shrinks, a fixed dollar ceiling
+  becomes structurally too generous relative to remaining
+  capacity. The portfolio-% ceiling scales the cap down with
+  the corpus; the dollar ceiling alone does not.
+
+- **B — MIN of both.** The chosen design. The two ceilings
+  protect against complementary failure modes:
+  - Portfolio-% ceiling binds when the corpus shrinks
+    (post-latch drawdown; long-horizon raises outstripping a
+    slow-growing portfolio). It scales down with capacity.
+  - Dollar ceiling binds at the high-portfolio end where
+    `I_0` would otherwise authorize withdrawals far above need.
+    It is anchored to actual living-expense scale rather than
+    portfolio size.
+  Belt-and-suspenders matches the spec's general fail-safe
+  posture.
+
+- **C — Clamp `I_0` itself at latch using a year-T dollar cap.**
+  Protection visible at activation rather than month-by-month.
+  Rejected because a one-time clamp at latch fails open in the
+  scenario where the portfolio *grows* substantially during
+  Phase 3 (e.g., a survivor latches at $1M, the corpus
+  appreciates to $3M+ over a decade, raises now accelerate
+  faster than living-expense need scales). A per-cycle clamp
+  catches this case; a latch-only clamp does not.
+
+**Why $4000 base, 2027 base year.** The base is set against
+the Phase 1 monthly baseline of $3000/mo (in 2027 USD). $4000
+gives the survivor a meaningful uplift over the operator's
+own pre-death budget — enough to absorb the additional fixed
+costs that fall solely on one person (insurance, taxes that
+were previously joint, healthcare) — but not so much that the
+ceiling becomes vestigial. The 2027 base year matches the
+spec's anchor for Phase 1 dollar amounts (`phase1_trigger_year`,
+`phase1_initial_monthly_dollars`), keeping the dollar-amount
+universe single-anchored.
+
+Indexing at the canonical `inflation_rate` rather than a
+separate Phase-3-specific rate keeps the parameter surface
+minimal and aligns the cap's real-purchasing-power trajectory
+with the schedule's real-purchasing-power trajectory: in a
+world where actual inflation tracks the canonical 3.5%, the
+cap maintains its 2027-real-value envelope across the entire
+Phase 3 horizon.
+
+**Alert semantics.** The existing `monthly_payment_ceiling_bound`
+alert is extended to identify which ceiling bound: portfolio-%,
+dollar, or both (when they coincide within rounding). The
+alert payload needs a `binding_ceiling` field; the alert
+template will need a corresponding placeholder. No new alert
+ID is added — the same Notice continues to fire whenever any
+ceiling clamps the payment.
+
+**Implementation in v1.10 spec.** §4.1.1.2 rewritten to
+describe both ceilings with the MIN rule, including a sample-
+value table for operator intuition. §2.3 examples list updated
+to enumerate both ceiling parameters. §13.6 test suite extended
+with the dollar-ceiling-binding test case and the both-ceilings-
+simultaneous test case. §14.6 (re-validation open question)
+updated to call out the spread of trigger portfolios spanning
+the regimes where each ceiling dominates. Code changes pending:
+`ruleset_model.py` adds the two new fields (with `Field(gt=0)`
+on the dollar amount and a sensible year range); the Phase 3
+cycle code computes the dollar ceiling each cycle from current
+year and clamps via three-way MIN; `alert_templates.yaml`
+`monthly_payment_ceiling_bound` template gains the binding-
+ceiling placeholder. `ruleset.yaml` already has the parameters
+added with full operator-comment rationale.
