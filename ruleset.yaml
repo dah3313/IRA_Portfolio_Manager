@@ -481,20 +481,6 @@ freeze_evaluation_threshold_days: 30             # [PROVISIONAL] §7.6.1
 
 
 # -----------------------------------------------------------------------------
-# §12. Rebalance suppression alerting (§7.5.1)
-# -----------------------------------------------------------------------------
-# When the rebalance plan would violate I5 (FI sacrosanct — selling FI to
-# buy Growth), the rebalance is suppressed for that cycle. If suppression
-# persists for an extended period, alert the operator. The conditions that
-# produce significant FI overweight typically coincide with CB1/CB2
-# territory (Growth depressed), where rebalancing is suspended anyway —
-# this alert mostly catches edge cases where FI grew unusually fast.
-
-# Suppression duration before alert escalation
-fi_overweight_suppression_alert_weeks: 4         # [SPEC] §7.5.1
-
-
-# -----------------------------------------------------------------------------
 # §13. Action layer (§8)
 # -----------------------------------------------------------------------------
 # Operational parameters governing how the action layer interacts with the
@@ -599,27 +585,36 @@ slave_promotion_grace_hours: 48                  # [SPEC] §9.4.2
 # -----------------------------------------------------------------------------
 # §16. Failure recovery (§11.3)
 # -----------------------------------------------------------------------------
-# The operational_pause framework: most blocking failures auto-resume
-# after a configurable window, with consecutive-pause escalation if the
-# underlying issue persists. The single permanent halt is
-# withdrawal_capacity_exhausted (cascade exhaustion) — that one requires
-# external operator action and never auto-resumes.
+# The operational_pause framework holds when a Critical failure makes
+# continuing unsafe. Per D-SPEC-8, pause_reasons are classified into
+# two categories:
+#   - Self-healed weird (auto-resume after pause_auto_resume_hours):
+#     partial_phase_transition, order_rejection, disk_full. Transient
+#     conditions that retry-against-fresh-state resolves.
+#   - Hard broke (no auto-resume; requires external action):
+#     internal_consistency_violation (software bug), broker_inconsistency
+#     (account-ID mismatch or malformed broker data).
+# A separate indefinite halt flag, withdrawal_capacity_exhausted, applies
+# only to withdrawals when the cascade cannot fund demand at residual
+# floors. That flag auto-clears the next withdrawal cycle when cash has
+# returned to the account; see §11.3.2.
 
 # Auto-resume window: time after pause_started_at before the next cycle
-# auto-clears the pause and retries. 48 hours = long enough for in-flight
-# broker orders to reach terminal state, broker-side flags to clear, etc.
-# Short enough that an operator returning from a multi-week trip finds
-# the system has been retrying rather than sitting idle since the
-# failure. (§11.3)
-pause_auto_resume_hours: 48                      # [SPEC] §11.3
+# auto-clears the pause and retries. Applies only to Self-healed-weird
+# pause_reasons. 48 hours = long enough for in-flight broker orders to
+# reach terminal state, broker-side flags to clear, etc. Short enough
+# that an operator returning from a multi-week trip finds the system
+# has been retrying rather than sitting idle since the failure.
+# (§11.3.1)
+pause_auto_resume_hours: 48                      # [SPEC] §11.3.1
 
 # Consecutive same-reason re-pauses before alert escalation. The system
 # keeps trying indefinitely; this only controls when the alert gets
 # louder. At N consecutive re-pauses for the same pause_reason, the
 # system emits pause_consecutive_escalation (Warning severity). For
 # weekly cycles, N=4 corresponds to ~28 days of repeated failure — a
-# returning operator sees an unmissable pattern. (§11.3)
-pause_consecutive_escalation_count: 4            # [SPEC] §11.3
+# returning operator sees an unmissable pattern. (§11.3.1)
+pause_consecutive_escalation_count: 4            # [SPEC] §11.3.1
 
 
 # -----------------------------------------------------------------------------

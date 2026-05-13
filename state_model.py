@@ -87,11 +87,28 @@ class LookbackStatus(str, Enum):
 
 
 class PauseReason(str, Enum):
-    """Catalog of pause_reason values per §11.3."""
+    """Catalog of pause_reason values per §11.3.1.
+
+    Three values are Self-healed-weird (auto-resume after 48h):
+    PARTIAL_PHASE_TRANSITION, ORDER_REJECTION, DISK_FULL.
+
+    Two values are Hard-broke (no auto-resume; require external
+    action): INTERNAL_CONSISTENCY_VIOLATION (§7.3.2 step 4),
+    BROKER_INCONSISTENCY (§11.2.14 hard-broke sub-cases).
+
+    See DECISIONS.md D-SPEC-8 for the framework rationale.
+    """
     PARTIAL_PHASE_TRANSITION = "partial_phase_transition"
     ORDER_REJECTION = "order_rejection"
     DISK_FULL = "disk_full"
     INTERNAL_CONSISTENCY_VIOLATION = "internal_consistency_violation"
+    BROKER_INCONSISTENCY = "broker_inconsistency"
+
+
+class Phase2SwingState(str, Enum):
+    """Phase 2 opportunistic swing state (§7.5.2.a)."""
+    STEADY = "steady"
+    DEPLOYED = "deployed"
 
 
 # =============================================================================
@@ -299,13 +316,47 @@ class BufferState(BaseModel):
         return Decimal(str(v))
 
 
-class OperationalPause(BaseModel):
-    """Auto-resuming pause framework (§11.3). When paused == true, cycles
-    still run but abort after input refresh without entering decision/
-    action layers. Auto-resumes after pause_auto_resume_hours.
+class Phase2Opportunistic(BaseModel):
+    """Phase 2 opportunistic swing state (§6.7, §7.5.2.a). Binary
+    state plus two pending-confirmation counters for the 2-week
+    confirmation windows on deploy (steady -> deployed) and recover
+    (deployed -> steady) transitions.
 
-    consecutive_pause_count increments when the same pause_reason fires
-    on consecutive pauses. At >= pause_consecutive_escalation_count,
+    Initialized to {state: STEADY, both counters zero} when Phase 2
+    begins. The binary state becomes moot at Phase 3 latch (Phase 2
+    is no longer the operating regime) and the counters are
+    discarded at the same time. Pending counters are suspended (not
+    advanced, not reset) during the Phase 3 grace window.
+
+    Counter semantics: each counter increments per weekly cycle the
+    corresponding signal condition holds. Resets to zero when the
+    signal falls back out of range. When cycles_confirmed reaches
+    confirmation_window_weeks (default 2), the transition commits
+    and the counter resets.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    state: Phase2SwingState = Phase2SwingState.STEADY
+    deploy_pending: PendingCounter = Field(default_factory=PendingCounter)
+    recover_pending: PendingCounter = Field(default_factory=PendingCounter)
+
+
+class OperationalPause(BaseModel):
+    """Operational pause framework (§11.3.1). When paused == true,
+    cycles still run but abort after input refresh without entering
+    decision/action layers.
+
+    Per D-SPEC-8, auto-resume behavior depends on the pause_reason:
+    Self-healed-weird reasons (partial_phase_transition,
+    order_rejection, disk_full) auto-resume after
+    pause_auto_resume_hours. Hard-broke reasons
+    (internal_consistency_violation, broker_inconsistency) do not
+    auto-resume; the next cycle clears the pause only when the
+    underlying condition is gone (e.g., a code fix has been
+    deployed, or broker configuration has been corrected).
+
+    consecutive_pause_count increments when the same pause_reason
+    fires on consecutive pauses. At >= pause_consecutive_escalation_count,
     alert severity escalates from Notice to Warning.
     """
     model_config = ConfigDict(extra="forbid")
@@ -362,6 +413,9 @@ class OperatingState(BaseModel):
     lookback_signal: LookbackSignal
     schedule_state: ScheduleState = Field(default_factory=ScheduleState)
     buffer_state: BufferState
+    phase2_opportunistic: Phase2Opportunistic = Field(
+        default_factory=Phase2Opportunistic
+    )
     operational_pause: OperationalPause
     withdrawal_capacity_exhausted: bool = False
     coordination: Coordination
@@ -463,7 +517,7 @@ def new_initial_state(
     cash_target = i_0 + cash_offset
 
     return OperatingState(
-        schema_version="1.1",
+        schema_version="1.2",
         last_cycle_id=uuid4(),
         last_cycle_at=now,
         phase=Phase.PHASE_1,
@@ -486,6 +540,7 @@ def new_initial_state(
             cash_target_dollars=cash_target,
             recomputed_at=now,
         ),
+        phase2_opportunistic=Phase2Opportunistic(),
         operational_pause=OperationalPause(paused=False),
         withdrawal_capacity_exhausted=False,
         coordination=Coordination(

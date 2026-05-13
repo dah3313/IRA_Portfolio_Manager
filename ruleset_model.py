@@ -271,7 +271,6 @@ class Ruleset(BaseModel):
     # -------------------------------------------------------------------------
     # §12. Misc alert / order / ACH parameters
     # -------------------------------------------------------------------------
-    fi_overweight_suppression_alert_weeks: int = Field(gt=0)
     order_fill_timeout_seconds: int = Field(gt=0)
     ach_update_warning_threshold_cycles: int = Field(gt=0)
 

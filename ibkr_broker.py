@@ -127,18 +127,28 @@ etc.) before raising BrokerInconsistency.
 Fifteen seconds is generous for normal IBKR processing (typical
 confirmation < 1 sec) and leaves headroom for occasional API-callback
 lag during heavy-load periods or near IBKR's 23:45 ET daily reset.
-The cost-benefit is asymmetric: a false-positive BrokerInconsistency
-is the one halt category NOT eligible for 48h auto-resume (requires
-operator review), so a slightly longer wait is cheap insurance.
-A cycle stalling on it for the full 15 sec is still operator-visible
-quickly (cycles run in the background, not interactively)."""
+The cost-benefit favors the longer window: a false-positive
+BrokerInconsistency in this sub-case is self-healed-weird per
+§11.2.14 (the next cycle's fresh broker query resolves the
+ambiguity), so the operational impact of a spurious raise is just
+one extra alert and one cycle's delay — a slightly longer wait is
+cheap insurance against the noise. A cycle stalling on the full
+15 sec is still operator-visible quickly (cycles run in the
+background, not interactively)."""
 
 POST_PLACEMENT_ACTIVITY_LOOKBACK_HOURS = 48
 """How far back place_order() looks when searching for an existing
-order with the same client_order_id (idempotent rediscovery). Matches
-the operational_pause auto-resume window so that a cycle restarted
-within 48h of its prior attempt's failure can find any orders that
-attempt placed."""
+order with the same client_order_id (idempotent rediscovery). The
+48-hour window covers two restart scenarios: (a) a cycle that
+crashed yesterday and is restarting today, whose placed orders are
+discoverable via this lookup; (b) a cycle paused via §11.3.1 with a
+Self-healed-weird pause_reason (48h auto-resume), where the resumed
+cycle's idempotency lookup needs to see anything the pre-pause
+attempt placed. The lookback's primary justification is restart-
+recoverability; the parallel with the pause_auto_resume_hours
+default is coincidental but useful — they're both 48h for the same
+underlying reason (a "single business day plus buffer" granularity
+that covers normal operational delays)."""
 
 # Acceptable TWS API ports — used for argument validation defense
 # against transposed/typo'd port numbers (e.g., 7496 vs 7497).
@@ -1291,8 +1301,13 @@ class IBKRBroker:
           - Pre-place lookup: we call get_recent_activity() ourselves
             (a method on this same class), search for matching
             orderRef, and return an idempotent rediscovery if found.
-            The 48h lookback in get_recent_activity matches the
-            operational_pause auto-resume window.
+            The 48h lookback in get_recent_activity covers two
+            restart scenarios: a cycle that crashed yesterday and is
+            restarting today, and a cycle paused with a Self-healed-
+            weird pause_reason (48h auto-resume) whose resumed
+            attempt's idempotency lookup must see anything the prior
+            attempt placed. See POST_PLACEMENT_ACTIVITY_LOOKBACK_HOURS
+            for the full rationale.
 
           - Post-place confirmation: we wait up to
             POST_PLACEMENT_CONFIRMATION_WINDOW_SEC for the order to

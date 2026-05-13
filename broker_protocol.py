@@ -84,11 +84,12 @@ from broker_types import (
 # (ib_async errors, network errors, etc.) into these. Raw library exceptions
 # must never escape the broker module.
 #
-# The action layer's response to each:
+# The action layer's response to each (per IRAPM spec §11 and D-SPEC-8):
 #
 #   BrokerNotReady       → cycle aborts at step 1 (input refresh); §11.2.1
-#                          broker-connectivity-loss; no operational_pause
-#                          (transient by nature). Next cycle retries.
+#                          broker-connectivity-loss; Critical (self-healed
+#                          weird) — no operational_pause (transient by
+#                          nature). Next cycle retries.
 #
 #   BrokerUnreachable    → same as BrokerNotReady (subtype). Distinguished
 #                          for log/alert clarity: "could not reach broker"
@@ -97,18 +98,27 @@ from broker_types import (
 #   BrokerRejection      → broker accepted the connection and processed the
 #                          request, but rejected the operation (order
 #                          rejected, ACH update refused, etc.). §11.2.2
-#                          handles this — operational_pause with
-#                          pause_reason='order_rejection' (or similar);
+#                          handles this — Critical (self-healed weird),
+#                          operational_pause with pause_reason='order_rejection';
 #                          48h auto-resume.
 #
 #   BrokerInconsistency  → broker returned data that violates an invariant
-#                          we depend on (account mismatch, place_order
-#                          succeeded but order not in open orders within
-#                          15 sec, place_order returned an order ref we
-#                          didn't supply, etc.). This is the "something is
-#                          deeply wrong" category — operational_pause with
-#                          pause_reason='broker_inconsistency'; NOT eligible
-#                          for 48h auto-resume; requires operator review.
+#                          we depend on. The action layer's response depends
+#                          on the sub-case (§11.2.14):
+#                            - Account-ID mismatch at connect, or malformed
+#                              Trade data → Critical (hard broke):
+#                              operational_pause with pause_reason=
+#                              'broker_inconsistency'; no auto-resume.
+#                            - Post-placement confirmation timeout, or
+#                              pre-place query failure → Critical (self-
+#                              healed weird): alert only, NO operational_pause.
+#                              The next cycle's fresh broker query resolves
+#                              the ambiguity via the established idempotency
+#                              mechanism.
+#                          The broker module raises the same exception in
+#                          all cases; the action layer's exception handler
+#                          inspects the BrokerInconsistency's cause field
+#                          (or equivalent metadata) to choose the response.
 # =============================================================================
 
 
@@ -156,20 +166,26 @@ class BrokerRejection(BrokerError):
 class BrokerInconsistency(BrokerError):
     """Broker returned data that violates an invariant we depend on.
 
-    This is the "something is deeply wrong, halt and alert operator"
-    category. Examples that raise this:
+    Examples that raise this:
       - Connected account ID doesn't match the configured expected
-        account ID at startup
+        account ID at startup (hard-broke sub-case)
+      - A returned Trade carries malformed numeric values, an
+        impossible execId collision, or wrong client_id attribution
+        (hard-broke sub-case)
       - place_order() succeeded but the order doesn't appear in the
-        open-orders table within 15 seconds (the post-placement
-        confirmation check)
-      - get_recent_activity() returns an order with a client_order_id
-        format the broker didn't receive from us (suggests order
-        attribution corruption)
-      - Two distinct fills at the broker share the same fill_id
-        (impossible if broker is correctly identifying executions)
+        open-orders table within 15 seconds — the post-placement
+        confirmation check (self-healed-weird sub-case)
+      - get_recent_activity() raised, leaving the idempotency lookup
+        blind; the cycle refused to place (self-healed-weird sub-case)
 
-    Raising this never auto-resumes; an operator must review.
+    The action layer's response depends on the sub-case per §11.2.14
+    and D-SPEC-8: hard-broke sub-cases set operational_pause with
+    pause_reason='broker_inconsistency' and no auto-resume;
+    self-healed-weird sub-cases alert only with no pause, since the
+    next cycle's fresh broker query resolves the ambiguity via the
+    established idempotency mechanism. The exception itself does not
+    encode the distinction — the action layer's handler inspects the
+    BrokerInconsistency's cause / context to classify.
     """
 
 

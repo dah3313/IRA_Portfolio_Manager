@@ -1600,3 +1600,131 @@ simplify-quest task.
 subsections deleted (each as a header-through-pre-separator
 block, preserving the major-section `---` separator that
 followed). New `CHANGELOG.md` file created. No code changes.
+
+
+### D-SPEC-8: Three-category failure-classification framework (operator-relevance, not timer-based)
+
+**Context.** The pre-v1.8 spec classified `operational_pause` recovery
+behavior into two categories — auto-resuming (48h timer) and
+"NOT eligible for auto-resume" (waits indefinitely for operator
+to clear). The two-category model accumulated a sub-category in
+v1.7.1 (Critical indefinite-halt for `withdrawal_capacity_exhausted`),
+producing three categories whose distinguishing axis was *timer
+behavior*: 48h, indefinite-with-condition-clear, or never-resume.
+
+Reviewing the v1.7.1 spec in context of §1.4's failure-quiet
+principle ("the survivor inherits a running system, not a system
+awaiting instructions") surfaced a fundamental conflict. Three
+§11.2 failure entries — §11.2.11 Layer B (split-brain detected),
+§11.2.14 (broker inconsistency), §11.2.15 (external account
+activity overlap) — set `operational_pause` with "NOT eligible
+for auto-resume" semantics. In the absent-operator scenarios
+the system is explicitly designed to survive (multi-week travel,
+hospitalization, death), these three pause types would leave the
+system permanently halted waiting for an operator who is not
+returning.
+
+The conflict is not local to those three entries. The deeper
+issue is that the failure model was organized around *retry
+behavior* when it should have been organized around *system
+status*. A timer-based question ("after how long do we retry?")
+hides the operator-relevant question ("is the system still
+functioning, or genuinely broken?").
+
+**Decision.** Replace the timer-based failure model with an
+operator-relevance framework. Each failure mode is classified
+into one of three named categories based on the system's actual
+status after detection:
+
+1. **Hard broke.** The system genuinely cannot proceed without
+   external action. Either the underlying condition cannot be
+   resolved by retrying (a software bug, configuration error,
+   or broker-data invariant violation), or retrying could cause
+   harm (placing duplicate orders, acting against compromised
+   state). The system halts; auto-resume is absent because no
+   automatic recovery is safe or meaningful.
+
+2. **Self-healed weird.** Something unexpected happened, but
+   the system already recovered automatically. The detection
+   itself is the receipt that the system noticed; the recovery
+   was already performed by other mechanisms (broker-layer
+   idempotency, IP-tiebreak, fresh-state re-read on next cycle).
+   The alert exists for operator awareness — forensics, trust
+   calibration, runbook reference — not for operator action.
+   The system continues running normally; no `operational_pause`
+   is set.
+
+3. **Normal-ops notice.** Routine state transitions, scheduled
+   actions, or successful recoveries that the operator should
+   see in their alert stream for cadence reporting. The system
+   is in its expected state; the alert is informational. The
+   pre-v1.8 spec handled this category implicitly via Notice
+   and Info severity alerts; the framework names it explicitly
+   so the catalog is complete.
+
+**Rationale.**
+
+The new framework honors §1.4's failure-quiet principle by
+making the absent-operator case the design center. With timer-
+based classification, the question "what happens if no operator
+ever returns?" had different answers in different rows of the
+§11.2 catalog. With status-based classification, the answer is
+uniform: the system runs forever unless it is genuinely broken,
+and "genuinely broken" is a deliberately narrow category that
+the system cannot fix itself.
+
+**Hard broke is intentionally narrow.** Only two pause causes
+qualify post-v1.8: `internal_consistency_violation` (assertion-
+failure semantics; the same software bug will re-fire on retry,
+so retrying achieves nothing) and `broker_inconsistency` in the
+narrow sub-cases where the broker layer cannot trust its own
+state (account-ID mismatch at connect, malformed Trade data
+indicating ib_async/IBKR version drift). The withdrawal-only
+indefinite halt `withdrawal_capacity_exhausted` is structurally
+its own field (not a `pause_reason` value); it sits in the
+Hard-broke category conceptually but has a precise condition-
+based auto-clear that the other Hard-broke cases lack.
+
+**Self-healed weird is the right home for several v1.7.1
+"NOT auto-resume" cases.** Layer B split-brain detection
+(§11.2.11) fires *after* the IP-tiebreak has resolved the
+state-file conflict and *after* the broker layer's pre-place
+idempotency lookup has prevented duplicate orders. The pause
+was protecting against damage that the system had already
+prevented. Similarly, `external_activity_overlap` (§11.2.15)
+fires when the system has already declined to act on
+suspicious data — the heal is the declination, and the next
+cycle's fresh-state read continues operation safely. The
+transient sub-cases of `broker_inconsistency` (post-placement
+confirmation timeout, pre-place query failure) recover on the
+next cycle's broker query without operator involvement.
+
+**Net effect on the failure catalog.** The §11.3.1 pause-reason
+catalog post-v1.8 lists 5 values:
+- Auto-resuming (Self-healed-weird category, after-the-fact
+  recovery via 48h retry): `partial_phase_transition`,
+  `order_rejection`, `disk_full`
+- Hard-broke (no auto-resume): `internal_consistency_violation`,
+  `broker_inconsistency`
+
+The values `state_file_corrupt` and `configuration_validation`
+that appeared in the v1.7.1 catalog under "N/A — refuses to
+start" are removed; these are §11.2 entries documenting
+refuse-to-start startup-time conditions, not values the runtime
+ever writes to the state file as `pause_reason`.
+
+Three former pause types are converted to alerts-only with no
+pause: §11.2.11 Layer B (`split_brain_detected`), §11.2.15
+(`external_activity_overlap`), and two of the four
+§11.2.14 sub-cases (`broker_inconsistency` post-placement
+timeout and pre-place query failed).
+
+**Implementation in v1.8 spec.** §11.1 severity model gains the
+named three-category framework. §11.2 entries each carry the
+new classification in their Severity line. §11.3.1 catalog
+contains the canonical 5-value `pause_reason` set. State schema
+and Pydantic model updated to match. Detailed case-by-case
+classification (which §11.2 entry falls in which category, and
+why) is in the spec body §11 rather than duplicated here —
+this entry captures the framework decision; the spec carries
+current truth.

@@ -1,54 +1,34 @@
-This is a genuinely mil-spec architectural document. It reads less like a standard software spec and more like an avionics manual—which is exactly the tone and rigor required for an unattended, decades-long financial engine.
+Simplifying a specification of this magnitude is like refactoring a live database—when you collapse sections and move logic around, the internal pointers almost always get left behind.
 
-Evaluating the specification against your four pillars—**Clean, Simple, Elegant, and Robust**—reveals a highly mature system. Here is a line-by-line "scrub" of how the v1.5 architecture successfully hits those marks, along with a few minor areas where the logic could be tightened even further.
+You have done an incredible job tightening the actual logic (the decision/action separation and the state machine boundaries are airtight), but you are exactly right to suspect there are some dangling references.
 
-### 1. Clean: Strict Boundary Enforcement
+I just ran a "static analysis" on the document's internal cross-references. Here are the stale pointers and orphans that need to be cleaned up:
 
-The spec shines in how ruthlessly it enforces boundaries.
+### 1. The Phantom "§12.7" and "Item 20"
 
-* **State Isolation (§6.7):** Restricting `state.json` to a tiny <10KB footprint and pushing all historical data (CB transitions, annual reviews, cycle attempts) to append-only logs is perfectly clean. It guarantees the core operating state won't bloat into an unparseable mess ten years from now.
-* **Money Discipline (§2.8):** Enforcing `Decimal` and forbidding float arithmetic at the spec level is a crucial guardrail. It cleanly eliminates the compounding binary-fraction artifacts that plague long-term financial simulations.
+When you simplified the Alert Catalog, it seems you merged or deleted a section, but left a few pointers behind:
 
-### 2. Simple: Stateless & Ephemeral Execution
+* In **§7.2.1** and **§8.2.5 (Step 1)**, the text says: `surfaced in the large_rebalance alert's residual-exceptions section (§12.7).` **Section 12 stops at §12.6.**
+* At the very end of **§12.6**, there is an orphaned review note: `(§7.2.1, §8.2.5 ruling per Item 20).` "Item 20" looks like a leftover reference to an old changelog or review checklist.
 
-Complexity in automated systems usually breeds in persistent state and long-running memory loops. The spec systematically exterminates both.
+### 2. The §4.1.1 Math Sub-Section Chaos
 
-* **The Lookback Signal (§5):** Leaving moving averages (like a 200-day SMA) out of the synthetic index computation keeps the signal strictly point-to-point and deterministic. It avoids smoothing artifacts, requires zero warmup period, and can be calculated perfectly from raw price files on any given Wednesday.
-* **Per-Cycle Broker Lifecycle (§15.3):** Connecting, executing, and disconnecting within a single cycle context manager is an excellent simplification. It completely sidesteps the memory leaks and stale-cache bugs associated with persistent API connections.
+It looks like the Phase 3 sustainable withdrawal math section (`§4.1.1`) was heavily condensed from an older version, breaking several downstream pointers in the Testing and Open Questions sections:
 
-### 3. Elegant: Leveraging the Environment
+* In **§13.6 (Phase 3 four-regime testing)**, it says: `Per the four-regime taxonomy in §4.1.1.6...` **There is no §4.1.1.6.** The taxonomy concepts (sub_floor, floor, calc, ceiling) are now just woven directly into `§4.1.1` and `§4.1.1.2`.
+* Also in **§13.6**, it references `sustainable_floor_monthly per §4.1.1.4` and `direct closed-form result (§4.1.1.3)`. Currently, `§4.1.1.4` is "Reference Values" and `§4.1.1.3` is the "Implementation Summary", neither of which contain the formulas being referenced (the formulas are now just under the main `§4.1.1` header).
+* In **§14.7**, it says: `Replace the illustrative reference values in §4.1.1.8...` **There is no §4.1.1.8.** Those reference values are currently sitting in `§4.1.1.4`.
 
-Elegance is achieving high reliability without writing heavy, custom infrastructure.
+### 3. The "F6" Threat Model Orphan
 
-* **Master/Slave Coordination (§9.4.2 & §15.6):** This is arguably the most elegant design in the document. Using an `rsync` push where the state-file write *is* the heartbeat avoids the need for complex, fragile consensus protocols. Backing that up with IBKR's `get_recent_activity()` as the ultimate split-brain arbiter uses the broker itself as the source of truth, effectively getting a distributed lock for free.
-* **Transaction Cost Management:** The reliance on high-liquidity ETFs (like PYLD and FBCG) rather than mutual funds allows the system to smoothly execute fractional-share rebalancing and cascade withdrawals without bleeding capital to transaction fees.
+* In **§15.5 (Idempotency model)**, under item #6 (Library-level retry), the text says: `(This is the F6 case from the threat model.)`
+* There is a physical security threat model in `§10.1.1`, but there is no "F6" anywhere in the document. This is likely a leftover pointer to an older, external software threat-model document.
 
-### 4. Robust: Physical Security & Fail-Safe Defaults
+### A Note on External Pointers
 
-The document assumes everything will eventually fail and dictates exactly how the system must respond.
+You have several references to `DECISIONS.md` (e.g., `D-SPEC-8`, `D-BROKER-1`). Given your preamble states `DECISIONS.md` is a living document meant for clarification, these are structurally fine, provided those tags still actually exist over in that file!
 
-* **The "Dead Man's Switch" (§10):** Using USB removal as the Phase 3 trigger across the two fanless CL260 boxes provides brilliant AND-semantics. It is infinitely more robust than trying to maintain synchronized active/active "hot standby" hardware. If a USB port fails, the system safely holds its state. If the survivor pulls the tokens, the 24-hour grace window elegantly absorbs any physical accidents before the permanent latch.
-* **Cascade Sourcing (§7.3.2):** The SGOV → FI → Growth drainage path ensures that the system aggressively buys time during deep drawdowns.
+**Summary:**
+If you do a quick `CTRL+F` for **`12.7`**, **`Item 20`**, **`4.1.1.8`**, **`4.1.1.6`**, and **`F6`**, you will clear out the last remaining cobwebs from the refactor.
 
----
-
-### The "Scrub" — Areas to Tighten
-
-While the spec is incredibly solid, passing it through the filter of these four philosophies highlights three minor areas worth a second look before the `ruleset.yaml` is finalized:
-
-**1. Market Orders During Cascade Conditions (Robustness Check)**
-In **§8.2.1**, the spec states: *"IRAPM uses market orders exclusively... The high-liquidity ETFs in the IRAPM allowlist... have tight enough spreads that market-order slippage is negligible."* While true in normal markets, a **CB2 Cascade** implies severe market stress. During liquidity crunches, bid/ask spreads on high-yield debt ETFs can gap significantly.
-
-* **Recommendation:** You don't necessarily need to add limit-order logic (which violates the "Simple" pillar), but you may want to explicitly note in the spec that wider slippage is an *accepted cost* during cascade events, as the primary goal at that stage is survivor liquidity, not optimal execution pricing.
-
-**2. Coordination Timing & Clock Drift (Elegance Check)**
-**§9.4.2** defines fixed clock times for master/slave operations (06:00 ET heartbeat, 06:15 ET rsync, 06:30 ET slave check).
-
-* **Recommendation:** Because the sequence relies on absolute wall-clock times rather than sequential process triggers, it is vulnerable to system clock drift. Explicitly stating an assumption in the spec that both boxes rely on a strictly maintained local NTP daemon ensures the 15-minute operational gaps aren't accidentally swallowed by time drift over a decade.
-
-**3. The Large Cash Deployment Threshold (Clean Check)**
-In **§7.7.1**, the `$25,000` default threshold for bulk deployment is entirely reasonable for the Phase 1 Roth conversions.
-
-* **Recommendation:** To keep the logic perfectly clean across decades, ensure that this dollar threshold is clearly decoupled from inflation indexing in the `ruleset.yaml`. A $25k threshold in 2027 will represent a very different real purchasing power in 2045, so the percentage-based fallback (`large_cash_deployment_threshold_rate`) will do the heavy lifting later in the system's life.
-
-Overall, this specification is tight, defensive, and built to survive both market volatility and the physical realities of unattended hardware.
+The document is brilliantly constructed. The fact that the only errors left are essentially Markdown 404s means the hard systems-engineering work is fully locked in.

@@ -2,7 +2,7 @@
 
 ## Specification
 
-**Version:** 1.7
+**Version:** 1.9.2
 **Status:** Implementation-ready pending ruleset.yaml drafting, operational
 runbook, paper-trading verification of the §15.12 uncertainty-flagged items,
 and re-validation per §14.7.
@@ -253,8 +253,6 @@ violations. This includes — non-exhaustively:
   (`large_cash_deployment_threshold_dollars` default 25000;
   `large_cash_deployment_threshold_rate` default 5; trigger fires
   when cash surplus exceeds the max of the two — per §7.7.1).
-- FI-overweight suppression alert threshold
-  (`fi_overweight_suppression_alert_weeks`, default 4, per §7.5.1).
 - Order fill timeout (`order_fill_timeout_seconds`, default 60,
   per §8.2.1).
 - Dry-run mode (`dry_run`, boolean, default false, per §13.7).
@@ -378,12 +376,6 @@ rule.
 |---|---|---|---|
 | `annual_review_date` | Jan 15 | MM-DD | §7.6 |
 | `freeze_evaluation_threshold_days` | 30 | days | §7.6.1 |
-
-**Rebalance suppression alerting:**
-
-| Parameter | Default | Units | Section |
-|---|---|---|---|
-| `fi_overweight_suppression_alert_weeks` | 4 | weeks | §7.5.1 |
 
 **Action layer:**
 
@@ -2132,8 +2124,17 @@ replicated to the slave's local disk via the daily rsync per §9.4.2:
   buffer_target, refill_rate, cash_target)`. Append-only. `cb2_days`
   counts calendar days CB2 was active for any part of the day,
   regardless of which entry path triggered.
-- **Phase 2 opportunistic state:** Current state of the swing (steady /
-  deployed). Only meaningful in Phase 2; cleared at Phase 3 transition.
+- **Phase 2 opportunistic state:** Current state of the swing
+  (`steady` / `deployed`). Initialized to `steady` at Phase 2
+  entry. Two pending-confirmation counters tracked independently:
+  `deploy_pending_weeks` (cycles consecutively at signal ≤
+  `phase2_opportunistic_trigger_rate` while in `steady`) and
+  `recover_pending_weeks` (cycles consecutively at signal ≥
+  `phase2_opportunistic_recovery_rate` while in `deployed`). Both
+  counters are reset to 0 whenever the signal falls back out of
+  range, and discarded at Phase 3 latch. The binary state itself
+  becomes moot at Phase 3 latch (Phase 2 is no longer the
+  operating regime); no explicit clear is required.
 - **Buffer & cash targets:** Current `buffer_target_dollars`,
   `monthly_refill_rate_dollars`, `cash_target_dollars`. Recomputed at
   annual review; recomputed values persisted here for cycle reads.
@@ -2143,8 +2144,8 @@ replicated to the slave's local disk via the daily rsync per §9.4.2:
   `{paused: false, pause_reason: null, pause_started_at: null, consecutive_pause_count: 0}`.
   See §11.3.
 - **Withdrawal capacity:** `withdrawal_capacity_exhausted` (boolean,
-  default false). Permanent halt flag for cascade-exhausted state;
-  see §11.3.
+  default false). Indefinite-halt flag for cascade-exhausted state;
+  see §11.3.2.
 - **Master/slave coordination:** `master_box_id`,
   `last_master_write_timestamp`, `master_ipv4_last_octet`,
   `last_cycle_clientid` in the local state file (per §9.4.2,
@@ -2470,7 +2471,7 @@ before moving to the next stage:
    absolute floor and the operator should review.
 4. If all three stages have reached residual and demand is not yet
    met, abort cycle. Set `withdrawal_capacity_exhausted: true`
-   in state (permanent halt for withdrawals only, per §11.3 and
+   in state (indefinite halt for withdrawals only, per §11.3.2 and
    §11.2.7). The portfolio has effectively reached its absolute
    floor. Emit `withdrawal_capacity_exhausted` Critical alert.
 
@@ -2612,17 +2613,16 @@ fine). If the trigger is "FI overweight" (FI grew faster than Growth),
 the natural plan would be to sell FI and buy Growth, which violates I5.
 
 **Resolution:** If the rebalance plan would require selling FI to buy
-Growth, **suppress the entire rebalance** for that cycle. Log a
-warning. This is a rare condition (FI dramatically outperforming
-Growth) and the right behavior is to wait — eventually Growth
-catches up. Note that the conditions producing significant FI
+Growth, **suppress the entire rebalance** for that cycle. Record the
+suppression in the cycle log alongside other per-cycle decisions; no
+dedicated alert fires. This is a rare condition (FI dramatically
+outperforming Growth) and the right behavior is to wait — eventually
+Growth catches up. Note that the conditions producing significant FI
 overweight typically coincide with CB1/CB2 (Growth depressed),
-where rebalancing is suspended anyway.
-
-If the suppression-by-FI-sacrosanct condition persists for more than
-`fi_overweight_suppression_alert_weeks` (default 4), elevate to a
-`fi_overweight_persistent_suppression` Warning alert: the operator
-should look at why this is happening.
+where rebalancing is suspended anyway. The operator notices any
+persistent FI overweight via the mandatory weekly summary alert
+(§12.3), which exposes current asset balances and weights every
+cycle; no separate alerting mechanism is needed.
 
 #### 7.5.2 Phase 2 opportunistic rebalancing
 
@@ -2686,12 +2686,30 @@ The system swings between these two states based on the signal:
 - Mark plan with `phase2_opportunistic_recover` flag → triggers
   alert.
 
-**Phase 3 grace window suspension:** if the Phase 3 token activation
-grace window is active (24-hour countdown running), Phase 2 swings
-are suspended. Pending confirmations are held but not advanced. Once
-the grace window resolves (either cancelled or expired/latched),
-swing evaluation resumes (or is permanently moot if Phase 3 latched).
-Pending Phase 2 confirmations are discarded at Phase 3 latch.
+**Suspend conditions** (swing evaluation does not advance pending
+counters and does not fire triggers when any of these hold):
+
+- **Phase 3 token activation grace window active.** If the
+  24-hour Phase 3 grace countdown is running, Phase 2 swing
+  evaluation is suspended. Pending confirmations are held but
+  not advanced. Once the grace window resolves (cancelled or
+  expired/latched), swing evaluation resumes — or is permanently
+  moot if Phase 3 latched. **Pending Phase 2 confirmations are
+  discarded at Phase 3 latch.**
+- **Lookback signal UNAVAILABLE.** The swing triggers are
+  signal-based; if the signal is UNAVAILABLE for the cycle, no
+  trigger evaluation occurs. Pending confirmations are held but
+  not advanced (consistent with §6.3's CB confirmation-counter
+  semantics under signal-UNAVAILABLE conditions).
+- **CB state is CB1 or CB2.** Phase 2 normally holds CB at
+  CB_INACTIVE, so this is mostly belt-and-suspenders — but if a
+  CB transition did fire during Phase 2 (e.g., the resource-based
+  CB2 entry paths in §6.3.1 are not phase-gated and remain
+  evaluable in Phase 2), swing evaluation is suspended for the
+  same reason rebalancing is suspended under CB1/CB2 (§7.5):
+  drawdown-protection state implies the system is not in a
+  posture where opportunistic allocation swings are appropriate.
+  Pending confirmations are held but not advanced.
 
 **Why the asymmetric recovery threshold?**
 
@@ -2770,20 +2788,25 @@ other date-anchored cycles.
   an Info-severity alert noting the drift that was scraped back.
 
 **Skip conditions** (semi-annual reallocation does NOT run, even
-on a scheduled date):
+on a scheduled date; the reallocation is calendar-driven and has
+no pending-counter state to preserve across skips — a skipped
+occurrence is simply not executed, and the next semi-annual date
+re-evaluates the same way):
 
-- Phase 2 swing state is `deployed` — the swing-recovery trigger
-  is what returns the system to steady state, not the calendar.
-- A Phase 3 token activation grace window is currently active —
-  same pause-pending-decision logic as the §7.5.2.a swing
-  triggers.
-- Lookback signal is UNAVAILABLE — defer to next weekly cycle
-  to retry; the reallocation is not signal-gated for its trigger
-  logic, but the operating environment must be observable enough
-  to safely execute the trades.
-- CB state is CB1 or CB2 in the unusual case CB was active in
-  Phase 2 — Phase 2 normally holds CB at CB_INACTIVE so this is
-  mostly belt-and-suspenders.
+- **Phase 3 token activation grace window active.** Same suspend
+  rationale as the §7.5.2.a swing triggers — defer the
+  reallocation until the grace window resolves.
+- **Lookback signal UNAVAILABLE.** The reallocation is not
+  signal-gated for its trigger logic, but the operating
+  environment must be observable enough to safely execute the
+  trades. Defer to the next weekly cycle to retry.
+- **CB state is CB1 or CB2.** In the unusual case CB was active
+  in Phase 2 — Phase 2 normally holds CB at CB_INACTIVE so this
+  is mostly belt-and-suspenders.
+- **Phase 2 swing state is `deployed`** — the swing-recovery
+  trigger is what returns the system to steady state, not the
+  calendar. (This condition is specific to §7.5.2.b; the swing
+  itself is the mechanism that handles the deployed state.)
 
 **Why semi-annual, not 5/25 or annual:**
 
@@ -3323,8 +3346,10 @@ Executed as a coordinated batch:
    - Cash target = I_0 + $1000
 
 A PhaseTransition entry's failure leaves the system in a partially-
-transitioned state requiring operator review. Alert with severity:
-Critical (blocking).
+transitioned state requiring `operational_pause` with `pause_reason:
+"partial_phase_transition"`. Alert severity: Critical (self-healed
+weird) — the auto-resume cycle re-reads broker state and completes
+the transition from wherever it left off. See §11.2.8.
 
 #### 8.2.6 CBStateTransition entries
 
@@ -4726,22 +4751,54 @@ Four severity levels:
 | Notice | Significant state change requiring operator awareness | Email + SMS | 1 retry on SMS dispatch failure |
 | Critical | Issue that requires operator action; may or may not block operation | Email + SMS | 3 retries on SMS dispatch failure |
 
-Critical alerts have an additional **recovery category** orthogonal
-to severity:
+Critical alerts carry an additional **operator-relevance category**
+orthogonal to severity. The category communicates the system's
+actual status after detection — what the operator needs to do, if
+anything — rather than describing timer behavior. Three named
+categories:
 
-- **Critical (transient):** the underlying condition is expected to
-  resolve naturally on subsequent cycles (e.g., broker temporarily
-  unreachable). The system continues operating; the next cycle
-  retries the operation. No `operational_pause` is set.
-- **Critical (blocking):** the system cannot safely continue normal
-  operation; `operational_pause` is set per §11.3. Most blocking
-  conditions auto-resume after `pause_auto_resume_hours` (default
-  48). The single permanent halt is
-  `withdrawal_capacity_exhausted` from cascade exhaustion.
+- **Critical (hard broke):** the system genuinely cannot proceed
+  without external action. Either retrying achieves nothing (the
+  underlying condition cannot be fixed by waiting — a software
+  bug, configuration error, broker-data invariant violation) or
+  retrying could cause harm (acting against compromised state).
+  Sets `operational_pause` per §11.3.1 with one of the two
+  hard-broke pause reasons (`internal_consistency_violation`,
+  `broker_inconsistency`); no auto-resume. The withdrawal-only
+  variant uses the `withdrawal_capacity_exhausted` flag per
+  §11.3.2 — same category, different state field.
+- **Critical (self-healed weird):** something unexpected happened,
+  but the system already recovered automatically by the time the
+  alert fires. The recovery was performed by other mechanisms —
+  the broker layer's pre-place idempotency lookup, the IP last-
+  octet tiebreak, the next cycle's fresh-state re-read, or a 48h
+  retry of a transient failure. The alert exists for operator
+  awareness (forensics, runbook reference, trust calibration),
+  not for operator action. Some self-healed-weird cases set
+  `operational_pause` with auto-resume (the 48h-retry variants:
+  `partial_phase_transition`, `order_rejection`, `disk_full`);
+  others set no pause at all (the already-healed variants:
+  `split_brain_detected`, `external_activity_overlap`, transient
+  broker-layer cases). Either way, the system continues operating.
+- **Critical (normal-ops notice):** routine state transitions
+  the operator should see in their alert stream for cadence
+  reporting — phase transitions, CB transitions, scheduled
+  withdrawal execution. The system is in its expected state;
+  the alert is informational. No pause; no retry; no operator
+  action required.
 
-Notation in the failure catalog: `Critical (transient)` or
-`Critical (blocking)`. Both are Critical severity for alerting
-purposes; they differ only in whether they set `operational_pause`.
+The framework is operator-absence-aware (§1.4). Nothing leaves
+the system permanently halted waiting for an operator who is not
+returning, *except* the narrow Hard-broke cases where halting is
+actively safer than continuing — software bugs that would re-fire
+on retry, or broker-state violations where the broker layer cannot
+trust its own data. See DECISIONS.md D-SPEC-8 for the framework
+rationale.
+
+Notation in the failure catalog: `Critical (hard broke)`,
+`Critical (self-healed weird)`, or `Critical (normal-ops notice)`.
+All three are Critical severity for alerting purposes; they differ
+only in operator-relevance.
 
 The severity name "Notice" is preferred over "Alert" to avoid
 confusion with the Plan entry type `Alert` (which is the dispatch
@@ -4757,7 +4814,7 @@ mechanism; severity is metadata about that dispatch).
   established has dropped. May happen at cycle start (most common)
   or mid-cycle (less common; the per-cycle connection model in
   §15.3 means each cycle reconnects fresh).
-- **Severity:** Critical (transient).
+- **Severity:** Critical (self-healed weird).
 - **System response:** Cycle ends; state file unchanged; alert
   dispatched. No `operational_pause` is set — broker connectivity
   is transient by nature and the next scheduled cycle will retry.
@@ -4774,10 +4831,10 @@ mechanism; severity is metadata about that dispatch).
 - **Symptom:** Order entry submitted; broker returns rejection
   (reason varies: insufficient buying power, instrument restricted,
   account flagged, etc.).
-- **Severity:** Critical (blocking).
+- **Severity:** Critical (self-healed weird).
 - **System response:** Cycle aborts after rejection.
   `operational_pause` is set with `pause_reason: "order_rejection"`.
-  Per §11.3, the pause auto-resumes after
+  Per §11.3.1, the pause auto-resumes after
   `pause_auto_resume_hours` (default 48); the next cycle re-reads
   broker state and produces a fresh plan.
 - **Recovery:** Transient causes (insufficient buying power from a
@@ -4796,7 +4853,7 @@ mechanism; severity is metadata about that dispatch).
 #### 11.2.3 State file missing or corrupt
 
 - **Symptom:** Process startup fails to read or parse state file.
-- **Severity:** Critical (blocking).
+- **Severity:** Critical (hard broke).
 - **System response:** Process refuses to start. Logs error to
   startup log. Alerts via email/SMS if alerter can be initialized
   without state file (which it should — credentials live in `.env`).
@@ -4851,37 +4908,35 @@ mechanism; severity is metadata about that dispatch).
 
 - **Symptom:** Withdrawal sourcing reaches all three cascade stages
   at residual floor with demand still unmet.
-- **Severity:** Critical (blocking, **permanent halt**).
+- **Severity:** Critical (hard broke, withdrawal-only).
 - **System response:** Withdrawal cycle aborts before SELL execution.
   No partial withdrawal. `withdrawal_capacity_exhausted: true` set
-  in the state file. The system enters a permanent halt for
-  withdrawals only: future withdrawal attempts are suppressed, but
-  all other system functions (CB state machine, signal computation,
-  weekly summary alerts, rebalancing if any value remains, etc.)
-  continue normally. The weekly summary re-alerts the
+  in the state file. The system enters a withdrawal-only halt:
+  future withdrawal attempts are suppressed, but all other system
+  functions continue normally. The weekly summary re-alerts the
   `withdrawal_capacity_exhausted` condition every cycle.
-- **Recovery:** No automatic recovery. The portfolio cannot fund
-  withdrawals, and retrying achieves nothing. External operator
-  action (manual fund deposit, account closure, transition to
-  non-portfolio income sources, etc.) is required. If external
-  action restores portfolio value, the flag auto-clears when the
-  cascade can again meet a hypothetical withdrawal demand at the
-  next withdrawal cycle (i.e., when SGOV+FI+Growth above-residual
-  total ≥ current monthly withdrawal). Unlike other pause
-  conditions, there is no 48-hour auto-resume — auto-retrying the
-  same impossible operation indefinitely would be pointless.
+- **Recovery:** The flag auto-clears when the cascade can again
+  meet a hypothetical withdrawal demand at the next withdrawal
+  cycle (i.e., when SGOV+FI+Growth above-residual ≥ current
+  monthly withdrawal). This typically requires cash entering the
+  managed account (Roth conversion, dividend accumulation, external
+  deposit, etc.) — the §2.9 "cash appears, system reacts" mechanism
+  picks it up automatically. There is no 48-hour timer-based
+  auto-resume (auto-retrying the same impossible operation
+  indefinitely would be pointless). See §11.3.2 for the full
+  indefinite-halt semantics.
 
 #### 11.2.8 Partial PhaseTransition execution
 
 - **Symptom:** A PhaseTransition entry's SELL or BUY orders fail
   mid-execution, leaving the system with an asset allocation matching
   neither the outgoing nor the incoming phase.
-- **Severity:** Critical (blocking).
+- **Severity:** Critical (self-healed weird).
 - **System response:** Cycle ends in inconsistent state. Phase
   indicator may have been updated (depending on where in the
   PhaseTransition execution the failure occurred — see §8.2.5).
   `operational_pause` is set with `pause_reason: "partial_phase_transition"`.
-  Per §11.3, the pause auto-resumes after
+  Per §11.3.1, the pause auto-resumes after
   `pause_auto_resume_hours` (default 48). The 48-hour window
   allows any in-flight broker orders to settle to terminal states
   (filled or rejected) before the next attempt.
@@ -4940,24 +4995,21 @@ serve different purposes.
 - **Symptom:** The `last_cycle_clientid` field in the operating state
   file shows two distinct values within a 24h window — meaning two
   different boxes' cycles both ran broker work within that span.
-- **Severity:** Critical (operator review required).
+- **Severity:** Critical (self-healed weird).
 - **System response:** Critical `split_brain_detected` alert
-  dispatched. `operational_pause` is set with
-  `pause_reason: "split_brain_detected"`. **This pause is NOT
-  eligible for auto-resume** — the operator must investigate and
-  clear it manually after confirming no duplicate execution
-  occurred at IBKR.
-- **Recovery:** Operator inspects the cycle log and the IBKR
-  account log to verify no duplicate orders were placed. The
-  broker layer's pre-place lookup (§15.5) almost certainly
-  prevented duplicates at execution time — defense layer 3
-  ensures any second cycle attempting the same client_order_id
-  finds the first's order and aborts via idempotent rediscovery.
-  But the *attempt* warrants investigation: why did both boxes
-  run cycles? Was Layer A's IP-tiebreak slow to fire? Operator
-  resolves the underlying cause (network partition, rsync
-  failure, host misconfiguration) and explicitly clears the
-  pause.
+  dispatched. No `operational_pause` is set. By the time Layer B
+  fires, the broker layer's pre-place lookup (§15.5, defense layer
+  3) has already prevented duplicate execution, and Layer A's
+  IP-tiebreak has resolved the state-file conflict; the system is
+  already in a consistent state. The alert is the receipt that
+  proves the system noticed.
+- **Recovery:** No system action required — the system continues
+  operating from the post-tiebreak state. The operator's role is
+  forensic: inspect the cycle log and the IBKR account log to
+  confirm no duplicate orders were placed (defense layer 3 should
+  have prevented this; the inspection verifies), and resolve the
+  underlying cause (network partition, rsync failure, host
+  misconfiguration) so future occurrences are less likely.
 
 The two layers complement each other: Layer A prevents state-file
 divergence in the steady state; Layer B catches the case where
@@ -4971,7 +5023,7 @@ that proves the system noticed.
 
 - **Symptom:** Process startup detects invalid `ruleset.yaml`
   (missing required field, type mismatch, internal inconsistency).
-- **Severity:** Critical (blocking).
+- **Severity:** Critical (hard broke).
 - **System response:** Process refuses to start (per I9). Logs and
   alerts. This is a pre-condition failure, not a runtime failure;
   the operational_pause framework doesn't apply (the process
@@ -4984,9 +5036,9 @@ that proves the system noticed.
 #### 11.2.13 Disk full
 
 - **Symptom:** State file write or log append fails with ENOSPC.
-- **Severity:** Critical (blocking).
+- **Severity:** Critical (self-healed weird).
 - **System response:** Cycle aborts. `operational_pause` is set
-  with `pause_reason: "disk_full"`. Per §11.3, auto-resume after
+  with `pause_reason: "disk_full"`. Per §11.3.1, auto-resume after
   48 hours retries; log rotation may have freed sufficient space
   by then.
 - **Recovery:** Most cases resolve via the daily log rotation
@@ -4998,34 +5050,61 @@ that proves the system noticed.
 
 #### 11.2.14 Broker inconsistency
 
-- **Symptom:** Broker layer raises `BrokerInconsistency` (§15.4):
-  IBKR returned data that violates an invariant IRAPM depends on.
-  Concrete cases:
-    - Connected account ID doesn't match `expected_account_id`
-      (§15.8) at connect time — defense against wrong-account
-      connection.
-    - Post-placement confirmation timed out (§15.5): an order was
-      submitted but did not appear in IBKR's open-orders table
-      within `POST_PLACEMENT_CONFIRMATION_WINDOW_SEC` (default 15s).
-      The order's true state is unknown.
-    - Pre-place query failed (§15.5): `get_recent_activity()`
-      raised, leaving the idempotency lookup blind; the cycle
-      refused to place rather than risk duplicate execution.
-    - A returned `Trade` carries data the broker layer can't
-      reconcile (impossible `execId` collision, wrong client_id
-      attribution, malformed numeric values, etc.).
-- **Severity:** Critical (operator review required).
-- **System response:** Cycle aborts. `operational_pause` is set
-  with `pause_reason: "broker_inconsistency"`. **NOT eligible
-  for auto-resume** — operator must investigate and clear the
-  pause.
-- **Recovery:** Operator reviews the cycle log, the IBKR
-  account log, and the alert content. Common root causes
-  include: paper-vs-live TWS port confusion (account mismatch),
-  TWS process restart between connect and place_order, IBKR-side
-  API version change that hasn't been verified against the
-  pinned ib_async version. After resolving the root cause,
-  operator explicitly clears the pause.
+`BrokerInconsistency` is raised by the broker layer (§15.4) when
+IBKR returns data that violates an invariant IRAPM depends on.
+The classification depends on whether the broker layer can trust
+its own state going forward — the sub-cases split into Hard-broke
+and Self-healed-weird categories.
+
+**Hard-broke sub-cases** — broker layer cannot trust IBKR's data:
+
+- **Connected account ID doesn't match `expected_account_id`
+  (§15.8) at connect time.** Defense against wrong-account
+  connection (e.g., paper-vs-live TWS port confusion). The cycle
+  cannot proceed; retrying would keep connecting to the wrong
+  account.
+- **A returned `Trade` carries data the broker layer can't
+  reconcile** (impossible `execId` collision, wrong `client_id`
+  attribution, malformed numeric values). Indicates ib_async /
+  IBKR API version drift or a TWS bug; retrying executes the
+  same broken code path against the same broker behavior.
+
+System response: Cycle aborts. `operational_pause` is set with
+`pause_reason: "broker_inconsistency"`. NOT eligible for
+auto-resume. Severity: **Critical (hard broke)**.
+
+Recovery: Operator reviews the alert content and the cycle log,
+resolves the root cause (correct the TWS port configuration, or
+verify and update the pinned ib_async version against the current
+IBKR API), and explicitly clears the pause.
+
+**Self-healed-weird sub-cases** — broker layer's state is
+temporarily ambiguous but the next cycle's fresh broker query
+resolves it:
+
+- **Post-placement confirmation timed out (§15.5):** an order
+  was submitted but did not appear in IBKR's open-orders table
+  within `POST_PLACEMENT_CONFIRMATION_WINDOW_SEC` (default 15s).
+  The order's true state is unknown at this instant — but the
+  next cycle's pre-place lookup queries IBKR for recent
+  activity (§15.6 defense layer 3) and either finds the order
+  (use the existing fill) or doesn't (place anew, idempotently).
+- **Pre-place query failed (§15.5):** `get_recent_activity()`
+  raised, leaving the idempotency lookup blind. The cycle
+  refused to place rather than risk duplicate execution. The
+  next cycle retries the query; persistent failure escalates to
+  `broker_connectivity_loss` (§11.2.1) which is itself
+  self-healed-weird.
+
+System response: Cycle aborts; alert dispatched. No
+`operational_pause` is set — the next cycle's fresh broker
+query resolves the ambiguity automatically via the established
+idempotency mechanism. Severity: **Critical (self-healed weird)**.
+
+Recovery: No system action required. The alert exists for
+operator forensics — repeated occurrences may indicate a TWS or
+network issue worth investigating, but the system is operating
+correctly.
 
 #### 11.2.15 External account activity overlap
 
@@ -5034,29 +5113,60 @@ that proves the system noticed.
   IRAPM is about to act on, OR — more rarely — on a symbol where
   IRAPM has an open order. This is detected at the action layer's
   pre-place check (§15.6 case 4).
-- **Severity:** Critical (operator acknowledgment required).
-- **System response:** Cycle aborts before placing any orders.
-  `operational_pause` is set with `pause_reason:
-  "external_activity_overlap"`. NOT eligible for auto-resume.
-- **Recovery:** Operator reviews the activity in the IBKR portal
-  to identify what was placed manually and why. If the activity
-  was intentional and the operator wants IRAPM to proceed with
-  the new positions as baseline, the operator explicitly clears
-  the pause; the next cycle re-reads broker state and decides
-  against the post-manual-activity reality. If the activity was
-  unintentional (account compromise, accidental order), operator
-  may need to take separate IBKR-side action before clearing.
+- **Severity:** Critical (self-healed weird).
+- **System response:** Cycle aborts before placing any orders. No
+  `operational_pause` is set. The declination to act *is* the
+  heal: the system has correctly refused to place orders against
+  potentially-compromised state, and the next cycle re-reads
+  broker state fresh and decides against post-manual-activity
+  reality. Critical alert dispatched for operator awareness.
+- **Recovery:** No system action required. The next cycle
+  proceeds against the new positions as baseline. The alert
+  exists for operator forensics — the operator reviews the
+  activity in the IBKR portal to identify what was placed
+  manually and why. If the activity was unintentional (account
+  compromise, accidental order), operator takes separate
+  IBKR-side action; IRAPM's continued operation against the new
+  baseline is not the safety concern (the broker layer's
+  idempotency mechanism handles all subsequent activity
+  correctly).
 
-  The strict pause-on-overlap behavior protects against scenarios
-  where the operator's manual activity and IRAPM's scheduled
-  cycle would race; forcing operator acknowledgment ensures the
-  human is in the loop before any further automated trading.
+  The system-continues-operating-against-fresh-state behavior is
+  consistent with §1.4's failure-quiet principle: an
+  absent-operator cannot acknowledge anything, and indefinite
+  pause on every external-activity event would freeze the system
+  on any unrelated account activity (legitimate dividend
+  routing, residual cash sweeps, broker-side rebalances).
 
-### 11.3 Operational pause (auto-resuming)
+### 11.3 Halt mechanisms
 
-The `operational_pause` state replaces the earlier single-flag
-`paused_pending_recovery` model. It is a structure in the persistent
-state file:
+IRAPM has two parallel halt mechanisms with different semantics.
+Both can be active simultaneously (rare, but possible if a Critical
+failure pauses the system before cascade exhaustion clears).
+
+**Operational pause** (`operational_pause`) — generic halt applied
+to Critical failures. The pause-reason determines whether auto-
+resume applies: Self-healed-weird reasons auto-resume after a
+timer; Hard-broke reasons do not auto-resume (only external action
+can clear them, per the §11.1 framework and D-SPEC-8). The full
+mechanism is specified in §11.3.1 below.
+
+**Indefinite halt** (`withdrawal_capacity_exhausted`) — non-auto-
+resuming, withdrawal-only halt applied when the portfolio cannot
+fund a scheduled withdrawal at residual floors. The full mechanism
+is specified in §11.3.2 below.
+
+The two mechanisms use distinct state fields (`operational_pause`
+struct vs `withdrawal_capacity_exhausted` boolean) and follow
+distinct lifecycles. Neither requires operator state-file edits;
+both clear automatically when their respective recovery conditions
+are met (auto-resume timer for the Self-healed-weird pauses;
+external action for the Hard-broke pauses and for
+`withdrawal_capacity_exhausted`).
+
+#### 11.3.1 Operational pause
+
+`operational_pause` is a structure in the persistent state file:
 
 ```
 operational_pause = {
@@ -5073,12 +5183,28 @@ proceeding to decision or action layers. The cycle dispatches a
 `pause_initiated` (first cycle) or `pause_re_alert` (subsequent
 cycles) alert.
 
-**Auto-resume.** When `pause_started_at + pause_auto_resume_hours`
-(default 48) has elapsed, the next cycle observes the threshold,
-clears the pause structure (`paused: false`, `pause_reason: null`),
-emits a `pause_auto_resumed` alert, and proceeds with normal cycle
+**Auto-resume.** For Self-healed-weird pause reasons
+(`partial_phase_transition`, `order_rejection`, `disk_full`):
+when `pause_started_at + pause_auto_resume_hours` (default 48)
+has elapsed, the next cycle observes the threshold, clears the
+pause structure (`paused: false`, `pause_reason: null`), emits a
+`pause_auto_resumed` alert, and proceeds with normal cycle
 execution. The cycle reads fresh broker state and produces a new
 plan that reflects whatever happened during the pause window.
+
+**No auto-resume for Hard-broke reasons.** Pauses with
+`pause_reason` in `{internal_consistency_violation,
+broker_inconsistency}` do not auto-resume. The system continues
+running scheduled cycles (which abort after step 1, dispatching
+`pause_re_alert` each time) until external action resolves the
+underlying issue. There is no operator state-file edit path —
+recovery comes from resolving the root cause (deploying a code
+fix for `internal_consistency_violation`, or fixing the broker
+configuration / library version for `broker_inconsistency`),
+after which the next cycle finds the condition cleared and
+resumes normal operation. See D-SPEC-8 for why these specific
+pause types reject the failure-quiet preference of automatic
+recovery.
 
 If the next cycle's plan re-triggers the **same pause condition**,
 `consecutive_pause_count` is incremented. When `consecutive_pause_count >= 4`,
@@ -5089,46 +5215,86 @@ unmissable signal).
 
 **Pause-reason catalog:**
 
-| `pause_reason` | Source failure | Auto-resume? | Notes |
-|---|---|---|---|
-| `partial_phase_transition` | §11.2.8 | Yes (48h) | Next cycle re-reads broker state and completes the transition |
-| `order_rejection` | §11.2.2 | Yes (48h) | Next cycle re-decides against fresh state; consecutive-escalation at N=4 |
-| `disk_full` | §11.2.13 | Yes (48h) | Disk may have freed via log rotation by next attempt |
-| `withdrawal_capacity_exhausted` | §11.2.7 (cascade exhaustion) | **NO — permanent halt** | Portfolio cannot fund withdrawals; resume is irrelevant without external intervention |
-| `state_file_corrupt` | §11.2.3 | N/A — refuses to start | Slave promotion handles this per §9.4.2 |
-| `configuration_validation` | §11.2.12 | N/A — refuses to start | Operator must fix `ruleset.yaml` before restart |
+| `pause_reason` | Source failure | Category | Auto-resume? | Notes |
+|---|---|---|---|---|
+| `partial_phase_transition` | §11.2.8 | Self-healed weird | Yes (48h) | Next cycle re-reads broker state and completes the transition |
+| `order_rejection` | §11.2.2 | Self-healed weird | Yes (48h) | Next cycle re-decides against fresh state; consecutive-escalation at N=4 |
+| `disk_full` | §11.2.13 | Self-healed weird | Yes (48h) | Disk may have freed via log rotation by next attempt |
+| `internal_consistency_violation` | §7.3.2 step 4 | Hard broke | No | Assertion-failure semantics; same software bug will re-fire on retry — see D-SPEC-8 |
+| `broker_inconsistency` | §11.2.14 (hard-broke sub-cases) | Hard broke | No | Account-ID mismatch or malformed Trade data; broker-state cannot be trusted — see D-SPEC-8 |
 
-Conditions explicitly NOT setting operational_pause (alert only, no
-halt):
-- Broker disconnect (§11.2.1) — transient; auto-recovers on retry
-- ACH update failure (§8.2.7) — system continues at prior ACH amount;
-  external (IBKR-side) operator action required
-- Master/slave split-brain resolved (§11.2.11) — tiebreak completed
-  automatically; Notice alert only
+Each value's category column reflects the operator-relevance framework
+of §11.1: auto-resuming pauses are Self-healed-weird (the system
+resumes itself after a brief window of letting transient conditions
+clear); non-auto-resuming pauses are Hard-broke (no automatic
+recovery is safe or meaningful).
+
+Conditions explicitly NOT setting `operational_pause` (alert only,
+no halt):
+- Broker disconnect (§11.2.1) — Self-healed weird; transient,
+  auto-recovers on next cycle's reconnect.
+- Layer B split-brain detected (§11.2.11) — Self-healed weird; by
+  the time detection fires, IP-tiebreak and broker idempotency
+  have already restored consistency.
+- External account activity overlap (§11.2.15) — Self-healed
+  weird; the system has correctly refused to act on suspicious
+  data and the next cycle proceeds against fresh state.
+- Broker inconsistency, transient sub-cases (§11.2.14) — Self-
+  healed weird; post-placement confirmation timeout and pre-place
+  query failure both resolve on the next cycle's fresh broker
+  query.
+- ACH update failure (§8.2.7) — system continues at prior ACH
+  amount; IBKR-side operator action required when the operator
+  returns, but the system itself is not halted.
 - Signal UNAVAILABLE (§11.2.5) — CB state holds; system continues
+  per §5's degraded-gracefully design.
 
-**Permanent halt: `withdrawal_capacity_exhausted`.** This is the only
-indefinite-stop state. It is set when cascade sourcing reaches all
-three stages (SGOV, FI, Growth) at residual floor with demand unmet
-(§7.3.2 step 4). When set:
+Refuse-to-start conditions (`state_file_corrupt` per §11.2.3,
+`configuration_validation` per §11.2.12) are not pause_reason
+values — they prevent process startup, so no state file is ever
+written with these values. Both are Hard-broke per §11.1, but
+they manifest as process refusal rather than as runtime pauses.
 
-- Future withdrawal attempts are suppressed (no point in trying).
-- All other system functions continue: CB state machine, signal,
-  weekly alerts, the buffer/cash buckets to the extent any value
-  remains.
-- The weekly summary alert re-fires the
-  `withdrawal_capacity_exhausted` condition every cycle.
-- Auto-clears only if the portfolio recovers above a configurable
-  threshold (unlikely once exhausted; possible via residual position
-  dividends or external operator action transferring cash into the
-  account).
+Cascade exhaustion (§11.2.7) is also not in this catalog; it uses
+the separate `withdrawal_capacity_exhausted` flag per §11.3.2.
 
-**The operator never edits the state file.** All auto-resume and
-clear paths are system-managed. The `withdrawal_capacity_exhausted`
-halt is intentionally permanent because there is no recovery
-IRAPM can perform on its own — the portfolio cannot meet demand,
-and only external action (operator returning, depositing funds,
-closing the account, etc.) changes the situation.
+#### 11.3.2 Indefinite halt (`withdrawal_capacity_exhausted`)
+
+The `withdrawal_capacity_exhausted` boolean is a sibling state flag
+to `operational_pause`. It is set when withdrawal sourcing reaches
+all three cascade stages (SGOV, FI, Growth) at residual floor with
+demand unmet (§7.3.2 step 4, §11.2.7).
+
+**Scope.** The halt is **withdrawal-only**. While the flag is true:
+- Scheduled withdrawal cycles abort before SELL execution.
+- All other system functions continue normally: CB state machine,
+  signal computation, weekly summary alerts, rebalancing if any
+  value remains, daily-token monitoring, master/slave coordination.
+- The weekly summary re-fires the `withdrawal_capacity_exhausted`
+  condition every cycle.
+
+**Auto-clear.** The flag has exactly one auto-clear path: at each
+subsequent withdrawal cycle, the system evaluates whether
+SGOV+FI+Growth above-residual ≥ current monthly withdrawal demand.
+If yes, the flag clears that cycle and normal withdrawal sourcing
+resumes. The trigger condition for setting the flag is its own
+inverse — the same cascade evaluation that set it clears it.
+
+There is **no 48-hour timer-based auto-resume** (unlike
+`operational_pause`). There is **no operator state-file edit
+path**; recovery happens through cash appearing in the managed
+account (per the §2.9 "cash appears, system reacts" mechanism),
+which the cascade re-evaluation picks up automatically on the next
+withdrawal cycle.
+
+The asymmetry vs `operational_pause` reflects the underlying
+condition. `operational_pause` recovers because the failure was
+transient — a 48-hour retry against fresh state is meaningful.
+`withdrawal_capacity_exhausted` recovers because cash genuinely
+returned to the portfolio — a timer-based retry would either
+fire pointlessly (cash hasn't returned) or fire after it didn't
+need to (cash already returned, and the next withdrawal cycle
+catches it anyway).
 
 ### 11.4 Recovery alert cadence
 
@@ -5355,7 +5521,8 @@ and exits are signal-based only.
 | `withdrawal_executed` | Monthly withdrawal completed successfully | Info | Both |
 | `withdrawal_failed` | SELL or ACH failure during withdrawal cycle | Critical | Both |
 | `cascade_growth_source` | Withdrawal cascade reached Growth stage (§7.3.2 step 3) | Critical | Both |
-| `withdrawal_capacity_exhausted` | Cascade exhaustion permanent halt set (§11.2.7) | Critical | Both |
+| `withdrawal_capacity_exhausted` | Cascade exhaustion indefinite halt set (§11.2.7) | Critical | Both |
+| `monthly_payment_ceiling_bound` | Phase 3 monthly payment clamped at portfolio-based ceiling (§4.1.1.2, §6.5.1) | Notice | Both |
 
 **Cash deployment:**
 
@@ -5379,14 +5546,25 @@ and exits are signal-based only.
 | `token_unavailable` | Daily-token cycle fails to enumerate USB devices | Notice (escalating per §10.4) | Both |
 | `stopincome_stuck_alert` | STOP INCOME paused >12 months threshold reached; quarterly re-alert | Notice | Both |
 
-**Operational pause alerts (per §11.3):**
+**Operational pause alerts (per §11.3.1):**
 
 | `alert_id` | Trigger | Severity | Channels |
 |---|---|---|---|
 | `pause_initiated` | `operational_pause` set on first cycle | Notice | Both |
 | `pause_re_alert` | Subsequent cycle while paused | Notice | Both |
-| `pause_auto_resumed` | Auto-resume cycle clears pause | Notice | Both |
+| `pause_auto_resumed` | Auto-resume cycle clears pause (Self-healed-weird only) | Notice | Both |
 | `pause_consecutive_escalation` | `consecutive_pause_count` ≥ 4 same-reason | Warning | Both |
+| `internal_consistency_violation` | §7.3.2 step 4 hard-broke pause set | Critical | Both |
+| `broker_inconsistency` | §11.2.14 hard-broke sub-case pause set | Critical | Both |
+
+**Non-paused Critical-event alerts (per D-SPEC-8; the system has
+already healed, no `operational_pause` set):**
+
+| `alert_id` | Trigger | Severity | Channels |
+|---|---|---|---|
+| `split_brain_detected` | §11.2.11 Layer B post-hoc detection | Critical | Both |
+| `external_activity_overlap` | §11.2.15 unrecognized broker activity detected | Critical | Both |
+| `broker_inconsistency_transient` | §11.2.14 transient sub-case (post-placement timeout / pre-place query failure) | Critical | Both |
 
 **ACH and broker alerts:**
 
@@ -5416,7 +5594,6 @@ and exits are signal-based only.
 
 | `alert_id` | Trigger | Severity | Channels |
 |---|---|---|---|
-| `fi_overweight_persistent_suppression` | §7.5.1 suppression persists > threshold weeks | Warning | Both |
 | `alerter_failure_recovered` | Post-hoc: alerter dispatch failed previously; channels recovered | Warning | Both |
 
 **Mandatory weekly:**
@@ -5505,7 +5682,7 @@ Multi-cycle scenarios where state evolves across cycles:
 - Withdrawal sourcing across CB state transitions mid-month
 - Operational pause auto-resume scenarios: partial-transition,
   order-rejection (single and N=4 consecutive); disk-full
-- Cascade exhaustion → `withdrawal_capacity_exhausted` permanent halt
+- Cascade exhaustion → `withdrawal_capacity_exhausted` indefinite halt
 
 ### 13.4 Simulator tests (IPMS)
 
@@ -5782,18 +5959,32 @@ a complete operator runbook. The runbook should cover, at minimum:
   operator resolves the IBKR-side issue. The procedure must be
   written for the survivor as audience — assume no programming or
   systems-admin skill, only basic web-browser familiarity.
-- **Operator pause-clearing procedures.** Three §11.2 failure modes
-  produce operational pauses NOT eligible for auto-resume and
-  require explicit operator clearance:
-  - `broker_inconsistency` (§11.2.14) — investigation procedure
-    for each of the four concrete causes
-  - `external_activity_overlap` (§11.2.15) — review IBKR account
-    log, confirm the manual activity was intentional, decide
-    whether to proceed with new positions as baseline
-  - `split_brain_detected` (§11.2.11 Layer B) — review cycle logs
-    on both boxes, confirm no duplicate orders at IBKR, resolve
-    the underlying cause (rsync failure, network partition,
-    box misconfiguration) before clearing
+- **Operator pause-clearing procedures.** Two §11.2 failure modes
+  produce operational pauses that do not auto-resume and require
+  external action before the next cycle succeeds (per D-SPEC-8):
+  - `internal_consistency_violation` (§7.3.2 step 4) — assertion-
+    failure semantics; indicates a software bug. Investigation
+    procedure: review the cycle log to identify which sourcing
+    branch fired the violation, compare against current CB state
+    and resource conditions, deploy code fix or spec update.
+    Pause clears automatically when the next cycle finds the
+    bug-triggering condition no longer present (typically because
+    the underlying state has changed or a code fix has been
+    deployed).
+  - `broker_inconsistency` hard-broke sub-cases (§11.2.14
+    account-ID mismatch and malformed Trade data) — investigation
+    procedure: verify TWS/Gateway configuration matches
+    `expected_account_id`, check pinned ib_async version against
+    current IBKR API. Pause clears automatically when the next
+    cycle's broker connection succeeds without raising
+    `BrokerInconsistency`.
+
+  Three §11.2 failure modes that previously required operator
+  clearance now alert only and do not pause (per D-SPEC-8):
+  `split_brain_detected` (§11.2.11 Layer B), `external_activity_overlap`
+  (§11.2.15), and `broker_inconsistency` transient sub-cases. The
+  operator still reviews these for forensics, but the system
+  continues operating.
 - **Broker library maintenance procedure.** Pinned ib_async version
   in `requirements.txt`. Quarterly check for library updates;
   major-version upgrades go through paper-trading verification
@@ -6034,7 +6225,7 @@ exceptions never escape:
 | `BrokerNotReady` | Method called before `connect()`, or connection lost mid-cycle | Cycle aborts at step 1 (§6.5). §11.2.1 broker_connectivity_loss. Next cycle retries; no operational_pause. |
 | `BrokerUnreachable` | TCP/auth/timeout failure (subtype of `BrokerNotReady`) | Same as above; distinguished for log/alert clarity. |
 | `BrokerRejection` | Broker accepted the request and explicitly refused (e.g., order rejected, insufficient buying power) | Cycle aborts. `operational_pause` set with `pause_reason='order_rejection'`. §11.2.2. 48h auto-resume. |
-| `BrokerInconsistency` | Broker returned data violating an invariant (account mismatch, post-placement timeout, etc.) | Cycle aborts. `operational_pause` set with `pause_reason='broker_inconsistency'`. §11.2.X. **NOT eligible for auto-resume** — operator must review. |
+| `BrokerInconsistency` | Broker returned data violating an invariant (account mismatch, post-placement timeout, etc.) | Sub-case dependent (§11.2.14): hard-broke cases (account-ID mismatch, malformed Trade data) set `operational_pause` with `pause_reason='broker_inconsistency'`, no auto-resume; self-healed-weird cases (post-placement timeout, pre-place query failure) alert only, no pause. |
 
 `BrokerInconsistency` is the most consequential category. It signals
 "something is deeply wrong, halt and alert" — distinct from
@@ -6111,7 +6302,7 @@ otherwise cause duplicate execution:
 5. **External operator activity.** Operator manually placed an
    order via TWS portal. The recent_activity query returns it with
    empty `client_order_id` (no orderRef); the action layer treats
-   this as `external_activity_overlap` (§11.2.X).
+   this as `external_activity_overlap` (§11.2.15).
 
 6. **Library-level retry.** ib_async retries `placeOrder` on a
    transient error and submits twice. IBKR sees two orders with
@@ -6185,8 +6376,9 @@ for any order whose `orderRef` matches the proposed
    for investigation.
 
 4. **Match with empty `orderRef` (no cycle_-prefix in orderRef).**
-   External operator activity. `pause_reason =
-   'external_activity_overlap'` (§11.2.X).
+   External operator activity. Cycle aborts; `external_activity_overlap`
+   Critical alert fires; no `operational_pause` is set per §11.2.15
+   and D-SPEC-8 — the cycle's declination to act is the heal.
 
 **Post-cycle split-brain detection:**
 
@@ -6194,8 +6386,7 @@ The cycle records its `last_cycle_clientid` (the client_id used
 for the cycle) in the operating state file alongside other state.
 If two different `last_cycle_clientid` values appear within a 24h
 window, the alerter raises a Critical `split_brain_detected` alert
-and `operational_pause` is set with `pause_reason =
-'split_brain_detected'`. This is post-hoc detection — the cycle
+per §11.2.11 Layer B. This is post-hoc detection — the cycle
 itself has completed without harm thanks to the pre-place lookup;
 the alert is the receipt that proves the system noticed.
 
@@ -6511,7 +6702,7 @@ respective recovery buffers.
 **Cascade exhaustion.** Failure mode where withdrawal sourcing
 reaches all three cascade stages (SGOV, FI, Growth) at residual
 floor with demand still unmet (§7.3.2 step 4, §11.2.7). Triggers
-the `withdrawal_capacity_exhausted` permanent halt per §11.3.
+the `withdrawal_capacity_exhausted` indefinite halt per §11.3.2.
 
 **Cycle.** A single execution of the system's main loop (§3.8). Four
 types: weekly, monthly-withdrawal, annual-review, daily-token.
@@ -6589,15 +6780,18 @@ observations only.
 **operational_pause.** A structure in the state file that gates
 cycle execution while paused. Set automatically by Critical-blocking
 failures; auto-resumes after `pause_auto_resume_hours` (default 48)
-(§11.3).
+(§11.3.1).
 
-**withdrawal_capacity_exhausted.** A permanent-halt flag in the state
-file, set when cascade sourcing reaches all three stages at residual
-floor with demand unmet (§7.3.2 step 4, §11.2.7). Suppresses future
-withdrawal attempts but does not stop other system functions. Unlike
-`operational_pause`, this flag has no auto-resume; the portfolio
-cannot fund withdrawals and external operator action is required
-(§11.3).
+**withdrawal_capacity_exhausted.** An indefinite-halt flag in the
+state file, set when cascade sourcing reaches all three stages at
+residual floor with demand unmet (§7.3.2 step 4, §11.2.7).
+Suppresses future withdrawal attempts but does not stop other
+system functions. Unlike `operational_pause`, the flag has no
+48-hour timer-based auto-resume; instead, it auto-clears at the
+next withdrawal cycle when SGOV+FI+Growth above-residual ≥ current
+monthly withdrawal demand. Recovery happens through cash appearing
+in the managed account, picked up automatically via the §2.9 "cash
+appears, system reacts" mechanism (§11.3.2).
 
 **Phase.** One of PHASE_1, PHASE_2, PHASE_3 (§3.9, §4). Determines
 asset allocation, withdrawal calculation, and active subsystems.

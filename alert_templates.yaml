@@ -447,7 +447,8 @@ cascade_growth_source:
     The withdrawal succeeded — funds will be delivered as scheduled.
     However, the portfolio is now near its absolute floor. If withdrawals
     continue to draw from Growth, the next cycle may trigger cascade
-    exhaustion (permanent halt of withdrawals — see §11.2.7).
+    exhaustion — an indefinite halt of withdrawals (NOT permanent;
+    auto-clears when capacity returns) per §11.2.7.
 
     Operator review recommended. Possible actions:
     - Review the operator's separate runbook for portfolio-near-floor
@@ -460,8 +461,10 @@ cascade_growth_source:
 
 withdrawal_capacity_exhausted:
   # Fires when cascade exhaustion sets withdrawal_capacity_exhausted: true
-  # (§11.2.7). PERMANENT HALT for withdrawals. Re-fires every weekly cycle
-  # while the flag is set.
+  # (§11.2.7). Indefinite halt for withdrawals (NOT permanent — D-SPEC-5).
+  # The flag auto-clears at the next withdrawal cycle when capacity returns
+  # (SGOV+FI+Growth above-residual ≥ current monthly withdrawal). Re-fires
+  # every weekly cycle while the flag is set.
   # Placeholders: {timestamp}, {portfolio_value}, {monthly_withdrawal},
   #               {months_realert_count}
   subject: "IRAPM CRITICAL: Withdrawal capacity EXHAUSTED — portfolio cannot fund demand"
@@ -474,31 +477,40 @@ withdrawal_capacity_exhausted:
 
     All three cascade stages (SGOV buffer, FI bucket, Growth bucket)
     have reached residual floor. The portfolio cannot fund the
-    scheduled withdrawal demand. This is a PERMANENT HALT for
-    withdrawals.
+    scheduled withdrawal demand. The system has set the
+    `withdrawal_capacity_exhausted` flag.
 
-    The system has set the `withdrawal_capacity_exhausted` flag.
-    Future withdrawal attempts are suppressed (no point in trying).
-    All other system functions continue normally:
+    This is an INDEFINITE HALT for withdrawals — not permanent. Future
+    withdrawal attempts are suppressed (no point retrying the same
+    impossible operation), but the flag auto-clears the next time
+    withdrawal capacity returns. Specifically: at the next withdrawal
+    cycle, if SGOV+FI+Growth above-residual is at least the current
+    monthly withdrawal demand, the flag clears and normal withdrawal
+    behavior resumes. No state-file edit is required.
+
+    All other system functions continue normally during the halt:
     - Circuit breaker monitoring
     - Signal computation
+    - Rebalancing (per CB state)
     - Weekly summary alerts (you are reading one now)
     - Any remaining position dividends accrue normally
 
-    External operator action is required. Possible paths:
+    External operator action is required to restore capacity. Possible
+    paths:
     - Deposit external funds to restore portfolio above thresholds
-      (the flag will auto-clear when capacity returns)
+      (the §2.9 "cash appears, system reacts" mechanism picks it up
+      at the next withdrawal cycle automatically)
     - Close the IRAPM account and transition to other income sources
     - Reduce the scheduled withdrawal amount (operator must edit
       ruleset.yaml — but note the system cannot change the IBKR-side
       recurring ACH without a successful withdrawal cycle, so this
       requires manual intervention via the IBKR Portal as well)
 
-    See spec §11.2.7 and §11.3 for the full mechanism. The runbook
+    See spec §11.2.7 and §11.3.2 for the full mechanism. The runbook
     (§14.4) contains the survivor-facing procedures.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM CRITICAL: WITHDRAWAL CAPACITY EXHAUSTED. Portfolio cannot fund withdrawals. See email — external action required."
+  sms: "IRAPM CRITICAL: WITHDRAWAL CAPACITY EXHAUSTED. Portfolio cannot fund withdrawals. Clears when capacity returns. See email — external action required."
 
 
 # -----------------------------------------------------------------------------
@@ -748,51 +760,83 @@ stopincome_stuck_alert:
 
 pause_initiated:
   # Fires on first cycle that sets operational_pause: true.
-  # Placeholders: {timestamp}, {pause_reason}, {reason_detail},
-  #               {auto_resume_at}
+  # Per D-SPEC-8, pause auto-resume depends on pause_reason:
+  #   Self-healed weird (partial_phase_transition, order_rejection, disk_full):
+  #     48h auto-resume; auto_resume_at is set; pause_category="self_healed_weird"
+  #   Hard broke (internal_consistency_violation, broker_inconsistency):
+  #     no auto-resume; auto_resume_at is "N/A — external action required"
+  #     in the placeholder substitution; pause_category="hard_broke"
+  # Placeholders: {timestamp}, {pause_reason}, {pause_category},
+  #               {reason_detail}, {auto_resume_at}, {recovery_summary}
   subject: "IRAPM: Operational pause — {pause_reason}"
   body: |
     The system has entered an operational pause at {timestamp}.
 
     Pause reason: {pause_reason}
+    Category: {pause_category}
     Detail: {reason_detail}
-    Auto-resume scheduled for: {auto_resume_at} (48 hours from pause)
+    Auto-resume: {auto_resume_at}
 
     Cycle execution is suspended. Each scheduled cycle while paused
     runs only through input refresh, then aborts without entering the
     decision or action layers. Alerts continue to dispatch normally.
 
-    Per §11.3, this pause WILL auto-resume after 48 hours. The next
-    cycle reads fresh broker state and produces a fresh plan. You
-    should NOT need to manually edit the state file. If the underlying
-    issue has resolved (broker transient, network issue, etc.), the
-    next cycle will execute cleanly. If the issue persists, the
-    system will pause again and the consecutive-pause counter will
-    increment.
+    What happens next:
+    {recovery_summary}
+
+    For Self-healed-weird pauses (auto-resume): per §11.3.1, the
+    pause auto-resumes after 48 hours. The next cycle reads fresh
+    broker state and produces a fresh plan. You should NOT need to
+    manually edit the state file. If the underlying issue has resolved
+    (broker transient, network issue, disk space, etc.), the next
+    cycle executes cleanly. If the issue persists, the system pauses
+    again and the consecutive-pause counter increments.
+
+    For Hard-broke pauses (no auto-resume): the underlying condition
+    is one that retry alone cannot fix — a software bug
+    (internal_consistency_violation) or a broker-state issue the
+    broker layer cannot trust (broker_inconsistency). The pause
+    clears automatically when the underlying condition is gone (a
+    code fix has been deployed, or broker configuration is corrected).
+    No state-file edit is needed; the next cycle naturally finds the
+    condition resolved and resumes.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM: PAUSED — {pause_reason}. Auto-resume in 48h. See email."
+  sms: "IRAPM: PAUSED — {pause_reason} ({pause_category}). See email."
 
 pause_re_alert:
-  # Fires on each subsequent cycle while paused, until auto-resume or
-  # consecutive escalation.
-  # Placeholders: {timestamp}, {pause_reason}, {hours_remaining},
-  #               {consecutive_pause_count}
-  subject: "IRAPM: Still paused — {pause_reason} ({hours_remaining}h until auto-resume)"
+  # Fires on each subsequent cycle while paused, until auto-resume
+  # (self-healed weird) or external resolution (hard broke).
+  # Placeholders: {timestamp}, {pause_reason}, {pause_category},
+  #               {time_remaining_or_status}, {consecutive_pause_count}
+  # time_remaining_or_status:
+  #   Self-healed weird: "{N}h until auto-resume"
+  #   Hard broke: "auto-resume not applicable — awaiting external resolution"
+  subject: "IRAPM: Still paused — {pause_reason} ({time_remaining_or_status})"
   body: |
     The system remains paused at {timestamp}.
 
     Pause reason: {pause_reason}
-    Hours until auto-resume: {hours_remaining}
+    Category: {pause_category}
+    Status: {time_remaining_or_status}
     Consecutive pauses for this reason: {consecutive_pause_count}
 
-    No new action required. The system will auto-resume at the
-    scheduled time and re-evaluate. This alert exists to confirm the
-    pause is still ongoing — its absence would indicate the system
-    has unexpectedly stopped emitting alerts.
+    No new action required from this alert alone. The pause is still
+    in its expected lifecycle.
+
+    For Self-healed-weird pauses: the system will auto-resume at the
+    scheduled time and re-evaluate.
+    For Hard-broke pauses: the system continues running scheduled
+    cycles (which abort after input refresh and dispatch this alert
+    each time). The pause clears automatically when the underlying
+    condition is gone.
+
+    This alert exists to confirm the pause is still ongoing — its
+    absence would indicate the system has unexpectedly stopped
+    emitting alerts.
 
     Cycle ID: {cycle_id}
-  sms: "IRAPM: Still paused ({pause_reason}). Auto-resume in {hours_remaining}h."
+  sms: "IRAPM: Still paused ({pause_reason}). {time_remaining_or_status}."
 
 pause_auto_resumed:
   # Fires when auto-resume cycle clears the pause and proceeds.
@@ -819,17 +863,31 @@ pause_auto_resumed:
 pause_consecutive_escalation:
   # Fires when consecutive_pause_count reaches 4 for the same pause_reason.
   # Severity escalates to Warning so a returning operator sees an
-  # unmissable pattern.
-  # Placeholders: {timestamp}, {pause_reason}, {consecutive_count}
+  # unmissable pattern. Applies to Self-healed-weird pauses primarily
+  # (auto-resume cycle keeps re-pausing); Hard-broke pauses don't
+  # technically "recur" since they don't auto-resume, but the
+  # consecutive_pause_count still increments per pause_re_alert and the
+  # escalation can fire if the underlying condition stays unresolved
+  # long enough.
+  # Placeholders: {timestamp}, {pause_reason}, {pause_category},
+  #               {consecutive_count}
   subject: "IRAPM WARNING: Pause has recurred {consecutive_count} times — {pause_reason}"
   body: |
-    The system has entered the same operational pause {consecutive_count}
-    times in a row, all for reason: {pause_reason}.
+    The same operational pause has been observed {consecutive_count}
+    times in a row, all for reason: {pause_reason}
+    (category: {pause_category}).
 
-    Each pause has auto-resumed after 48 hours per the normal
-    mechanism. However, the persistent recurrence indicates the
-    underlying issue is NOT being resolved by retry alone — operator
-    intervention is likely needed.
+    For Self-healed-weird pauses (auto-resume after 48h): each
+    occurrence has auto-resumed but the next cycle re-triggers the
+    same condition. The persistent recurrence indicates the underlying
+    issue is NOT being resolved by retry alone — operator intervention
+    is likely needed.
+
+    For Hard-broke pauses (no auto-resume): the pause is persisting
+    across many cycles because the underlying condition (software
+    bug, broker configuration issue) remains unresolved. The
+    re-alerts are accumulating into the escalation count to make the
+    situation visibly louder.
 
     Common reasons this pattern occurs:
     - Order rejection: broker-side flag or permission issue that
@@ -838,15 +896,241 @@ pause_consecutive_escalation:
       the system keeps reproducing
     - Disk full: log rotation isn't reclaiming enough space, or a
       runaway log file
-    - State file or filesystem corruption that intermittently
-      surfaces
+    - Internal consistency violation: a software bug that fires on
+      the same code path each cycle
+    - Broker inconsistency: TWS configuration drift, ib_async version
+      mismatch, or account-ID misconfiguration
 
-    The system continues to operate — it will keep auto-retrying.
-    But the alert pattern is now visibly louder so the returning
-    operator cannot miss it. Manual investigation is warranted.
+    The system continues to operate scheduled cycles (which abort
+    after input refresh). Manual investigation is warranted.
 
     Cycle ID: {cycle_id}
   sms: "IRAPM WARN: Pause recurred {consecutive_count}x for {pause_reason}. Manual review warranted."
+
+internal_consistency_violation:
+  # Fires when the cycle hits a §7.3.2 step 4 assertion-failure
+  # condition. Critical (hard broke) per D-SPEC-8: sets operational_pause
+  # with pause_reason='internal_consistency_violation', no auto-resume.
+  # The same software bug will re-fire on retry, so the pause holds
+  # until a code fix is deployed.
+  # Placeholders: {timestamp}, {violation_detail}, {cycle_log_ref}
+  subject: "IRAPM CRITICAL: Internal consistency violation — software bug detected"
+  body: |
+    The system detected an internal consistency violation at
+    {timestamp} and has set operational_pause with
+    pause_reason='internal_consistency_violation'.
+
+    Violation detail:
+    {violation_detail}
+
+    This is a Critical (hard broke) condition per the §11.1 framework:
+    the system has hit an assertion-failure-style condition where its
+    own logic cannot proceed safely. The most likely cause is a
+    software bug — the code path produced a state that violates an
+    invariant the system depends on.
+
+    The pause does NOT auto-resume. Retrying the same software with
+    the same state would just re-trigger the same violation. Recovery
+    requires a code fix or a state change that takes the system out
+    of the violation-triggering condition.
+
+    What happens next:
+    - The system continues to run scheduled cycles. Each one aborts
+      after input refresh, dispatches a pause_re_alert, and exits.
+    - Once a code fix is deployed (or a state change makes the
+      condition no longer apply), the next cycle finds the violation
+      gone and resumes normal operation. No state-file edit is
+      required.
+
+    Operator action:
+    1. Inspect the cycle log entry referenced ({cycle_log_ref}) and
+       the surrounding context to identify the violation site.
+    2. Compare against current CB state, resource conditions, and
+       phase to understand what triggered the assertion.
+    3. Deploy a code fix or spec correction. The pause clears
+       automatically on the next cycle once the violation is gone.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Internal consistency violation — software bug. No auto-resume. See email."
+
+broker_inconsistency:
+  # Fires for §11.2.14 hard-broke sub-cases: account-ID mismatch at
+  # connect, or malformed Trade data the broker layer cannot reconcile.
+  # Sets operational_pause with pause_reason='broker_inconsistency';
+  # no auto-resume. Recovery requires fixing the broker-side
+  # configuration or library version drift.
+  # Placeholders: {timestamp}, {sub_case}, {detail}, {recovery_hint}
+  subject: "IRAPM CRITICAL: Broker inconsistency — broker state cannot be trusted"
+  body: |
+    The broker layer raised a BrokerInconsistency exception at
+    {timestamp} that the action layer classified as Hard-broke per
+    D-SPEC-8.
+
+    Sub-case: {sub_case}
+    Detail: {detail}
+
+    The system has set operational_pause with
+    pause_reason='broker_inconsistency'. This pause does NOT
+    auto-resume — the broker layer cannot trust its own state going
+    forward, and retrying would just re-encounter the same
+    inconsistency.
+
+    Two concrete situations land here:
+    - Account-ID mismatch at connect: the connected IBKR account
+      does not match expected_account_id. Defense against paper-vs-
+      live TWS port confusion or misconfigured TWS Gateway.
+    - Malformed Trade data: a returned Trade carries an impossible
+      execId collision, wrong client_id attribution, or malformed
+      numeric values. Suggests ib_async / IBKR API version drift or
+      a TWS bug.
+
+    Recovery action:
+    {recovery_hint}
+
+    The pause clears automatically when the next cycle's broker
+    connection succeeds without raising BrokerInconsistency — no
+    state-file edit needed.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Broker inconsistency ({sub_case}). No auto-resume. See email."
+
+
+# -----------------------------------------------------------------------------
+# Non-paused Critical-event alerts
+# -----------------------------------------------------------------------------
+# Per D-SPEC-8: these are Critical (self-healed weird) — the system has
+# already recovered by the time the alert fires, no operational_pause is
+# set, and the alerts exist for operator awareness (forensics, runbook
+# reference) rather than for operator action.
+
+split_brain_detected:
+  # Fires when the cycle's broker-layer post-hoc check (§11.2.11 Layer B)
+  # observes two different last_cycle_clientid values within a 24h window
+  # — meaning two different boxes' cycles both ran broker work in that
+  # span. By the time this alert fires, the IP-tiebreak (Layer A) has
+  # already resolved the state-file conflict, and the broker layer's
+  # pre-place idempotency lookup (defense layer 3) has already prevented
+  # duplicate execution. The system is already consistent; the alert is
+  # the receipt that proves the system noticed. No operational_pause.
+  # Placeholders: {timestamp}, {clientid_a}, {clientid_b}, {window_hours},
+  #               {tiebreak_winner_box_id}
+  subject: "IRAPM CRITICAL: Split-brain detected (Layer B post-hoc) — system already consistent"
+  body: |
+    The broker-layer post-hoc split-brain check observed two distinct
+    cycles' client_ids within a {window_hours}-hour window at
+    {timestamp}.
+
+    Cycle A client_id: {clientid_a}
+    Cycle B client_id: {clientid_b}
+    Tiebreak winner (continuing as master): {tiebreak_winner_box_id}
+
+    This is Layer B detection per §11.2.11 — distinct from the
+    Layer A IP-tiebreak (which generates `split_brain_resolved`
+    alerts). Layer B fires *after* the broker-layer pre-place
+    idempotency lookup has already prevented any duplicate
+    execution, and after Layer A has already restored a single
+    master.
+
+    Per D-SPEC-8, this is Critical (self-healed weird): the
+    system has already recovered by the time you see this alert.
+    No operational_pause is set; the system continues operating.
+
+    The alert exists for forensics. Operator action recommended
+    (when convenient — there is no urgency):
+    - Inspect both cycles' logs to confirm the broker-layer
+      idempotency mechanism (defense layer 3, §15.6) successfully
+      prevented duplicate orders. The pre-place lookup should
+      have found the first cycle's order and aborted the second
+      via idempotent rediscovery.
+    - Investigate the underlying cause: Was Layer A's IP-tiebreak
+      slow to fire? Was there a rsync failure? Network partition?
+      Box misconfiguration? Resolving the underlying cause makes
+      future occurrences less likely.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Split-brain Layer B detected. Already consistent. See email for forensics."
+
+external_activity_overlap:
+  # Fires when get_recent_activity() returns orders with empty
+  # client_order_id (no orderRef stamped by IRAPM) on a symbol IRAPM
+  # is about to act on, or on a symbol where IRAPM has an open order
+  # (§11.2.15). The cycle aborts before placing orders — the
+  # declination to act IS the heal. No operational_pause is set;
+  # next cycle proceeds against fresh state.
+  # Placeholders: {timestamp}, {affected_symbols}, {external_order_summary}
+  subject: "IRAPM CRITICAL: External account activity detected — cycle declined to trade"
+  body: |
+    The cycle's pre-place check at {timestamp} found orders in the
+    IBKR account that were not placed by IRAPM (no orderRef stamp).
+
+    Affected symbol(s): {affected_symbols}
+    External activity summary:
+    {external_order_summary}
+
+    The cycle correctly refused to place orders against potentially-
+    compromised state. No trades were executed.
+
+    Per D-SPEC-8, this is Critical (self-healed weird): the system's
+    declination to act IS the heal. No operational_pause is set —
+    the next cycle re-reads broker state fresh and decides against
+    the post-manual-activity reality. Whatever new positions the
+    external activity created become the baseline.
+
+    The alert exists for operator awareness. Recommended review:
+    - Inspect the IBKR portal to identify what was placed manually
+      and why.
+    - If the activity was intentional (you placed manual orders for
+      a specific reason), no further action — IRAPM will continue
+      operating against the new positions as baseline.
+    - If the activity was unintentional (account compromise,
+      accidental order), take separate IBKR-side action (cancel
+      orders, contact IBKR support, change credentials). IRAPM's
+      continued operation against the new baseline is not the
+      safety concern — the broker layer's idempotency mechanism
+      handles all subsequent IRAPM activity correctly.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: External activity in account. Cycle declined. System continues vs new baseline."
+
+broker_inconsistency_transient:
+  # Fires for §11.2.14 self-healed-weird sub-cases: post-placement
+  # confirmation timeout, or pre-place query failure. The next cycle's
+  # fresh broker query resolves the ambiguity via the established
+  # idempotency mechanism; no operational_pause is set.
+  # Placeholders: {timestamp}, {sub_case}, {detail}
+  subject: "IRAPM CRITICAL: Broker query ambiguity — next cycle resolves"
+  body: |
+    The broker layer raised a transient BrokerInconsistency at
+    {timestamp} that the action layer classified as
+    Self-healed-weird per D-SPEC-8.
+
+    Sub-case: {sub_case}
+    Detail: {detail}
+
+    Two concrete situations land here:
+    - Post-placement confirmation timeout (§15.5): an order was
+      submitted but did not appear in IBKR's open-orders table
+      within the 15-second confirmation window. The order's true
+      state was momentarily unknown.
+    - Pre-place query failure (§15.5): get_recent_activity() raised,
+      leaving the idempotency lookup blind. The cycle refused to
+      place rather than risk duplicate execution.
+
+    In both cases, the system is correctly designed to recover on
+    the next cycle: the broker layer's pre-place idempotency lookup
+    (defense layer 3, §15.6) queries IBKR for recent activity and
+    either finds the order (idempotent rediscovery) or doesn't
+    (places anew, idempotently). No operational_pause is set; the
+    system continues operating.
+
+    The alert exists for forensics. No operator action required.
+    Recommended review (when convenient): repeated occurrences may
+    indicate a TWS configuration issue, network instability, or
+    IBKR API-side problem worth investigating, but the system
+    itself is operating correctly.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM CRITICAL: Broker query ambiguity ({sub_case}). Next cycle resolves. See email."
 
 
 # -----------------------------------------------------------------------------
@@ -913,7 +1197,8 @@ ach_update_warning:
 
 broker_disconnect:
   # Fires when cycle aborts at input refresh due to broker connection
-  # failure. Critical-transient (auto-recovers; no operational_pause).
+  # failure. Critical (self-healed weird) per §11.1: no operational_pause,
+  # the next cycle's reconnect attempt is the heal.
   # Placeholders: {timestamp}, {cycle_type}, {error_detail}
   subject: "IRAPM CRITICAL: Broker connection failure — cycle aborted"
   body: |
@@ -926,10 +1211,11 @@ broker_disconnect:
     unchanged. The next scheduled cycle (typically next day) will
     attempt to reconnect.
 
-    This is a Critical-transient failure: the underlying condition is
-    expected to resolve naturally on subsequent cycles (broker
-    reconnects, network heals). NO operational_pause is set; the
-    system retries naturally.
+    This is a Critical (self-healed weird) failure per the §11.1
+    framework: the underlying condition is expected to resolve naturally
+    on subsequent cycles (broker reconnects, network heals). NO
+    operational_pause is set; the system retries naturally and continues
+    operating.
 
     If this alert persists across multiple cycles, investigate broker
     status (IBKR system status page, account access, network
@@ -1115,39 +1401,6 @@ signal_recovered:
 # -----------------------------------------------------------------------------
 # Configuration / sanity alerts
 # -----------------------------------------------------------------------------
-
-fi_overweight_persistent_suppression:
-  # Fires when §7.5.1 FI-sacrosanct rebalance suppression persists
-  # beyond fi_overweight_suppression_alert_weeks (default 4).
-  # Placeholders: {timestamp}, {weeks_suppressed}, {fi_overweight_pct},
-  #               {growth_drift_summary}
-  subject: "IRAPM WARNING: Rebalance suppressed for {weeks_suppressed} weeks — review"
-  body: |
-    A rebalance has been continuously suppressed for {weeks_suppressed}
-    consecutive weeks, longer than the alert threshold (4 weeks
-    default).
-
-    The suppression is the FI-sacrosanct rule (I5) firing: the
-    rebalance plan would require selling FI to buy Growth, which the
-    system refuses. This typically happens during prolonged Growth
-    drawdowns where FI has held value while Growth depreciated.
-
-    Current state:
-    - FI overweight: {fi_overweight_pct} above target
-    - Growth drift: {growth_drift_summary}
-
-    The system continues operating normally — withdrawals, refills,
-    and CB-state-based behavior all run as expected. Only the 5/25
-    rebalance trigger is suppressed.
-
-    The conditions producing significant FI overweight typically
-    coincide with CB1/CB2 territory (where rebalancing is suspended
-    anyway), so this alert mostly catches edge cases. If you see
-    this in CB_INACTIVE state, investigate whether the target weights
-    in ruleset.yaml still reflect your intent.
-
-    Cycle ID: {cycle_id}
-  sms: "IRAPM WARN: Rebalance suppressed {weeks_suppressed}wk. FI overweight {fi_overweight_pct}. See email."
 
 alerter_failure_recovered:
   # Post-hoc: alerter dispatch failed during a prior period; channels

@@ -627,9 +627,10 @@ class RecentActivity(BaseModel):
       2. The external-activity detector. If the activity list contains
          orders whose client_order_id doesn't match the IRAPM-controlled
          namespace (`cycle-{uuid}-...`), the cycle treats this as
-         external operator activity and decides accordingly (§ TBD —
-         likely an operational_pause with pause_reason
-         'external_activity_overlap').
+         external operator activity per §11.2.15: cycle aborts before
+         placing any orders and an `external_activity_overlap` Critical
+         alert fires (alert only, NO operational_pause — the cycle's
+         declination to act is the heal, per D-SPEC-8).
 
       3. Idempotent order rediscovery inside IBKRBroker. The internal
          _find_order_by_ref helper aggregates these same data structures
