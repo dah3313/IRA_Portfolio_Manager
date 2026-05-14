@@ -71,12 +71,19 @@ logger = logging.getLogger(__name__)
 def _is_scheduled_withdrawal_day(today: date) -> bool:
     """The monthly withdrawal step runs on the latest Wednesday on or
     before (15th - 4 business days). For simplicity here we use the
-    first Wednesday of the month that is ≤ the 15th, which lines up
-    with the IBKR ACH 2-business-day-settlement convention per §9.6.1.
+    Wednesday-of-month that is <= the 15th, which lines up with the
+    IBKR ACH 2-business-day-settlement convention per §9.6.1.
 
-    Concrete rule used: the cycle's normal Wednesday cadence; the
-    cycle script targets the Wed before the 15th. If today's date is
-    in the window (10-15 of the month) AND it's a Wednesday, withdraw.
+    Concrete rule used: today is a Wednesday AND today.day is in
+    [9, 15]. A 7-day window guarantees exactly one Wednesday falls
+    within it regardless of where the 1st sits in the week, so this
+    rule fires exactly once per month.
+
+    History: an earlier version used [10, 15], which excluded day 9.
+    When the 1st of a month was a Tuesday, the only candidate Wed
+    landed on day 9 and the withdrawal silently skipped that month
+    entirely. Over the 2005-2025 baseline run this caused ~35 missed
+    monthly withdrawals (205 actual vs ~240 expected).
 
     The spec leaves operator-tunable precision here; this simple rule
     satisfies the "monthly cadence on a Wednesday near the 15th"
@@ -84,20 +91,43 @@ def _is_scheduled_withdrawal_day(today: date) -> bool:
     """
     if today.weekday() != 2:  # Wed = 2
         return False
-    return 10 <= today.day <= 15
+    return 9 <= today.day <= 15
 
 
 def _is_annual_review_day(today: date, annual_review_date_str: str) -> bool:
-    """Annual review fires on the first cycle on or after MM-DD each
-    year. We approximate by firing on the cycle that includes the
-    configured MM-DD; the cycle driver tracks year-already-reviewed
-    via the cycle log (operator-level check) and the schedule_state
-    updates (in-data check).
+    """Annual review fires on the first Wednesday cycle on-or-after
+    MM-DD each year. Cycles only run on Wednesdays, so a date-equality
+    rule would miss most years (MM-DD is a Wednesday only ~1/7 of
+    years). This implementation fires on exactly one Wednesday per
+    year: the first Wed in the [MM-DD, MM-DD+6] window.
 
-    Conservative implementation: fire on the configured day.
+    Rule: today is a Wednesday AND this year's MM-DD (call it T) is
+    in the 7-day window ending at today: T <= today <= T + 6 days.
+    Equivalently, today - 6 <= T <= today. Since the window is exactly
+    7 days long, exactly one Wednesday falls in it for any T.
+
+    The cycle driver's broader machinery (year-already-reviewed checks
+    via cycle log and schedule_state) handles idempotency if the
+    function is consulted multiple times in the same window.
+
+    History: an earlier version used `today.month == M and today.day
+    == D`, which only fired when the cycle date exactly equaled MM-DD.
+    Over the 2005-2025 baseline run this produced only 2 annual
+    reviews vs the expected ~20.
     """
+    if today.weekday() != 2:  # Wed = 2
+        return False
     month, day = (int(p) for p in annual_review_date_str.split("-"))
-    return today.month == month and today.day == day
+    try:
+        target = date(today.year, month, day)
+    except ValueError:
+        # Defensive: malformed config produces a no-fire result rather
+        # than crashing the cycle. The ruleset validator should reject
+        # invalid MM-DD strings at startup, so this branch should be
+        # unreachable in practice.
+        return False
+    delta_days = (today - target).days
+    return 0 <= delta_days <= 6
 
 
 def _is_phase2_reallocation_day(today: date,

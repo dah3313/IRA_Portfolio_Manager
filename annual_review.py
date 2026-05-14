@@ -123,6 +123,22 @@ def compute_cumulative_cb1_plus_days(
             ts = datetime.fromisoformat(ts_str)
         except ValueError:
             continue
+        # Normalize naive timestamps to UTC. The IRAPM clock seam
+        # (clock.py) documents Clock.now() as returning NAIVE local
+        # datetimes, and the CB transition log records timestamps via
+        # `now.isoformat()` in action_layer._execute_cb_state_transition,
+        # which produces ISO strings without a tz suffix. Re-parsing
+        # those strings yields naive datetimes. We compare them to
+        # year_start/year_end which are tz-aware UTC; without this
+        # normalization the comparison raises TypeError.
+        #
+        # Treating missing tz as UTC is correct for the freeze
+        # evaluation: the algorithm cares about calendar-year membership
+        # and inter-event spans, not sub-day precision, and the system's
+        # clock is modeled as UTC throughout the harness (AdvancingClock
+        # attaches ET only at the now_et() boundary).
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
         parsed.append((ts, from_state, to_state))
 
     if not parsed:

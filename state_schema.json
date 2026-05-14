@@ -475,10 +475,10 @@
           "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
         },
         "trigger_year": {
-          "description": "Calendar year when this schedule_state was initialized. Phase 1: 2027 (program start). Phase 3: year of Phase 3 latch event.",
+          "description": "Calendar year when this schedule_state was initialized. Phase 1: 2027 (program start) for production deployment. Phase 3: year of Phase 3 latch event. Range relaxed from [2020, 2100] to [1900, 2200] to accommodate harness simulator scenarios that drive IRAPM against historical market data (e.g., a Phase 3 trigger in 2016 during the GFC-recovery period); the relaxed range still catches actual data corruption while letting backtests work. Operational timeline expectations are enforced at higher layers (scenario loader, new_initial_state, ruleset validation), not in this schema.",
           "type": "integer",
-          "minimum": 2020,
-          "maximum": 2100
+          "minimum": 1900,
+          "maximum": 2200
         },
         "cpi_rate": {
           "description": "Annual CPI rate compounded into the schedule (Decimal-as-string). For both Phase 1 and Phase 3, this equals the canonical inflation_rate (default 0.035) at the time of schedule_state creation. Persisted into schedule_state so that historical scheduled-amount calculations remain reproducible even if inflation_rate is later changed in ruleset.yaml.",

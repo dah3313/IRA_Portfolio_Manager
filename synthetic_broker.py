@@ -812,6 +812,24 @@ class SyntheticBroker:
         self._require_connected()
         return self._clock_now_utc()
 
+    def resolve_symbol(self, symbol: str) -> ContractRef:
+        """Mint a ContractRef for `symbol`.
+
+        Synthetic implementation: trivial — same shape as the refs
+        seed_position() produces. No broker round-trip required. The
+        ref's broker_impl tag is BROKER_IMPL_TAG so passing it back to
+        this same broker's place_order() satisfies the impl check.
+
+        This method does NOT verify that the symbol has price data
+        seeded; that check happens at place_order time via the existing
+        market-price lookup (which raises BrokerRejection if no price
+        is available). Resolving a symbol with no price data returns a
+        usable ContractRef — the failure surfaces later when the order
+        actually tries to execute.
+        """
+        self._require_connected()
+        return ContractRef(broker_impl=BROKER_IMPL_TAG, symbol=symbol)
+
     # =========================================================================
     # SIMULATOR-FACING METHODS (not part of the protocol; for IPMS use)
     # =========================================================================

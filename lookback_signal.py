@@ -147,7 +147,9 @@ def compute_synthetic_growth_lookback(
     expected_bars = lookback_window_weeks + 1
     for s in growth_symbols:
         try:
-            bars = load_weekly_adj_close(s, data_dir, count=expected_bars)
+            bars = load_weekly_adj_close(
+                s, data_dir, count=expected_bars, as_of=as_of,
+            )
         except PriceFileMissing as e:
             return LookbackResult.unavailable(f"missing price file: {e}")
         except PriceFileMalformed as e:

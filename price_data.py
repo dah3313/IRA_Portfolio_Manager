@@ -121,16 +121,25 @@ def load_weekly_adj_close(
     data_dir: str | Path,
     *,
     count: int | None = None,
+    as_of: date | None = None,
 ) -> list[PriceBar]:
     """Load the most recent weekly Adj Close bars for a symbol.
 
     Looks for `<symbol>.tsv` first, then `<symbol>.csv` in `data_dir`.
     Returns bars sorted ascending by date.
 
+    If `as_of` is given, bars with `bar_date > as_of` are filtered out
+    BEFORE the count-trim. This makes the loader date-aware so a
+    backtest harness can walk historical cycle dates against a fixed
+    price file and get the appropriate "as-of" view of the data. In
+    production where `as_of` is always "now" and the file contains
+    only past data, this filter is a no-op.
+
     If `count` is given, returns only the most recent `count` bars
-    (after sort). If the file has fewer than `count` bars, returns
-    them all — the lookback signal's coverage check (§5.3.2) decides
-    whether the result is sufficient.
+    (after the as_of filter and after sort). If the file has fewer
+    than `count` bars after filtering, returns them all — the
+    lookback signal's coverage check (§5.3.2) decides whether the
+    result is sufficient.
 
     Raises:
       PriceFileMissing: neither .tsv nor .csv exists.
@@ -198,6 +207,12 @@ def load_weekly_adj_close(
     for bar in bars:
         by_date[bar.bar_date] = bar
     bars_sorted = sorted(by_date.values(), key=lambda b: b.bar_date)
+
+    # Apply as_of filter BEFORE count-trim. This is what makes the
+    # loader correct for backtest harnesses: in a 2005 cycle against
+    # a price file extending to 2026, we must not return 2026 bars.
+    if as_of is not None:
+        bars_sorted = [b for b in bars_sorted if b.bar_date <= as_of]
 
     if count is not None and count > 0 and len(bars_sorted) > count:
         bars_sorted = bars_sorted[-count:]

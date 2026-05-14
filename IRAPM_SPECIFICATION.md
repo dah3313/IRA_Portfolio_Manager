@@ -2,10 +2,10 @@
 
 ## Specification
 
-**Version:** 1.9.2
+**Version:** 1.10
 **Status:** Implementation-ready pending ruleset.yaml drafting, operational
 runbook, paper-trading verification of the §15.12 uncertainty-flagged items,
-and re-validation per §14.7.
+and re-validation per §14.6.
 
 **Version history:** See `CHANGELOG.md`.
 **Design rationale:** See `DECISIONS.md`.
@@ -48,7 +48,7 @@ functions, etc.
 - §11. Failure Modes & Recovery
 - §12. Observability
 - §13. Testing Strategy
-- §14. Open Questions (incl. §14.7 Phase 3 re-validation requirement)
+- §14. Open Questions (incl. §14.6 Phase 3 re-validation requirement)
 - §15. Broker Layer (incl. §15.5 idempotency model, §15.6 master/slave coordination via IBKR-as-arbiter)
 - §16. Glossary
 
@@ -197,20 +197,19 @@ violations. This includes — non-exhaustively:
 - CB1 → CB2 timer (90 days, parameter `cb1_to_cb2_timer_days`))
 - Lookback window (6 months / ~26 weekly bars)
 - Lookback staleness gates (14 days max staleness, ≥80% bar coverage)
-- Phase 1 withdrawal amount and inflation rate ($3000/mo in 2027 USD, 3% nominal)
-- Phase 3 floor and ceiling brackets (`FLOOR_2026 = $3000`,
-  `CEILING_2026 = $5000` in 2026 USD; `INFLATION_PRE = 3.5%`
-  indexing rate, continues post-trigger; per §4.1.1.1)
-- Phase 3 post-trigger CPI rate (`CPI_POST = 4.0%`)
-- Phase 3 sustainable-withdrawal closed-form constants:
-  `RETURN_NOM = 6.0%` (assumed nominal portfolio return);
-  `HORIZON = 27 years`; `TARGET_TERMINAL = 0.50` (real terminal
-  target as fraction of trigger P); `INFLATION_TERMINAL = 2.5%`
-  (long-run inflation for terminal target); `SUB_FLOOR_RATE = 6.0%`
-  (sustainable rate for sub_floor regime). Per §4.1.1.1.
-- Phase 3 per-month payment ceiling
-  (`phase3_monthly_payment_ceiling_pct = 0.075`; applied as
-  `current_portfolio × pct / 12` per §4.1.1.7)
+- Phase 1 withdrawal amount and inflation rate ($3000/mo in 2027 USD,
+  3.5% canonical `inflation_rate` per §4.1.2)
+- Phase 3 starting income calculation inputs:
+  `phase3_i0_calc_return_assumption = 0.06`,
+  `phase3_i0_calc_inflation_assumption = 0.04`,
+  `phase3_i0_calc_horizon_years = 30` (per §4.1.1)
+- Phase 3 per-month payment ceilings (both apply, whichever is tighter):
+  - `phase3_monthly_payment_ceiling_rate = 0.075` (portfolio-%
+    ceiling), applied as `current_portfolio × rate / 12`
+  - `phase3_dollar_ceiling_base_dollars = 4000`,
+    `phase3_dollar_ceiling_base_year = 2027` (dollar ceiling
+    indexed annually at `inflation_rate`)
+  Per §4.1.1.2.
 - Annual review date (default January 15)
 - Freeze evaluation threshold days (default 30 cumulative CB1+ days)
 - SGOV buffer target (24 months × current monthly withdrawal)
@@ -279,7 +278,7 @@ without modification.
 The §2.3 bullet list above is descriptive; this subsection collects
 all parameters by name with canonical defaults, units, and governing
 section. The intent is to serve as the single reference for drafting
-`ruleset.yaml` (§14.3) and as the canonical map between parameter
+`ruleset.yaml` (§14.2) and as the canonical map between parameter
 names used elsewhere in the spec and their concrete defaults. Every
 configurable value in the system has a row here; any value referenced
 in code that lacks a row is a spec violation per §1's "magic numbers"
@@ -348,6 +347,8 @@ rule.
 | `phase3_i0_calc_inflation_assumption` | 0.04 | decimal | §4.1.1 |
 | `phase3_i0_calc_horizon_years` | 30 | years | §4.1.1 |
 | `phase3_monthly_payment_ceiling_rate` | 0.075 | decimal | §4.1.1.2 |
+| `phase3_dollar_ceiling_base_dollars` | 4000 | dollars | §4.1.1.2 |
+| `phase3_dollar_ceiling_base_year` | 2027 | year | §4.1.1.2 |
 
 **SGOV buffer:**
 
@@ -1132,29 +1133,57 @@ scheduled_monthly = I_0 × (1 + inflation_rate) ** n_raises_applied
 
 ##### 4.1.1.2 Per-cycle payment ceiling
 
-Every Phase 3 cycle, the actual monthly withdrawal is clamped:
+Every Phase 3 cycle, the actual monthly withdrawal is clamped
+against two independent ceilings — whichever is tighter binds:
 
 ```
-actual_monthly = min(scheduled_monthly,
-                     current_portfolio_value × phase3_monthly_payment_ceiling_rate / 12)
+portfolio_ceiling = current_portfolio_value × phase3_monthly_payment_ceiling_rate / 12
+dollar_ceiling    = phase3_dollar_ceiling_base_dollars × (1 + inflation_rate) ** (current_year - phase3_dollar_ceiling_base_year)
+actual_monthly    = min(scheduled_monthly, portfolio_ceiling, dollar_ceiling)
 ```
 
-Where `phase3_monthly_payment_ceiling_rate` defaults to `0.075`
-(7.5% annualized). If the ceiling binds — i.e., the scheduled
-monthly would exceed `portfolio × 0.075 / 12` — the system pays the
-ceiling and emits a `monthly_payment_ceiling_bound` Notice alert. No
-other state is affected by the ceiling binding: the schedule
-continues unchanged, the freeze evaluation is not triggered, and the
-next month re-runs the same clamp against the new portfolio value.
+Where:
+- `phase3_monthly_payment_ceiling_rate` defaults to `0.075` (7.5%
+  annualized of current portfolio value).
+- `phase3_dollar_ceiling_base_dollars` defaults to `4000` (the
+  dollar ceiling in `phase3_dollar_ceiling_base_year` USD).
+- `phase3_dollar_ceiling_base_year` defaults to `2027`.
+- `inflation_rate` is the canonical 3.5% rate (§4.1.2), shared
+  with the scheduled-monthly raise mechanism.
 
-The ceiling protects the corpus against several failure modes
-simultaneously:
-- `I_0` calibrated against a temporarily-inflated portfolio at latch
-- Portfolio drawdown after latch outpacing scheduled raises
-- Compounding inflation raises eventually outstripping the corpus
+If either ceiling binds, the system pays the lesser ceiling and
+emits a `monthly_payment_ceiling_bound` Notice alert identifying
+which ceiling bound (portfolio-percentage, dollar, or both
+simultaneously if they coincide within rounding). No other state is
+affected: the schedule continues unchanged, the freeze evaluation is
+not triggered, and the next month re-runs the same clamp against
+the new portfolio value and the new year's indexed dollar ceiling.
 
-In normal operation the ceiling does not bind. It is a safety clamp,
-not a target.
+The two ceilings protect against different failure modes:
+
+- **Portfolio-percentage ceiling** binds when the portfolio shrinks
+  relative to the schedule (drawdown post-latch, or inflation
+  raises outstripping a slow-growing portfolio over decades). It
+  scales down with the corpus, preserving sustainability.
+
+- **Dollar ceiling** binds when `I_0` is calibrated against a large
+  portfolio at latch (~$2M+) and would otherwise authorize
+  withdrawals far above what the survivor's actual living-expense
+  envelope requires. It prevents the corpus from being drained
+  faster than need.
+
+Sample dollar-ceiling values at default parameters
+(`base = $4000`, `base_year = 2027`, `inflation = 0.035`):
+
+| Year | Dollar ceiling (monthly) |
+|---|---|
+| 2027 | $4,000 |
+| 2035 (Phase 1→2 boundary) | $5,266 |
+| 2045 | $7,429 |
+| 2057 (latest plausible Phase 3 trigger) | $11,210 |
+
+In normal operation the ceilings do not bind. They are safety
+clamps, not targets.
 
 ##### 4.1.1.3 Implementation summary
 
@@ -2299,7 +2328,7 @@ Rationale for liquidation decisions:
 - SELL PYLD down to `position_residual_minimum_dollars`. Skipped
   if already at or below residual (no-op). The skip is recorded in
   the cycle log (§12.2.1) and surfaced in the `large_rebalance`
-  alert's residual-exceptions section (§12.7).
+  alert's residual-exceptions section (§12.6).
 - SELL JPIE down to `position_residual_minimum_dollars` (same
   residual-skip semantics).
 - Compute Phase 2 target allocation against post-liquidation core
@@ -2320,7 +2349,7 @@ Rationale for liquidation decisions:
 - Compute Phase 3 starting income `I_0` per §4.1.1 from current
   portfolio value at the moment the transition cycle executes (not
   at the moment of token-removal grace expiry — see §4.2).
-- Initialize Phase 3 schedule_state: `(I_0, trigger_year, CPI_POST, [])`.
+- Initialize Phase 3 schedule_state: `(I_0, trigger_year, inflation_rate, [])`.
   Persist to durable state.
 - Recompute Phase 3 buffer target = 24 × I_0; refill rate = target/12;
   cash target = I_0 + $1000. Persist.
@@ -2380,15 +2409,18 @@ scheduled_monthly = compute_scheduled_monthly(
 ```
 
 per §3.13. For Phase 3 only, additionally apply the per-month payment
-ceiling per §4.1.1.2:
+ceilings per §4.1.1.2 — the actual withdrawal is the MIN of the
+schedule, the portfolio-% ceiling, and the indexed dollar ceiling:
 
 ```
-monthly_withdrawal = min(scheduled_monthly,
-                         current_portfolio × phase3_monthly_payment_ceiling_rate / 12)
+portfolio_ceiling = current_portfolio × phase3_monthly_payment_ceiling_rate / 12
+dollar_ceiling    = phase3_dollar_ceiling_base_dollars × (1 + inflation_rate) ** (current_year - phase3_dollar_ceiling_base_year)
+monthly_withdrawal = min(scheduled_monthly, portfolio_ceiling, dollar_ceiling)
 ```
 
-If the ceiling binds, emit `monthly_payment_ceiling_bound` Notice
-alert. No other state is affected by the ceiling binding.
+If either ceiling binds, emit `monthly_payment_ceiling_bound` Notice
+alert identifying which ceiling bound (portfolio-%, dollar, or both).
+No other state is affected by the ceiling binding.
 
 Phase 1 has no portfolio clamp; the `portfolio_low_alert` provides
 operator warning at the depletion threshold, and the operational
@@ -3329,7 +3361,7 @@ Executed as a coordinated batch:
    Skip any SELL whose target position is already at or below residual
    (no-op). The skip is recorded in the cycle log (§12.2.1) and
    surfaced in the `large_rebalance` alert's residual-exceptions
-   section (§12.7).
+   section (§12.6).
 2. Wait for all SELL fills (timeout same as Order entries, but
    applied to the batch).
 3. Compute available cash post-SELLs.
@@ -3415,7 +3447,7 @@ amount instead of $0 during STOP INCOME pauses). Halting the system
 entirely because IBKR's API rejected an update would be worse than
 running with a stale ACH amount until the operator resolves the
 IBKR-side issue. The manual procedure is specified in detail in the
-operational runbook (§14.4).
+operational runbook (§14.3).
 
 #### 8.2.8 LargeCashDeployment entries
 
@@ -3551,7 +3583,7 @@ to enable unattended operation. The risk is mitigated by:
 
 Credentials (IBKR username/password) are stored in `.env` outside
 the codebase and read at process start. Credential rotation is an
-operator responsibility tracked in the runbook (§14.4).
+operator responsibility tracked in the runbook (§14.3).
 
 #### 9.1.3 Pointer to §15
 
@@ -3833,7 +3865,7 @@ original primary is preferred hardware), they perform a manual swap:
    master and becomes slave.
 
 Alternatively, operator may use a documented manual override
-procedure (per the operational runbook, §14.4) that atomically
+procedure (per the operational runbook, §14.3) that atomically
 swaps `master_box_id` and reverses rsync direction without waiting
 through the auto-promotion sequence.
 
@@ -3897,19 +3929,14 @@ hardware:
   master is considered healthy (default: 24). At or above this
   threshold, a notice is logged but no promotion is initiated.
 - `slave_wake_staleness_hours` — staleness threshold for slave to
-  enter SLAVE_PROMOTION_PENDING (default: 72, formerly
-  `slave_wake_staleness_days = 3`).
+  enter SLAVE_PROMOTION_PENDING (default: 72).
 - `slave_promotion_grace_hours` — grace window before auto-promotion
   completes, measured from SLAVE_PROMOTION_PENDING transition
   timestamp (default: 48).
 - Per-box rsync configuration (source/dest paths, current direction)
   is operational, not in shared ruleset.
 
-All coordination-subsystem timing parameters are in hours, including
-the staleness threshold (which was previously specified in days).
-This eliminates a days-vs-hours mixing that previously created
-ambiguity about off-by-one execution boundaries when cycle runtimes
-drifted.
+All coordination-subsystem timing parameters are in hours.
 
 **Clock synchronization assumption.** The coordination sequence above
 relies on absolute wall-clock times (06:00 ET heartbeat, 06:15 ET
@@ -3978,7 +4005,7 @@ eventually collapsing the heartbeat → rsync → slave-check gap and
 producing spurious staleness or missed rsync windows. NTP failure
 is non-catastrophic in the short term (the staleness thresholds are
 in hours, not minutes), but is a slow corrosive that must be
-detected and corrected by the operational runbook (§14.4) rather
+detected and corrected by the operational runbook (§14.3) rather
 than tolerated indefinitely. NTP daemon health is a
 deployment-checklist item, not a runtime-enforced invariant — the
 system does not self-monitor clock drift.
@@ -4618,15 +4645,14 @@ At the end of the 24-hour grace window with tokens still removed:
 4. Subsequent token states (re-insertion, removal, mismatch) have
    no effect on phase. The latch is permanent.
 
-The earlier design deferred the transition cycle when cascade was
-active. This was removed (v1.4): the Phase 3 transition is a
-one-time allocation reset, not a rebalance, so there is no reason
-to defer it for market conditions. The survivor needs the Phase 3
-income calculation in effect; cascade sourcing protects the
-portfolio during the transition cycle just as it does during
-normal operation. The transition may trade smaller Growth volumes
-if CB1 is active (I14 still applies during transitions), but the
-transition itself proceeds.
+The Phase 3 transition cycle is not deferred when cascade is
+active. The transition is a one-time allocation reset, not a
+rebalance; the survivor needs the Phase 3 income calculation in
+effect, and cascade sourcing protects the portfolio during the
+transition cycle just as it does during normal operation. The
+transition may trade smaller Growth volumes if CB1 is active (I14
+still applies during transitions), but the transition itself
+proceeds.
 
 ### 10.7 STOP INCOME flow
 
@@ -4823,7 +4849,7 @@ mechanism; severity is metadata about that dispatch).
   that month may be delayed. The operator should check
   TWS/Gateway status (is the process running? did IBKR push a
   forced upgrade? does the box have network connectivity?) if
-  the alert persists across multiple cycles. The §14.4 runbook
+  the alert persists across multiple cycles. The §14.3 runbook
   has a diagnostic procedure.
 
 #### 11.2.2 Order rejection (broker)
@@ -5522,7 +5548,7 @@ and exits are signal-based only.
 | `withdrawal_failed` | SELL or ACH failure during withdrawal cycle | Critical | Both |
 | `cascade_growth_source` | Withdrawal cascade reached Growth stage (§7.3.2 step 3) | Critical | Both |
 | `withdrawal_capacity_exhausted` | Cascade exhaustion indefinite halt set (§11.2.7) | Critical | Both |
-| `monthly_payment_ceiling_bound` | Phase 3 monthly payment clamped at portfolio-based ceiling (§4.1.1.2, §6.5.1) | Notice | Both |
+| `monthly_payment_ceiling_bound` | Phase 3 monthly payment clamped at portfolio-% or indexed dollar ceiling (§4.1.1.2, §7.3.1) | Notice | Both |
 
 **Cash deployment:**
 
@@ -5605,7 +5631,7 @@ already healed, no `operational_pause` set):**
 The `large_rebalance` alert includes a **residual-exceptions
 section** in its body listing any positions skipped during the
 transition because they were already at or below residual
-(§7.2.1, §8.2.5 ruling per Item 20).
+(§7.2.1, §8.2.5).
 
 The catalog is not closed: additional alert types may be added as
 the system evolves. Each addition follows the same pattern — pick
@@ -5695,45 +5721,14 @@ end-to-end strategy correctness. It exercises:
 - Stress scenarios (1929, 1973-74, 2000-02, 2008-09, hypothetical
   worse)
 - Phase 1 → Phase 3 trigger at various points in market history
-- Phase 3 four-regime validation per §4.1.1 (using IRAPM parameter
-  values; see §14.7)
+- Phase 3 sustainability validation per §4.1.1 (annuity `I_0`
+  calculation, scheduled raises, both per-month ceilings) under
+  IRAPM parameter values; see §14.6 for the required re-validation
+  sweep before production deployment.
 
 The IPMS specification (separate document) defines the simulator's
 own correctness criteria. IRAPM correctness depends on IPMS being
 trustworthy.
-
-**Historical validation evidence (legacy).** The Phase 3 adaptive
-design was validated against the 2005–2025 historical sequence at
-seven trigger portfolios spanning all four regimes, results recorded
-in the (now deprecated) `PHASE_3_DESIGN.md` §10.2 and the archive
-file `Retirement/RPM_PHASE3_ADAPTIVE.txt`. Key historical findings:
-
-- 100% survival across all 7 trigger portfolios over the 2005–2025
-  window.
-- Inflation freeze engaged exactly twice per scenario (2008 GFC and
-  2022 bear market), consistent with the freeze logic specified
-  in §7.6.
-- Worst-case widow scenario ($735K trigger) preserved real value
-  at 103% after 20 years of withdrawals.
-- Cascade exhaustion: zero months in all scenarios.
-
-**Important caveat.** That validation used the **legacy parameter set**
-(`INFLATION_PRE = 3.0%`, floor/ceiling brackets indexed *once* at
-trigger and fixed thereafter). IRAPM adopts a **different parameter
-set** (`INFLATION_PRE = 3.5%`, brackets continue growing post-trigger;
-see §4.1.1.1). The historical results therefore demonstrate *that the
-strategy class survives the 2005–2025 sequence*, but they do **not**
-validate the IRAPM-current parameter values. A fresh validation
-sweep is required and tracked in §14.7.
-
-IRAPM's simulator test suite should independently re-derive the
-historical-sequence results using IRAPM's decision and action layers
-(and the IRAPM parameter values) before deployment. Divergence
-between IRAPM's outputs at the legacy parameter set and the
-legacy results would indicate an IRAPM implementation defect;
-divergence between IRAPM's outputs at the IRAPM parameter set and
-the legacy results is *expected* and is the subject of §14.7's
-re-validation.
 
 **Open follow-up validation work** (not blocking IRAPM ratification):
 
@@ -5757,30 +5752,51 @@ The full invariant set:
 - Decision layer: D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12
 - Action layer: A1, A2, A3, A4, A5, A6, A7, A8
 
-### 13.6 Phase 3 four-regime testing
+### 13.6 Phase 3 starting-income and ceiling validation
 
-Per the four-regime taxonomy in §4.1.1.6, the test suite must verify
-correct `I_0` calculation in each regime:
+The test suite must verify correct behavior of the Phase 3 income
+calculation across the portfolio-size spectrum:
 
-- **sub_floor regime:** small portfolio at trigger; verify the
-  sustainable-floor path (`sustainable_floor_monthly` per §4.1.1.4)
-  produces the expected `I_0` and is the binding constraint.
-- **floor regime:** moderate portfolio where `I_sustainable_monthly`
-  would produce below-floor income; verify clamp to the indexed
-  floor (`floor_T` per §4.1.1.2).
-- **calc regime:** medium portfolio where `I_sustainable_monthly`
-  lands within the floor/ceiling band; verify direct closed-form
-  result (§4.1.1.3).
-- **ceiling regime:** large portfolio where `I_sustainable_monthly`
-  exceeds the indexed ceiling; verify clamp to the indexed ceiling
-  (`ceiling_T` per §4.1.1.2).
+- **`I_0` calculation correctness.** For a range of portfolio
+  values at trigger (e.g., $300K / $500K / $1M / $2M / $5M), verify
+  the annuity formula in §4.1.1 produces the expected `I_0`.
+  Independent test vectors generated by a numerical sustainability
+  solver under the IRAPM parameter set serve as golden values for
+  the closed-form path; equivalence within rounding tolerance
+  demonstrates the closed-form implementation is correct.
 
-Test vectors should be generated by independent solver runs (e.g.,
-numerical sustainability simulator) against the IRAPM parameter set
-and used as golden values for the closed-form path. Equivalence
-within rounding tolerance demonstrates the closed-form implementation
-is correct; this complements but does not substitute for §14.7
-end-to-end historical re-validation.
+- **Scheduled-monthly growth.** Verify that for any year Y > T,
+  `scheduled_monthly` equals
+  `I_0 × (1 + inflation_rate) ** n_raises_applied` where
+  `n_raises_applied` correctly excludes any years in `frozen_years`
+  per §4.1.1.1.
+
+- **Portfolio-percentage ceiling binding.** Construct a scenario
+  where `scheduled_monthly > portfolio × phase3_monthly_payment_ceiling_rate / 12`
+  and verify the actual paid amount equals the portfolio-% ceiling,
+  the `monthly_payment_ceiling_bound` alert fires identifying the
+  portfolio-% ceiling as binding, and no other state changes.
+
+- **Dollar ceiling binding.** Construct a scenario where
+  `scheduled_monthly > phase3_dollar_ceiling_base_dollars × (1 + inflation_rate) ** (current_year - phase3_dollar_ceiling_base_year)`
+  (e.g., a high-portfolio latch in 2030 producing an `I_0` above
+  the year-2030 indexed dollar ceiling). Verify the actual paid
+  amount equals the dollar ceiling, the alert fires identifying the
+  dollar ceiling as binding, and no other state changes.
+
+- **Both ceilings simultaneously below schedule.** Verify the
+  `min(scheduled, portfolio_ceiling, dollar_ceiling)` rule selects
+  the tighter ceiling and the alert identifies which one bound.
+
+The high-portfolio latch case (≥ $2M at trigger) is the primary
+motivating scenario for the dollar ceiling: at that scale the
+annuity formula authorizes `I_0` well above any plausible
+living-expense envelope, and the dollar ceiling is the mechanism
+that prevents the corpus from being drained faster than the
+survivor's actual need.
+
+Test vector generation complements but does not substitute for
+§14.6 end-to-end historical re-validation.
 
 ### 13.7 Dry-run cycle mode (mandatory)
 
@@ -5844,27 +5860,7 @@ to subsequent work. Each is bounded — the spec is implementation-ready
 without these resolved, but they should be addressed before
 production deployment.
 
-### 14.1 PHASE_3_DESIGN.md reconciliation (CLOSED)
-
-**Status: closed in v1.1 + v1.2.** Useful concepts (token semantics
-correction, physical security model, hold-previous-state design
-property, role-swap-not-failback, failure-quiet, reversible-where-
-possible, stuck-token alert, manual ACH fallback, worked example for
-resume semantics, historical validation cross-reference) were imported
-into IRAPM v1.1. The sustainable-withdrawal math (constants, bracket
-indexing, closed-form `I_sustainable`, sub-floor protection, regime
-classification, payment ceiling) was imported into IRAPM v1.2 §4.1.1.
-
-PHASE_3_DESIGN.md is now **deprecated** and should be moved out of
-the active document set. IRAPM is self-contained for Phase 3
-implementation.
-
-This item is retained in §14 as a historical record. See §14.7 for
-the validation work created by the parameter-set divergence between
-PHASE_3_DESIGN.md's ratified design and IRAPM's adopted parameter
-values.
-
-### 14.2 Simulator-tunable parameters
+### 14.1 Simulator-tunable parameters
 
 Several parameters are stated in this spec with provisional defaults,
 to be tuned via IPMS simulator runs:
@@ -5885,16 +5881,16 @@ to be tuned via IPMS simulator runs:
   enough to feel like a position but large enough to avoid
   accidental drift below; minimal simulator sensitivity expected.
 
-### 14.3 Ruleset.yaml drafting
+### 14.2 Ruleset.yaml drafting
 
 This specification defines the **structure** of configuration but
 does not provide a complete ruleset.yaml file. The next implementation
 step is to produce a draft ruleset.yaml containing all configurable
 parameters with their default values, organized for operator
 readability. The draft should be validated against the full
-parameter list distributed across §2.3, §6, §7, §10, §13, and §14.2.
+parameter list distributed across §2.3, §6, §7, §10, §13, and §14.1.
 
-### 14.4 Operational runbook
+### 14.3 Operational runbook
 
 This specification defines failure modes (§11) but does not provide
 a complete operator runbook. The runbook should cover, at minimum:
@@ -5998,7 +5994,7 @@ a complete operator runbook. The runbook should cover, at minimum:
 The runbook is operator-facing documentation; this specification is
 system-facing.
 
-### 14.5 Simulator-vs-production drift testing
+### 14.4 Simulator-vs-production drift testing
 
 The IPMS simulator and IRAPM production system must remain behaviorally
 equivalent for shared logic (decision layer, signal computation,
@@ -6006,7 +6002,7 @@ state machines). A test framework for verifying this equivalence on
 identical inputs should be developed. Drift between IPMS and IRAPM is
 a class of bug that the IPM v1 generation suffered from.
 
-### 14.6 Phase 3 trigger-year computation edge cases
+### 14.5 Phase 3 trigger-year computation edge cases
 
 The schedule_state structure (§3.13) uses `trigger_year` as a fixed
 integer. Edge cases at fiscal year boundaries (e.g., Phase 3 latches
@@ -6015,69 +6011,42 @@ freeze evaluation or CPI compounding. Simulator should verify
 behavior at these boundaries; if necessary, refine to use trigger
 *date* with explicit calendar-year derivation rules.
 
-### 14.7 Phase 3 re-validation at IRAPM parameter set
+### 14.6 Phase 3 re-validation
 
-The Phase 3 math imported in §4.1.1 originally validated successfully
-(100% survival across 7 trigger portfolios over the 2005–2025
-historical sequence; freeze engaged exactly twice per scenario;
-worst-case widow scenario preserved real value at 103% — recorded
-in the deprecated PHASE_3_DESIGN.md §10.2 and in
-`Retirement/RPM_PHASE3_ADAPTIVE.txt`). That validation used the
-**legacy parameter set**:
-
-- `INFLATION_PRE = 3.0%/yr`
-- Floor and ceiling brackets indexed *once* at trigger and **fixed
-  thereafter**.
-
-IRAPM adopts a **different parameter set**:
-
-- `INFLATION_PRE = 3.5%/yr`
-- Floor and ceiling brackets continue growing at `INFLATION_PRE`
-  *post-trigger*.
-
-The behavioral differences from these parameter changes:
-
-- **Higher initial trigger-year brackets at any future trigger.** A
-  trigger in 2035 sees `floor_T ≈ $4,090` under IRAPM vs `~$3,914`
-  under PHASE_3_DESIGN. Slight upward shift of the floor regime
-  range; slight upward shift of the ceiling.
-- **Growing brackets during Phase 3 lifetime.** Under PHASE_3_DESIGN,
-  the floor and ceiling that bind `I_0` at trigger remain valid
-  bracket anchors for the duration. Under IRAPM, the brackets
-  themselves grow at 3.5%/yr post-trigger. This does **not** affect
-  `I_0` (which is set once at trigger and held). It **does** affect
-  any consumer of `floor_Y` or `ceiling_Y` for `Y > T` — e.g.,
-  alerting that compares scheduled income against the
-  contemporaneous floor/ceiling for "is this regime still sane"
-  diagnostics.
+The Phase 3 design (§4.1.1 — annuity `I_0` + portfolio-% ceiling +
+indexed dollar ceiling) has not been validated end-to-end against
+the historical sequence at the current parameter set.
 
 Required validation work before production deployment:
 
-1. **Re-run historical-sequence sweep** at IRAPM parameter values
-   across the same 7 trigger portfolios used in the original
-   validation (and ideally additional portfolios spanning the regime
-   boundaries at the new bracket values).
-2. **Confirm 100% survival** at the new parameter set, or document
-   any survival shortfalls and decide whether parameter values need
-   adjustment.
-3. **Confirm regime classifications** at the new parameter set —
-   regime boundaries shift with bracket values, so portfolios near
-   the legacy regime boundaries may classify differently under
-   IRAPM.
-4. **Reconcile the implementation against the new validation
-   results.** Replace the illustrative reference values in §4.1.1.8
-   with the freshly-validated test-vector data.
+1. **Historical-sequence sweep.** Run the §4.1.1 design against the
+   2005–2025 historical sequence (and stressed windows per §13.4
+   follow-up) at a spread of trigger portfolios spanning the
+   spectrum where each protection mechanism dominates:
+   - Small portfolios (~$300K–$500K) where `I_0` from the annuity
+     formula is the binding sustainability constraint.
+   - Mid-range portfolios ($500K–$1.5M) where neither ceiling
+     binds and the schedule runs unclamped against `I_0`.
+   - Large portfolios ($2M+) where the indexed dollar ceiling
+     binds at or near latch.
 
-The operator has stated that the original validation samples had
-critical flaws that invalidate the results regardless of parameter
-changes, and that *all* tests will be re-run as part of IRAPM
-deployment. This open question merely formalizes that intent: no
-production deployment without fresh validation at the IRAPM
-parameter set.
+2. **Confirm survival** across the spread, or document shortfalls
+   and decide whether parameter values need adjustment (the
+   annuity-input pessimism in §4.1.1, the 7.5% portfolio ceiling
+   rate, or the $4000 base / 2027 base-year of the dollar ceiling).
+
+3. **Confirm ceiling-binding behavior** matches §13.6 expectations:
+   small portfolios never bind either ceiling, large portfolios
+   bind the dollar ceiling at or near latch, drawdown scenarios
+   eventually bind the portfolio-% ceiling.
+
+4. **Reconcile the implementation against the validation results.**
+   Replace the illustrative reference values in §4.1.1.4 with the
+   freshly-validated test-vector data.
 
 This is the **only blocking open question** for production Phase 3
 deployment. The other §14 items are tunable refinements or
-implementation work (ruleset.yaml, runbook). §14.7 alone gates
+implementation work (ruleset.yaml, runbook). §14.6 alone gates
 production-deployment confidence for Phase 3.
 
 ---
@@ -6308,7 +6277,7 @@ otherwise cause duplicate execution:
    transient error and submits twice. IBKR sees two orders with
    the same orderRef; reqAllOpenOrders returns both; our pre-place
    lookup returns the first one and our submission of the second
-   is suppressed. (This is the F6 case from the threat model.)
+   is suppressed.
 
 **Post-placement confirmation:**
 
@@ -6472,7 +6441,7 @@ that the runbook procedure catches at deployment time.
 ### 15.9 TWS / IB Gateway deployment requirements
 
 The IBKRBroker implementation assumes specific TWS/Gateway settings.
-The runbook §14.4 verifies these at deployment; deviation produces
+The runbook §14.3 verifies these at deployment; deviation produces
 silent or noisy failure modes.
 
 | Setting | Required value | Why |
@@ -6517,7 +6486,7 @@ Critical:**
   continues the existing recurring transfer untouched).
 - An alert with the new amount is sent so the operator knows what
   to update.
-- The runbook §14.4 has the manual portal procedure with
+- The runbook §14.3 has the manual portal procedure with
   screenshots, written for the survivor as audience.
 - The cycle does NOT pause; subsequent cycles re-emit the ACH
   update plan entry, the operator handles it at their convenience.

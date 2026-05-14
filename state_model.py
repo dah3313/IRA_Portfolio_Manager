@@ -257,7 +257,18 @@ class ScheduleStateInstance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     i_0_dollars: Decimal
-    trigger_year: int = Field(ge=2020, le=2100)
+    # trigger_year: floor relaxed from 2020 to 1900 to support harness
+    # simulator scenarios that exercise IRAPM against historical market
+    # data (2005-2025). The spec (§3.13, §4.1) assumes Phase 1 starts
+    # in 2027 operationally, so a 2020+ floor would have been a tight
+    # production sanity check — but the simulator legitimately needs
+    # to construct ScheduleStateInstance with historical trigger years
+    # (e.g., a Phase 3 trigger in 2016 during the GFC-recovery period).
+    # The relaxed range still catches actual data corruption: negative
+    # years, two-digit years like 99 or 20, absurd futures like 99999.
+    # Real operational timeline enforcement happens at higher layers
+    # (scenario loader, new_initial_state, ruleset validation).
+    trigger_year: int = Field(ge=1900, le=2200)
     cpi_rate: Decimal
     frozen_years: list[int] = Field(default_factory=list)
 

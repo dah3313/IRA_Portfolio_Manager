@@ -547,6 +547,37 @@ class Broker(Protocol):
         """
         ...
 
+    def resolve_symbol(self, symbol: str) -> ContractRef:
+        """Return a ContractRef for `symbol`, suitable for place_order().
+
+        Used by the action layer for first-time BUY orders of symbols
+        not currently held in the account (the only documented case is
+        the Phase 1→Phase 2 transition's first GBIL purchase — §7.2.1
+        — since GBIL doesn't exist in Phase 1). For symbols already
+        held, the action layer prefers the ContractRef returned by
+        get_positions() (which carries broker-implementation-specific
+        payload) and only falls back to resolve_symbol() for the new-
+        symbol case.
+
+        Implementations:
+          - SyntheticBroker: mints a ContractRef with its BROKER_IMPL_TAG
+            and the symbol; no broker round-trip required.
+          - IBKRBroker: queries TWS via reqContractDetails to resolve
+            the symbol to a conId / exchange / currency triple, populates
+            ContractRef.payload accordingly, and caches the result for
+            the connection's lifetime. May raise BrokerInconsistency if
+            the symbol is ambiguous (multiple matching contracts) or
+            BrokerRejection if the broker reports the symbol as unknown.
+
+        Raises:
+          BrokerNotReady: not connected.
+          BrokerInconsistency: symbol cannot be uniquely resolved (e.g.,
+            multiple matching contracts on different exchanges and the
+            implementation has no tie-breaking rule).
+          BrokerRejection: broker reports symbol unknown.
+        """
+        ...
+
 
 # =============================================================================
 # Context manager for the per-cycle connection lifecycle

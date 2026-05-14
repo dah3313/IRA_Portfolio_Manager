@@ -1,0 +1,14 @@
+- Portfolio is composed of Growth FBCG, AVUV, and fixed income PYLD, JPIE
+- Initial income withdrawals of $3000 a month
+- 24 months withdrawals worth of SGOV buffer in same account but outside of core income generator, SGOV is not calculated in net asset balance or used for anything other than providing crisis mode withdrawals. 
+- 5/25 rebalancing checked once a week using a 6 month synthetic price lookback
+- All income withdrawals from most overweight then Fixed Income proportionally
+- Circuit Breaker 1:  When Core portfolio down 10% via lookback stop rebalancing
+- Circuit Breaker 2:  When core portfolio down 20% lookback stop withdrawals and transition them to SGOV buffer, when core portfolio recovers to 0% at transition point move withdrawals back to Fixed Income asset class
+- After recovery begins refill SGOV buffer via its own mechanism starting with most overweight in portfolio.
+- After CB2 triggered, cascade of withdrawals go from SGOV, when that exhausted Fixed Income, then Growth as a last resort.
+- SMS and email messages are generated once a week containing the state of the portfolio and any additional events ongoing.
+- SMS/email messages for event triggers are sent:  CB1, CB2, Large Rebalance, Cascade Initiation and each point of the cascade, Recovery, there may be more  
+At start + 8 years program transitions to maximum growth phase.  Withdrawals halted
+90/10 assett allocation, buys 'GBIL' for FI as dry powder for opportunistic rebalances 
+Opportunistic rebalances are triggered when Growth down 10% using synthetic lookback
