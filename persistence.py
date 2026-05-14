@@ -73,6 +73,14 @@ class Paths:
     def logs_dir(self) -> Path:
         return self.state_dir / "logs"
 
+    def events_log(self) -> Path:
+        """The IRAPM event log (EVENT_LOG_SPEC §2). Lives at state_dir
+        directly, not under logs/ — it is architecturally distinct from
+        the legacy per-subsystem logs: the system of record, not a
+        per-subsystem diagnostic file. Written by event_log.py only.
+        """
+        return self.state_dir / "events.jsonl"
+
     def cycle_log(self) -> Path:
         return self.logs_dir / "cycle.jsonl"
 
