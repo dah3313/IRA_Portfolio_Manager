@@ -8,16 +8,23 @@ PURPOSE:
 DESIGN (per §7.4):
     All of the following must be true to plan a refill:
       1. Phase is 1, 2, or 3 (refill active in all phases).
-      2. Buffer market value < buffer target.
+      2. Buffer deficit (target - current) is meaningful, i.e., exceeds
+         the buffer's 2% noise floor. Sub-noise-floor deficits (cents
+         of SGOV price drift) do not warrant a refill batch and would
+         halt the cycle on share-quantization at the action layer.
       3. 60-day post-recovery delay window has elapsed (or never applied).
       4. CB state is not CB2 (I10: refill suspended in any CB2 state).
       5. Refill cadence (monthly): no refill batch this calendar month.
 
     When all conditions met:
       - Compute amount = min(monthly_refill_rate, current_deficit).
-      - Source from most-overweight Growth position (tie-break by larger $).
-      - If no Growth position is overweight, source proportionally from
-        all Growth positions.
+      - Source from any Growth position whose surplus over target exceeds
+        the 5/25 meaningful-drift threshold (rebalance_absolute_threshold_rate).
+        Multiple qualifying positions split the refill proportionally to
+        surplus. This reuses the existing drift yardstick rather than
+        introducing a separate "minimum sourceable surplus" tunable.
+      - If no Growth position is meaningfully overweight, source
+        proportionally from all Growth positions.
       - All Growth SELLs clamp at residual floor (I12). If a position
         would breach residual, reduce SELL and corresponding refill.
       - Refill is ALWAYS Growth-sourced, never FI-sourced.
@@ -60,6 +67,7 @@ class SGOVRefillInputs:
     # Tunables
     position_residual_minimum_dollars: Decimal
     sgov_refill_post_recovery_delay_days: int
+    rebalance_absolute_threshold_rate: Decimal
 
 
 def _same_calendar_month(a: datetime, b: datetime) -> bool:
@@ -86,9 +94,25 @@ def decide_buffer_refill(inputs: SGOVRefillInputs) -> Optional[BufferRefillEntry
     if inputs.cb_state == CBState.CB2:
         return None
 
-    # (2) Buffer below target?
+    # (2) Buffer below target by a meaningful amount?
+    #
+    # A deficit smaller than the buffer's noise floor (2% of target)
+    # does not warrant planning a refill batch this cycle. The buffer
+    # naturally drifts by cents day-to-day from SGOV price moves; a
+    # sub-noise-floor deficit would produce a sub-noise-floor refill
+    # batch, and when split across Growth positions, the per-leg dollar
+    # amounts can fall below the action layer's share-quantization
+    # threshold (4 dp ROUND_DOWN) and halt the cycle with
+    # "quantity reduced to zero". The 2% constant is a noise floor,
+    # not a strategy choice — it scales automatically with the buffer
+    # target (which itself scales with CPI via annual review), and is
+    # tight enough that no legitimate refill cycle is suppressed (the
+    # monthly refill rate is ~8.3% of target, so any month with
+    # meaningful accumulated drift produces a refill well above the
+    # floor).
     deficit = inputs.buffer_target_dollars - inputs.buffer_current_value
-    if deficit <= 0:
+    refill_meaningful_drift = inputs.buffer_target_dollars * Decimal("0.02")
+    if deficit < refill_meaningful_drift:
         return None
 
     # (3) Post-recovery delay window
@@ -128,14 +152,26 @@ def decide_buffer_refill(inputs: SGOVRefillInputs) -> Optional[BufferRefillEntry
         Decimal("0"),
     )
     overweight_growth: dict[str, Decimal] = {}
+    # A Growth position counts as "overweight enough to source from" only
+    # when its surplus exceeds the same meaningful-drift threshold the
+    # 5/25 rebalancer uses (rebalance_absolute_threshold_rate). Without
+    # this gate, a position overweight by pennies (Decimal rounding,
+    # intra-cycle price movement, prior partial-fill residue) would be
+    # treated as a source, producing a SourceLine with a near-zero
+    # dollar_amount that rounds to zero shares at the action layer and
+    # halts the cycle. Reusing the existing 5/25 rate keeps drift
+    # semantics consistent across the system and scales naturally with
+    # the portfolio (no new operator-tunable surface area).
+    drift_floor = core_total * inputs.rebalance_absolute_threshold_rate
     for s in inputs.growth_symbols:
         w = inputs.target_weights.get(s)
         if w is None:
             continue
         target_v = core_total * w
         cur_v = growth_values[s]
-        if cur_v > target_v:
-            overweight_growth[s] = cur_v - target_v
+        surplus = cur_v - target_v
+        if surplus >= drift_floor and surplus > 0:
+            overweight_growth[s] = surplus
 
     sources_dict: dict[str, Decimal] = {}
 

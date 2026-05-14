@@ -799,6 +799,7 @@ def _evaluate_sgov_refill(state: OperatingState,
         target_weights=weights,
         position_residual_minimum_dollars=ruleset.position_residual_minimum_dollars,
         sgov_refill_post_recovery_delay_days=ruleset.sgov_refill_post_recovery_delay_days,
+        rebalance_absolute_threshold_rate=ruleset.rebalance_absolute_threshold_rate,
     )
     return decide_buffer_refill(refill_inputs)
 

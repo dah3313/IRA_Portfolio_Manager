@@ -16,6 +16,132 @@ Conventions:
 
 ---
 
+## 2026-05-14 — Issue #4 fix + observability architecture (1 fix, 11 tests added, 2 specs drafted)
+
+Resolves the outstanding halt from 2026-05-13's session (FBCG
+zero-quantity SELL on 2005-05-04) and lands the design for a complete
+rebuild of IRAPM's observability and reporting subsystems. The fix is
+code; the architecture work is two design documents — no implementation
+started yet for the new subsystems.
+
+Pre-fix run state: baseline_20yr_phase3_2016.yaml ran end-to-end with
+1 halt on 2005-05-04 (FBCG zero-quantity SELL absorbed by harness as
+synthetic halted record; downstream cycles unaffected).
+
+Post-fix run state: zero halts. Terminal AUM moved $3,304,555.43 →
+$3,304,781.68 (the $226 delta reflects the previously-failed trades now
+executing and compounding over the remaining 20-year window).
+
+### Fixed
+
+- **SGOV refill drift floors (Issue #4).**
+  `sgov_refill.py`: two related bugs producing zero-share-quantity
+  SourceLines at the action layer.
+
+  Bug A (latent overweight branch): `decide_buffer_refill` classified
+  any Growth position with `cur_v > target_v` as overweight without a
+  meaningful-drift floor. Pennies of drift could produce near-zero
+  refill allocations rounding to zero shares.
+
+  Bug B (the actual 2005-05-04 producer): when the buffer deficit was
+  a few cents (SGOV intraday price drift relative to target), the
+  proportional-fallback split produced sub-cent SourceLines for each
+  Growth position — same halt class.
+
+  Fix A: meaningful-drift gate on overweight detection. A position
+  counts as overweight only when its surplus ≥
+  `core_total * rebalance_absolute_threshold_rate` (reuses the
+  existing 5% drift yardstick from the 5/25 rebalancer; no new
+  tunable).
+
+  Fix B: noise-floor gate on buffer deficit itself. Refill is planned
+  only when `deficit ≥ buffer_target_dollars * 0.02` (2% of target,
+  hardcoded; scales with `buffer_target` which scales with CPI; well
+  below the monthly refill rate of ~8.3% of target).
+
+  `sgov_refill.py`: added `rebalance_absolute_threshold_rate` field to
+  `SGOVRefillInputs`; added both drift-floor gates in `decide_buffer_refill`;
+  updated docstring.
+  `decision_layer.py`: pass `ruleset.rebalance_absolute_threshold_rate`
+  through at the one call site.
+  Tests: `test_sgov_refill_meaningful_drift.py` (11 tests covering both
+  bug variants, boundary cases at the threshold edges, and the healthy
+  cycle-3 scenario where refill should still fire).
+
+  Lesson worth flagging: an earlier diagnosis on this bug was incorrect
+  and a fix was implemented against the wrong root cause before being
+  caught. Going forward: reproduce the bug in the sandbox before
+  designing a fix.
+
+### Design landed (no code yet)
+
+Two specification documents drafted for the next session's implementation.
+Neither is reflected in production code as of this changelog entry.
+
+- **`EVENT_LOG_SPEC.md` (NEW, 1396 lines, ~88 KB).**
+  Complete event log architecture. Single append-only `events.jsonl`
+  at `paths.state_dir`, plain JSONL, no compression, no rotation, no
+  pruning — kept indefinitely. 13 event types cataloged with full
+  payload schemas. Writer API contract (single `append()` function in
+  `event_log.py`), reader patterns, migration plan for retiring
+  `cycle.jsonl` and `cb_transitions.jsonl`.
+
+  Architectural commitment: IRAPM is the system of record. The slave
+  box reconstructs from IBKR directly on self-promotion; the event log
+  is operator-facing infrastructure (read by the reporter), not on the
+  runtime critical path.
+
+- **`REPORT_DECISIONS.md` (NEW, ~14 KB).**
+  Reporter design captured as decisions rather than full spec. Three
+  output file types: `current_status.txt` (overwritten weekly,
+  current state + last 4 weeks' activity), `{YYYY}.txt` (per-year
+  monthly rows, accumulating, with year-end summary appended at close,
+  8-year rolling retention), `report_{timestamp}_{scenario}.txt`
+  (simulator output, single file per run). Fixed-width format,
+  annotation lines below data rows, column set documented.
+
+  Reporter module is `report.py` at repo root, pure consumer of
+  `events.jsonl`. Replaces the existing 12-file IPMS output package,
+  which gets deleted in Phase 3 of the new-architecture rollout.
+
+- **`HANDOFF_2026-05-14.md` (NEW, ~18 KB).**
+  Detailed handoff for the next session's implementation work.
+  Operator preferences, file-of-record list, phased implementation
+  plan (writer → reporter → IPMS deletion → consumer migration →
+  legacy writer deletion), and a list of "things to NOT do."
+
+### Known issues (not addressed today)
+
+- **Harness bail propagation.** Still unchanged from 2026-05-13.
+  Counter increments correctly but `HarnessFailureError` raise at
+  threshold doesn't terminate the run. Moot in current baseline since
+  Issue #4 was the only recurring failure.
+
+- **Deposit modeling (Path C).** Unchanged from 2026-05-13.
+  Architectural decision still pending.
+
+- **`test_ibkr_broker_phase2c.py` disrupts pytest collection.** Pre-existing
+  issue. The file is a script with print statements rather than pytest
+  test functions; pytest collection fails with `KeyError`. The 20 tests
+  inside it pass via direct execution. Workaround:
+  `pytest --ignore=test_ibkr_broker_phase2c.py test_*.py -v`. Fix is
+  out of scope.
+
+- **Gemini review items not addressed.** Same list as 2026-05-13:
+  `action_layer.py` Phase 3 I_0 cash settlement race; `rebalancer.py`
+  FI-sacrosanct suppression breadth.
+
+### Pending work for next session
+
+Implementation of the event log writer and the reporter per the two
+new specs. Phase 1 (writer + emission sites + tests), Phase 2
+(reporter + integration), Phase 3 (delete IPMS output), Phase 4
+(migrate remaining consumers off cycle.jsonl and cb_transitions.jsonl),
+Phase 5 (delete legacy writers). See `HANDOFF_2026-05-14.md` for full
+detail.
+
+---
+
 ## 2026-05-13 — Backtest viability fixes (6 fixes, 38 tests added)
 
 Brings `baseline_20yr_phase3_2016.yaml` from "broken in multiple ways"
