@@ -68,11 +68,29 @@ The reporter produces three kinds of files, distinguished by purpose and lifecyc
 
 **Content:**
 - Header block (scenario name, run timestamp, window, headline metrics)
+- `=== RULESET ===` section displaying the tuning-relevant ruleset values used for this run (see below)
 - `=== ANNUAL ===` section with one row per year of the run, annotations show all events from the prior 12 months
 - `=== MONTHLY ===` section with one row per month, annotations show events that occurred in that month
 - `=== LEGEND ===` footer explaining the column meanings and annotation codes
 
 **Lifecycle:** Written once, at end of simulation run. Never modified. Filename includes a timestamp so consecutive runs of the same scenario do not overwrite each other.
+
+**Ruleset section** (simulation report only — production `current_status.txt` and `{YYYY}.txt` do NOT include it):
+
+The simulator is used for offline parameter tuning. When the operator changes ruleset values to compare scenarios, the report must show which values produced this run's result so two reports can be diffed unambiguously. The production reports do not include this section — production reads from a single live ruleset that doesn't change between cycles, so embedding it in every weekly status file would be noise.
+
+The section shows tuning-relevant fields only, not the full ruleset. The full ruleset.yaml file is copied verbatim into the run's output directory (`runs/{...}/ruleset_used.yaml`) for diff-tooling; the on-report display is a curated tuning-readable summary.
+
+Tuning-relevant fields (the on-report display):
+
+- **Withdrawal mechanics:** `phase1_initial_monthly_withdrawal_dollars`, `phase3_monthly_payment_ceiling_rate`, `phase3_dollar_ceiling_base_dollars`, `phase3_dollar_ceiling_base_year`, `inflation_rate`
+- **Phase 3 I_0 calc:** `phase3_i0_calc_return_assumption`, `phase3_i0_calc_inflation_assumption`, `phase3_i0_calc_horizon_years`
+- **CB thresholds:** the cb-trigger lookback thresholds (e.g., `cb1_signal_threshold`, `cb2_signal_threshold`), `freeze_evaluation_threshold_days`
+- **Buffer mechanics:** `sgov_buffer_target_months`, `cash_buffer_offset_dollars`
+
+The implementing function (`report.py::_format_ruleset_section`) selects from the in-memory Ruleset object — not from re-parsing ruleset.yaml — since the operator may have applied scenario-specific overrides. The Ruleset Pydantic model is the authoritative source for "values that this run actually used."
+
+The full-file copy (`ruleset_used.yaml`) happens at run-start, written by ipms.engine, capturing the post-override merged form. This is independent of report.py and lives in the simulator wrapper, not the reporter.
 
 **Annual section event attribution:** Events listed in the annual row for year Y are events that fired during the 12 months ending at that snapshot (i.e., during year Y-1 for the row dated YYYY-01-01). This convention is operator-confirmed.
 

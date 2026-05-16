@@ -79,6 +79,7 @@ from alerter import StdoutAlerter, load_templates
 from clock import AdvancingClock
 from cycle import CycleConfig, run_daily_token_cycle, run_weekly_cycle
 from persistence import Paths, load_operating_state, save_operating_state
+import report
 from ruleset_model import Ruleset
 from state_model import OperatingState, new_initial_state
 from synthetic_broker import SyntheticBroker
@@ -1715,6 +1716,34 @@ def run_scenario(scenario_path: Path) -> int:
                 print(f"Harness state preserved at: {persistent_dst}")
             except Exception as e:
                 logger.warning("could not preserve harness state: %s", e)
+
+        # Emit the simulation report (REPORT_SPEC §7.4). One call at
+        # end-of-run. Writes into sim_result.output_dir (the public
+        # IPMS output dir) so operators find it alongside the other
+        # run artifacts. Wrapped per §7.6 — reporter failures must
+        # never break the run. If IPMS didn't materialize an output
+        # dir (some test paths), log and skip rather than warning,
+        # since that's an intentional configuration, not a failure.
+        if sim_result.output_dir is not None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            report_path = (
+                sim_result.output_dir
+                / f"report_{timestamp}_{scenario.name}.txt"
+            )
+            try:
+                report.write_simulation_report(
+                    state_dir=state_dir,
+                    output_path=report_path,
+                    scenario_name=scenario.name,
+                    ruleset=ruleset,
+                )
+                print(f"Simulation report written to: {report_path}")
+            except Exception as e:
+                logger.warning("simulation report failed: %s", e)
+        else:
+            logger.info(
+                "IPMS produced no output_dir; skipping simulation report",
+            )
 
         # Print summary.
         _print_summary(scenario, sim_result, final_state, all_passed, failures)

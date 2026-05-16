@@ -122,6 +122,29 @@ class WithdrawalEntry(BaseModel):
     then initiates the ACH transfer. The ACH amount equals
     `total_dollar_amount`; the SELL dollar amounts sum to the same value
     (modulo rounding).
+
+    Phase 3 cap tracking
+    --------------------
+    `binding_ceiling`, `scheduled_amount_dollars`, and `was_capped`
+    surface the Phase 3 ceiling decision from `decide_withdrawal` so
+    that action_layer can emit the spec-conformant `withdrawal_executed`
+    event (EVENT_LOG_SPEC §4.7) without recomputing the ceilings.
+
+    `binding_ceiling` values match EVENT_LOG_SPEC §4.7 (the event log
+    is the system of record; alert template uses different value names
+    translated at the alert-context build site):
+      - "guardrail" — the Phase 3 portfolio-percent clamp
+        (current_portfolio × rate / 12) bound the payment. The spec's
+        central Guardrail. Reporter cash_out symbol: **G**.
+      - "dollar_cap" — the Phase 3 inflation-indexed dollar Cap bound
+        the payment. Reporter cash_out symbol: **C**.
+      - "both" — both bound within rounding (rare).
+      - None — withdrawal paid the full scheduled amount.
+
+    `scheduled_amount_dollars` is the pre-cap amount; equal to
+    `total_dollar_amount` when not capped. `was_capped` is True iff the
+    actual payment was less than the schedule. All three are populated
+    only for Phase 3; Phase 1 always emits None / equal-to-total / False.
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -132,6 +155,9 @@ class WithdrawalEntry(BaseModel):
     scheduled_ach_date: date
     cb_state_at_decision: CBState  # for cycle log forensics
     cascade_growth_used: bool = False  # set if cascade reached Growth (§7.3.2 step 3)
+    binding_ceiling: Optional[str] = None
+    scheduled_amount_dollars: Optional[Decimal] = None
+    was_capped: bool = False
 
 
 class BufferRefillEntry(BaseModel):

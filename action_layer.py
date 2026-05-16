@@ -85,6 +85,7 @@ from cycle_attempt import (
     PlacedOrderRecord,
     build_client_order_id,
 )
+import event_log
 from persistence import Paths
 from plan_model import (
     ACHScheduleUpdateEntry,
@@ -111,6 +112,34 @@ from state_model import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Time helpers
+# =============================================================================
+
+# Eastern Time — action_layer treats the harness/sim's naive "wall-clock"
+# datetimes as ET, then converts to UTC for event log emission. Same
+# convention as cycle.py and AdvancingClock.now_utc in clock.py.
+from zoneinfo import ZoneInfo
+_ET = ZoneInfo("America/New_York")
+
+
+def _to_aware_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to tz-aware UTC for event log emission.
+
+    EVENT_LOG_SPEC §3.2 mandates tz-aware UTC for every timestamp.
+    Action_layer is called by cycle.py with `now=decision_clock`,
+    which may be naive (legacy Clock contract). This helper handles
+    both cases: naive → treat as ET, convert to UTC; aware → convert.
+
+    Mirrors cycle.py._to_aware_utc; intentionally duplicated rather
+    than imported to keep action_layer's dependency surface minimal.
+    Six lines is a cost worth paying for module independence.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_ET).astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 # =============================================================================
@@ -252,17 +281,35 @@ class _ContractCache:
 # Quantity refresh helper
 # =============================================================================
 
+@dataclass(frozen=True)
+class _QuantityRefresh:
+    """Outcome of the price-refresh + share-recompute step.
+
+    Captures both the share quantity and the diagnostic detail
+    needed to populate the `order_placed` event's price_refresh_*
+    fields (EVENT_LOG_SPEC §4.5).
+    """
+    quantity: Decimal
+    price_refresh_dollars: Optional[Decimal]  # None when fallback used
+    price_refresh_status: str                 # "OK" or "UNAVAILABLE"
+    used_fallback_estimate: bool              # True when price was unusable
+
+
 def _refresh_quantity(
     broker: Broker,
     symbol: str,
     dollar_amount: Decimal,
     fallback_estimate: Decimal,
-) -> Decimal:
+) -> _QuantityRefresh:
     """Convert a dollar amount into a share quantity using a fresh price.
 
     Falls back to the SourceLine's stale estimate if the broker reports
     the price as UNAVAILABLE. Rounds to 4 dp ROUND_DOWN to never
     overshoot.
+
+    Returns _QuantityRefresh carrying both the quantity and the
+    price-refresh diagnostic detail. Callers (_place_one_order) use
+    the diagnostic fields to populate the order_placed event.
     """
     try:
         prices = broker.get_prices([symbol])
@@ -271,13 +318,30 @@ def _refresh_quantity(
             "get_prices(%s) failed: %s; using stale share estimate %s",
             symbol, e, fallback_estimate,
         )
-        return _quantize_shares(fallback_estimate)
+        return _QuantityRefresh(
+            quantity=_quantize_shares(fallback_estimate),
+            price_refresh_dollars=None,
+            price_refresh_status="UNAVAILABLE",
+            used_fallback_estimate=True,
+        )
     price = prices.get(symbol)
     if (price is None or price.status != PriceStatus.OK
         or price.price is None or price.price <= 0):
-        return _quantize_shares(fallback_estimate)
+        return _QuantityRefresh(
+            quantity=_quantize_shares(fallback_estimate),
+            price_refresh_dollars=None,
+            price_refresh_status=(
+                price.status.value if price is not None else "UNAVAILABLE"
+            ),
+            used_fallback_estimate=True,
+        )
     shares = dollar_amount / price.price
-    return _quantize_shares(shares)
+    return _QuantityRefresh(
+        quantity=_quantize_shares(shares),
+        price_refresh_dollars=price.price,
+        price_refresh_status="OK",
+        used_fallback_estimate=False,
+    )
 
 
 def _quantize_shares(shares: Decimal) -> Decimal:
@@ -288,6 +352,90 @@ def _quantize_shares(shares: Decimal) -> Decimal:
 # =============================================================================
 # Per-order primitive
 # =============================================================================
+
+def _emit_fills(
+    paths: Paths,
+    cycle_id: str,
+    coid: str,
+    res: OrderResult,
+    plan_entry_index: int,
+    plan_entry_kind: str,
+    symbol: str,
+    side: OrderSide,
+    quantity_submitted: Decimal,
+    intended_dollar_amount: Decimal,
+    now_aware: datetime,
+) -> None:
+    """Emit one fill_received event per Fill in OrderResult.fills.
+
+    Per EVENT_LOG_SPEC §4.6: every dollar that moves into or out of
+    the portfolio is represented by a fill_received event. This is
+    the load-bearing event for the reporter's cash_flow_in /
+    cash_flow_out columns.
+
+    Edge case: if OrderResult.fills is empty but the order reached
+    FILLED status (shouldn't happen with a well-behaved broker but
+    is observable per the OrderResult type), emit a single synthetic
+    fill_received using the submitted quantity and intended-dollar-
+    derived price. Protects against silent loss of fill records.
+
+    `now_aware` must be tz-aware UTC. `Fill.fill_time` is converted
+    via _to_aware_utc since the broker may report naive or non-UTC
+    datetimes.
+    """
+    fills = res.fills
+    if not fills:
+        # Synthetic single fill — broker reached FILLED but didn't
+        # populate fills. Use submitted quantity at the implied price.
+        synthetic_price = (
+            intended_dollar_amount / quantity_submitted
+            if quantity_submitted > 0 else Decimal("0")
+        )
+        event_log.append_fill_received(
+            paths,
+            cycle_id=cycle_id,
+            client_order_id=coid,
+            broker_order_id=res.broker_order_id or "",
+            fill_id=f"synthetic-{coid}",
+            plan_entry_index=plan_entry_index,
+            plan_entry_kind=plan_entry_kind,
+            symbol=symbol,
+            side=side.value,
+            quantity_shares=quantity_submitted,
+            price_dollars=synthetic_price,
+            fill_dollar_amount=intended_dollar_amount,
+            fill_time=now_aware,
+            fill_index=0,
+            total_fills_for_order=1,
+            now=now_aware,
+            in_sim_timestamp=now_aware,
+        )
+        return
+
+    total_fills = len(fills)
+    for idx, fill in enumerate(fills):
+        fill_dollars = fill.quantity * fill.price
+        fill_time_aware = _to_aware_utc(fill.fill_time)
+        event_log.append_fill_received(
+            paths,
+            cycle_id=cycle_id,
+            client_order_id=coid,
+            broker_order_id=res.broker_order_id or "",
+            fill_id=fill.fill_id,
+            plan_entry_index=plan_entry_index,
+            plan_entry_kind=plan_entry_kind,
+            symbol=symbol,
+            side=side.value,
+            quantity_shares=fill.quantity,
+            price_dollars=fill.price,
+            fill_dollar_amount=fill_dollars,
+            fill_time=fill_time_aware,
+            fill_index=idx,
+            total_fills_for_order=total_fills,
+            now=now_aware,
+            in_sim_timestamp=now_aware,
+        )
+
 
 def _place_one_order(
     *,
@@ -301,13 +449,22 @@ def _place_one_order(
     order_type: OrderType,
     limit_price: Optional[Decimal],
     plan_entry_index: int,
+    plan_entry_kind: str,
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> tuple[Optional[OrderResult], Optional[str], list[str]]:
     """Submit one order, wait for terminal status, return outcome.
 
     Returns (result, error_message, [client_order_id]).
+
+    Emits an `order_placed` event (EVENT_LOG_SPEC §4.5) after
+    broker.place_order() returns successfully — i.e., the broker
+    accepted the order and assigned a broker_order_id. Subsequently
+    emits one `fill_received` event per Fill in OrderResult.fills
+    once the order reaches FILLED status.
     """
     coid = build_client_order_id(
         cycle_uuid=attempt.cycle_uuid,
@@ -316,9 +473,10 @@ def _place_one_order(
         side=side.value,
     )
 
-    quantity = _refresh_quantity(
+    refresh = _refresh_quantity(
         broker, symbol, dollar_amount, fallback_share_estimate
     )
+    quantity = refresh.quantity
     if quantity <= 0:
         return None, f"quantity reduced to zero for {symbol}", [coid]
 
@@ -365,8 +523,37 @@ def _place_one_order(
     except OSError as e:
         logger.warning("placed_orders append failed (non-fatal): %s", e)
 
+    # Emit order_placed event (EVENT_LOG_SPEC §4.5). Done AFTER the
+    # broker accepted and BEFORE we wait for terminal status — every
+    # order that reached the broker is logged, including ones that
+    # subsequently time out or get cancelled.
+    now_aware = _to_aware_utc(now)
+    event_log.append_order_placed(
+        paths,
+        cycle_id=cycle_id,
+        client_order_id=coid,
+        broker_order_id=res.broker_order_id or "",
+        plan_entry_index=plan_entry_index,
+        plan_entry_kind=plan_entry_kind,
+        symbol=symbol,
+        side=side.value,
+        order_type=order_type.value,
+        quantity_shares=quantity,
+        limit_price_dollars=limit_price,
+        time_in_force=TimeInForce.DAY.value,
+        intended_dollar_amount=dollar_amount,
+        price_refresh_dollars=refresh.price_refresh_dollars,
+        price_refresh_status=refresh.price_refresh_status,
+        used_fallback_estimate=refresh.used_fallback_estimate,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+
     # Terminal status check
     if res.status == OrderStatusValue.FILLED:
+        _emit_fills(paths, cycle_id, coid, res, plan_entry_index,
+                    plan_entry_kind, symbol, side, quantity, dollar_amount,
+                    now_aware)
         return res, None, [coid]
     if res.status in (OrderStatusValue.CANCELLED, OrderStatusValue.REJECTED):
         reason = res.rejection_reason or res.status.value
@@ -380,6 +567,14 @@ def _place_one_order(
         except BrokerError as e:
             return None, f"get_order_status failed: {e}", [coid]
         if status.status == OrderStatusValue.FILLED:
+            # Re-fetch fills since the initial OrderResult predates terminal
+            # status. The broker is responsible for populating OrderResult
+            # with fills at FILLED transition; if the post-poll res still
+            # has no fills, _emit_fills emits a synthetic single-fill event
+            # per spec §4.6's empty-fills edge case.
+            _emit_fills(paths, cycle_id, coid, res, plan_entry_index,
+                        plan_entry_kind, symbol, side, quantity,
+                        dollar_amount, now_aware)
             return res, None, [coid]
         if status.status in (OrderStatusValue.CANCELLED, OrderStatusValue.REJECTED):
             reason = status.rejection_reason or status.status.value
@@ -401,13 +596,19 @@ def _place_source_lines(
     sources: list[SourceLine],
     side: OrderSide,
     plan_entry_index: int,
+    plan_entry_kind: str,
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> tuple[list[str], Optional[str]]:
     """Submit a multi-leg group of orders (one per SourceLine).
 
-    Returns (submitted_coids, error_message).
+    Returns (submitted_coids, error_message). `plan_entry_kind` is the
+    EntryKind.value of the parent plan entry (e.g., "withdrawal",
+    "buffer_refill") — passed through to event_log emissions so each
+    order_placed / fill_received can record its parent entry context.
     """
     coids: list[str] = []
     for line in sources:
@@ -424,9 +625,12 @@ def _place_source_lines(
             order_type=OrderType.MKT,
             limit_price=None,
             plan_entry_index=plan_entry_index,
+            plan_entry_kind=plan_entry_kind,
             timeout_seconds=timeout_seconds,
             cycle_attempt_path=cycle_attempt_path,
             now=now,
+            paths=paths,
+            cycle_id=cycle_id,
         )
         coids.extend(oids)
         if err is not None:
@@ -447,6 +651,8 @@ def _execute_order(
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> EntryExecutionResult:
     """Execute a standalone OrderEntry."""
     res, err, coids = _place_one_order(
@@ -460,9 +666,12 @@ def _execute_order(
         order_type=entry.order_type,
         limit_price=entry.limit_price,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.ORDER.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path,
         now=now,
+        paths=paths,
+        cycle_id=cycle_id,
     )
     if err is None:
         return EntryExecutionResult(
@@ -486,14 +695,35 @@ def _execute_withdrawal(
     dry_run: bool,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
+    state: OperatingState,
 ) -> EntryExecutionResult:
-    """§8.2.2 — SELLs; broker-side recurring ACH wires the cash out."""
+    """§8.2.2 — SELLs; broker-side recurring ACH wires the cash out.
+
+    Emits a `withdrawal_executed` event (EVENT_LOG_SPEC §4.7) after
+    every SELL leg reaches terminal-filled status. The event records
+    the source breakdown (per-symbol dollar amounts + originating
+    client_order_ids) for cross-reference with fill_received events.
+
+    NOTE on binding_ceiling/scheduled_amount_dollars/was_capped fields:
+    The WithdrawalEntry dataclass does not currently carry the
+    pre-cap scheduled amount or the binding-ceiling identifier;
+    decision_layer.apply_phase3_ceilings() computes these but doesn't
+    surface them to the plan entry. For now this event is emitted with
+    binding_ceiling=null, scheduled_amount_dollars=total_dollar_amount,
+    was_capped=false. A focused follow-up will add these fields to
+    WithdrawalEntry so the event payload becomes fully informative.
+    The data path is otherwise complete.
+    """
     coids, err = _place_source_lines(
         broker=broker, attempt=attempt, contracts=contracts,
         sources=entry.sources, side=OrderSide.SELL,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.WITHDRAWAL.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     if err:
         return EntryExecutionResult(
@@ -502,6 +732,53 @@ def _execute_withdrawal(
             submitted_order_ids=coids,
             note="partial_fills_in_cycle_log",
         )
+
+    # Emit withdrawal_executed (EVENT_LOG_SPEC §4.7). All SELL legs
+    # filled at this point; ACH disbursement is broker-side and not
+    # itself a separate IRAPM event.
+    now_aware = _to_aware_utc(now)
+    sources_payload: list[dict] = []
+    for src in entry.sources:
+        # Each source's contributing client_order_ids: derived by
+        # filtering the all-legs coid list for the source's symbol.
+        # The coid encodes symbol via build_client_order_id() format,
+        # so we match by suffix containing the symbol+side.
+        symbol_marker = f"-{src.symbol}-SELL"
+        src_coids = [c for c in coids if symbol_marker in c]
+        sources_payload.append({
+            "symbol": src.symbol,
+            "dollar_amount": str(src.dollar_amount),
+            "client_order_ids": src_coids,
+        })
+    # Build the withdrawal_executed payload (EVENT_LOG_SPEC §4.7).
+    # `scheduled_amount_dollars` defaults to total when not capped
+    # (Phase 1 always; Phase 3 unbound case). `binding_ceiling` is
+    # one of: "portfolio_percent", "dollar", "both" (mapping to
+    # reporter symbols G, C, both), or None when not capped.
+    scheduled_amount = (
+        entry.scheduled_amount_dollars
+        if entry.scheduled_amount_dollars is not None
+        else entry.total_dollar_amount
+    )
+    withdrawal_payload = {
+        "withdrawal_dollar_amount": str(entry.total_dollar_amount),
+        "scheduled_ach_date": entry.scheduled_ach_date.isoformat(),
+        "binding_ceiling": entry.binding_ceiling,
+        "scheduled_amount_dollars": str(scheduled_amount),
+        "amount_paid_dollars": str(entry.total_dollar_amount),
+        "was_capped": entry.was_capped,
+        "sources": sources_payload,
+        "phase": state.phase.value,
+        "income_state_at_withdrawal": state.income_state.value,
+    }
+    event_log.append_withdrawal_executed(
+        paths,
+        cycle_id=cycle_id,
+        payload=withdrawal_payload,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+
     return EntryExecutionResult(
         kind=EntryKind.WITHDRAWAL, success=True,
         note=f"sold {entry.total_dollar_amount} for ACH on {entry.scheduled_ach_date}",
@@ -519,14 +796,18 @@ def _execute_buffer_refill(
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> EntryExecutionResult:
     """§8.2.3 — SELL Growth, then BUY SGOV."""
     coids, err = _place_source_lines(
         broker=broker, attempt=attempt, contracts=contracts,
         sources=entry.growth_sources, side=OrderSide.SELL,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.BUFFER_REFILL.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     if err:
         return EntryExecutionResult(
@@ -541,8 +822,10 @@ def _execute_buffer_refill(
         fallback_share_estimate=Decimal("0"),
         order_type=OrderType.MKT, limit_price=None,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.BUFFER_REFILL.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     coids.extend(buy_coids)
     if err:
@@ -567,6 +850,8 @@ def _execute_cash_refill(
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> EntryExecutionResult:
     """Small cash adjustment — exactly one of SELL or BUY."""
     if entry.sell_source is not None:
@@ -574,8 +859,10 @@ def _execute_cash_refill(
             broker=broker, attempt=attempt, contracts=contracts,
             sources=[entry.sell_source], side=OrderSide.SELL,
             plan_entry_index=plan_entry_index,
+            plan_entry_kind=EntryKind.CASH_REFILL.value,
             timeout_seconds=timeout_seconds,
             cycle_attempt_path=cycle_attempt_path, now=now,
+            paths=paths, cycle_id=cycle_id,
         )
         return EntryExecutionResult(
             kind=EntryKind.CASH_REFILL, success=(err is None),
@@ -588,8 +875,10 @@ def _execute_cash_refill(
             broker=broker, attempt=attempt, contracts=contracts,
             sources=[entry.buy_target], side=OrderSide.BUY,
             plan_entry_index=plan_entry_index,
+            plan_entry_kind=EntryKind.CASH_REFILL.value,
             timeout_seconds=timeout_seconds,
             cycle_attempt_path=cycle_attempt_path, now=now,
+            paths=paths, cycle_id=cycle_id,
         )
         return EntryExecutionResult(
             kind=EntryKind.CASH_REFILL, success=(err is None),
@@ -612,14 +901,18 @@ def _execute_large_cash_deployment(
     timeout_seconds: int,
     cycle_attempt_path,
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> EntryExecutionResult:
     """§8.2.4 — BUYs only (D11)."""
     coids, err = _place_source_lines(
         broker=broker, attempt=attempt, contracts=contracts,
         sources=entry.buys, side=OrderSide.BUY,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.LARGE_CASH_DEPLOYMENT.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     if err:
         return EntryExecutionResult(
@@ -657,14 +950,24 @@ def _execute_phase_transition(
     timeout_seconds: int,
     now: datetime,
     cycle_attempt_path,
+    paths: Paths,
+    cycle_id: str,
 ) -> tuple[EntryExecutionResult, OperatingState]:
-    """§8.2.5 — SELLs, optionally compute I_0 from post-SELL portfolio, BUYs, persist."""
+    """§8.2.5 — SELLs, optionally compute I_0 from post-SELL portfolio, BUYs, persist.
+
+    NOTE: this turn's pass threads paths/cycle_id through but does
+    NOT yet emit the phase_transition event (EVENT_LOG_SPEC §4.9).
+    The emission is in the next pass alongside cb_transition and the
+    two state_snapshot triggers.
+    """
     sell_coids, err = _place_source_lines(
         broker=broker, attempt=attempt, contracts=contracts,
         sources=entry.sells, side=OrderSide.SELL,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.PHASE_TRANSITION.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     if err:
         return EntryExecutionResult(
@@ -690,8 +993,10 @@ def _execute_phase_transition(
         broker=broker, attempt=attempt, contracts=contracts,
         sources=entry.buys, side=OrderSide.BUY,
         plan_entry_index=plan_entry_index,
+        plan_entry_kind=EntryKind.PHASE_TRANSITION.value,
         timeout_seconds=timeout_seconds,
         cycle_attempt_path=cycle_attempt_path, now=now,
+        paths=paths, cycle_id=cycle_id,
     )
     all_coids = sell_coids + buy_coids
     if err:
@@ -738,6 +1043,52 @@ def _execute_phase_transition(
             "buffer_state": new_buffer,
         })
 
+    # Emit phase_transition event (EVENT_LOG_SPEC §4.9) + state_snapshot
+    # (§4.12 trigger="phase_transition"). Done after state mutation
+    # completes so the snapshot reflects the post-transition state.
+    now_aware = _to_aware_utc(now)
+
+    def _sources_with_coids(source_list, coid_list, side_marker: str) -> list[dict]:
+        """Build per-symbol sources array with cross-ref client_order_ids."""
+        out: list[dict] = []
+        for src in source_list:
+            symbol_marker = f"-{src.symbol}-{side_marker}"
+            src_coids = [c for c in coid_list if symbol_marker in c]
+            out.append({
+                "symbol": src.symbol,
+                "dollar_amount": str(src.dollar_amount),
+                "client_order_ids": src_coids,
+            })
+        return out
+
+    phase_transition_payload: dict = {
+        "from_phase": entry.from_phase.value,
+        "to_phase": entry.to_phase.value,
+        "is_phase3_activation": entry.is_phase3_activation,
+        "sells": _sources_with_coids(entry.sells, sell_coids, "SELL"),
+        "buys": _sources_with_coids(entry.buys, buy_coids, "BUY"),
+        "phase3_i0_dollars": None,
+        "phase3_i0_inputs": None,
+    }
+    if entry.is_phase3_activation and post_sell_portfolio is not None:
+        # i_0 was just computed above; capture both it and the inputs
+        # that produced it for long-horizon audit (§4.9 notes).
+        phase_transition_payload["phase3_i0_dollars"] = str(i_0)
+        phase_transition_payload["phase3_i0_inputs"] = {
+            "post_sell_portfolio_dollars": str(post_sell_portfolio),
+            "return_assumption": str(ruleset.phase3_i0_calc_return_assumption),
+            "inflation_assumption": str(ruleset.phase3_i0_calc_inflation_assumption),
+            "horizon_years": ruleset.phase3_i0_calc_horizon_years,
+        }
+    event_log.append_phase_transition(
+        paths,
+        cycle_id=cycle_id,
+        payload=phase_transition_payload,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+    _emit_state_snapshot(paths, cycle_id, new_state, "phase_transition", now_aware)
+
     return EntryExecutionResult(
         kind=EntryKind.PHASE_TRANSITION, success=True,
         note=f"transitioned {entry.from_phase.value} -> {entry.to_phase.value}",
@@ -746,13 +1097,59 @@ def _execute_phase_transition(
     ), new_state
 
 
+def _emit_state_snapshot(
+    paths: Paths,
+    cycle_id: str,
+    state: OperatingState,
+    trigger: str,
+    now_aware: datetime,
+) -> None:
+    """Emit a state_snapshot event (EVENT_LOG_SPEC §4.12).
+
+    Mirrors cycle.py's monthly_heartbeat emission pattern: dumps the
+    current OperatingState via model_dump(mode="json") and prefixes
+    with a trigger field. Used by:
+      - _execute_cb_state_transition (trigger="cb_transition")
+      - _execute_phase_transition (trigger="phase_transition")
+
+    The third trigger source ("annual_review_completed") lives in
+    annual_review.py; the fourth ("monthly_heartbeat") lives in
+    cycle.py.
+    """
+    payload = {
+        "trigger": trigger,
+        **state.model_dump(mode="json"),
+    }
+    event_log.append_state_snapshot(
+        paths,
+        cycle_id=cycle_id,
+        payload=payload,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+
+
 def _execute_cb_state_transition(
     entry: CBStateTransitionEntry,
     paths: Paths,
     now: datetime,
+    state: OperatingState,
+    cycle_id: str,
 ) -> EntryExecutionResult:
-    """§8.2.6 — append to CB transition log."""
-    from persistence import append_cb_transition
+    """§8.2.6 — append to CB transition log.
+
+    Writes BOTH the legacy cb_transitions.jsonl record AND emits the
+    new `cb_transition` event (EVENT_LOG_SPEC §4.8). Both writes run
+    in parallel during the migration period; Phase 5 removes the
+    legacy write.
+
+    Also emits a `state_snapshot` event with trigger="cb_transition"
+    per §4.12, capturing the operating state at the moment of the
+    transition (state passed in by execute_plan reflects the
+    decision-layer's post-cb-evaluation update; the action layer is
+    not mutating CB state here, just logging).
+    """
+    from persistence import append_cb_transition as _legacy_append_cb_transition
     record = {
         "timestamp": now.isoformat(),
         "from_state": entry.from_state.value,
@@ -763,16 +1160,36 @@ def _execute_cb_state_transition(
         ],
     }
     try:
-        append_cb_transition(paths, record)
-        return EntryExecutionResult(
-            kind=EntryKind.CB_STATE_TRANSITION, success=True,
-            note="cb transition logged",
-        )
+        _legacy_append_cb_transition(paths, record)
     except OSError as e:
         return EntryExecutionResult(
             kind=EntryKind.CB_STATE_TRANSITION, success=False,
             error=f"log write failed: {e}",
         )
+
+    # Emit new event log entries (§4.8 cb_transition + §4.12 state_snapshot).
+    # Event_log writes never raise per its error-handling contract
+    # (§5.4), so wrapping in try/except is unnecessary; if disk fills
+    # the write logs a warning and the cycle continues.
+    now_aware = _to_aware_utc(now)
+    lookback_value = state.lookback_signal.value_pct
+    event_log.append_cb_transition(
+        paths,
+        cycle_id=cycle_id,
+        from_state=entry.from_state.value,
+        to_state=entry.to_state.value,
+        trigger_reason=entry.trigger_reason,
+        cb2_entry_conditions_after=[c.value for c in entry.cb2_entry_conditions_after],
+        lookback_value_at_trigger=lookback_value,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+    _emit_state_snapshot(paths, cycle_id, state, "cb_transition", now_aware)
+
+    return EntryExecutionResult(
+        kind=EntryKind.CB_STATE_TRANSITION, success=True,
+        note="cb transition logged",
+    )
 
 
 def _execute_ach_update(
@@ -805,11 +1222,35 @@ def _execute_alert(
     alerter: Alerter,
     default_context: dict[str, str],
     now: datetime,
+    paths: Paths,
+    cycle_id: str,
 ) -> EntryExecutionResult:
-    """§8.2.9 — dispatch via alerter."""
+    """§8.2.9 — dispatch via alerter.
+
+    Emits an `alert_emitted` event (EVENT_LOG_SPEC §4.13) after
+    dispatch returns. The event records the alert intent plus per-
+    channel success/failure from the DispatchOutcome.
+    """
     outcome: DispatchOutcome = alerter.dispatch(
         entry, default_context=default_context, now=now,
     )
+
+    # Emit alert_emitted (§4.13) regardless of dispatch outcome.
+    now_aware = _to_aware_utc(now)
+    event_log.append_alert_emitted(
+        paths,
+        cycle_id=cycle_id,
+        alert_id=outcome.rendered.alert_id,
+        context=dict(entry.context),
+        email_ok=outcome.email_ok,
+        sms_ok=outcome.sms_ok,
+        deduped=outcome.deduped,
+        email_error=outcome.email_error,
+        sms_error=outcome.sms_error,
+        now=now_aware,
+        in_sim_timestamp=now_aware,
+    )
+
     success = outcome.email_ok or outcome.sms_ok or outcome.deduped
     if outcome.deduped:
         note = f"deduped ({entry.alert_id})"
@@ -868,6 +1309,10 @@ def execute_plan(
     halt_reason: Optional[str] = None
     default_ctx = default_alert_context or {}
     ca_path = paths.cycle_attempt_file
+    # cycle_id for event log emissions — every per-entry helper that
+    # emits events takes this. Derived from the attempt, which is
+    # the canonical owner of the cycle UUID (cycle_attempt.py §1).
+    cycle_id = str(attempt.cycle_uuid)
 
     with broker_session(broker):
         preflight = _preflight_checks(
@@ -908,6 +1353,7 @@ def execute_plan(
                     broker, attempt, contracts, entry, idx,
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     cycle_attempt_path=ca_path, now=now,
+                    paths=paths, cycle_id=cycle_id,
                 )
             elif entry.kind == EntryKind.WITHDRAWAL:
                 r = _execute_withdrawal(
@@ -915,24 +1361,28 @@ def execute_plan(
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     dry_run=ruleset.dry_run,
                     cycle_attempt_path=ca_path, now=now,
+                    paths=paths, cycle_id=cycle_id, state=new_state,
                 )
             elif entry.kind == EntryKind.BUFFER_REFILL:
                 r = _execute_buffer_refill(
                     broker, attempt, contracts, entry, idx,
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     cycle_attempt_path=ca_path, now=now,
+                    paths=paths, cycle_id=cycle_id,
                 )
             elif entry.kind == EntryKind.CASH_REFILL:
                 r = _execute_cash_refill(
                     broker, attempt, contracts, entry, idx,
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     cycle_attempt_path=ca_path, now=now,
+                    paths=paths, cycle_id=cycle_id,
                 )
             elif entry.kind == EntryKind.LARGE_CASH_DEPLOYMENT:
                 r = _execute_large_cash_deployment(
                     broker, attempt, contracts, entry, idx,
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     cycle_attempt_path=ca_path, now=now,
+                    paths=paths, cycle_id=cycle_id,
                 )
             elif entry.kind == EntryKind.PHASE_TRANSITION:
                 r, new_state = _execute_phase_transition(
@@ -940,13 +1390,19 @@ def execute_plan(
                     state=new_state, ruleset=ruleset,
                     timeout_seconds=ruleset.order_fill_timeout_seconds,
                     now=now, cycle_attempt_path=ca_path,
+                    paths=paths, cycle_id=cycle_id,
                 )
             elif entry.kind == EntryKind.CB_STATE_TRANSITION:
-                r = _execute_cb_state_transition(entry, paths, now)
+                r = _execute_cb_state_transition(
+                    entry, paths, now, state=new_state, cycle_id=cycle_id,
+                )
             elif entry.kind == EntryKind.ACH_SCHEDULE_UPDATE:
                 r = _execute_ach_update(broker, entry)
             elif entry.kind == EntryKind.ALERT:
-                r = _execute_alert(entry, alerter, default_ctx, now)
+                r = _execute_alert(
+                    entry, alerter, default_ctx, now,
+                    paths=paths, cycle_id=cycle_id,
+                )
             else:
                 r = EntryExecutionResult(
                     kind=entry.kind, success=False,

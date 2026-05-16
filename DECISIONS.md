@@ -1841,3 +1841,105 @@ year and clamps via three-way MIN; `alert_templates.yaml`
 `monthly_payment_ceiling_bound` template gains the binding-
 ceiling placeholder. `ruleset.yaml` already has the parameters
 added with full operator-comment rationale.
+
+---
+
+## v1.10+ design change: Cascade-tier alert ladder (2026-05, Session A)
+
+### D-CSC-1: Cascade tier severity ladder uses Notice/Warning/Critical
+
+**Context.** When extending the cascade alert ladder past the
+existing `cascade_growth_source` (Critical) and
+`withdrawal_capacity_exhausted` (Critical), Session A needed
+severities for the two new earlier-tier alerts (SGOV-engaged and
+FI-extended).
+
+**Decision.** Use the existing four-level severity model unchanged:
+`cascade_engaged_sgov` = Notice, `cascade_extended_fi` = Warning,
+`cascade_growth_source` = Critical (unchanged),
+`withdrawal_capacity_exhausted` = Critical (unchanged).
+
+**Rationale.**
+- The four-level model (Info / Notice / Warning / Critical) already
+  exists in `alert_catalog.py` and §11.1. Adding a fifth level just
+  for this case would have been needless.
+- The operator's framing ("semi-routine / REALLY BIG / CATASTROPHIC")
+  maps naturally onto Notice / Warning / Critical without semantic
+  loss. SGOV engagement is expected during CB2 (Notice). FI extension
+  means the buffer's protective layer is gone (Warning). Growth
+  extension is the deepest sustainable cascade (Critical).
+- Considered and rejected: making all three Critical and distinguishing
+  via `CriticalCategory`. Rejected because the operator's framing
+  emphasizes operationally distinct action thresholds, which is the
+  severity axis's job. Categories are for "is the system broken or
+  did it self-heal" — orthogonal to escalation depth.
+- Considered and rejected: skipping Warning, putting Tier 2 directly
+  to Critical. Rejected because operator review and external
+  intervention are distinct concerns — Warning is the right signal for
+  "you should look at this and plan," Critical for "the system is at
+  its limit." Tier 2 is the former, Tier 3 the latter.
+
+**Spec reference.** §7.3.2, §12.6; `alert_catalog.py` (implementation
+in Session B).
+
+---
+
+### D-CSC-2: Cascade tier visibility uses both annotation codes and CB2 suffix
+
+**Context.** The reporter needs to surface cascade-tier history in
+year files and the sim report's MONTHLY section. Two natural
+mechanisms exist: dedicated annotation codes (CSC-S, CSC-F, CSC-G)
+that appear on the rows where each escalation occurred, or a suffix
+on the CB2 entry annotation that shows the episode's depth at a
+glance.
+
+**Decision.** Implement both. CSC-S/F/G annotations mark point-in-time
+escalation events on the rows where they occurred; the CB2 annotation
+gains a (S)/(SF)/(SFG) suffix showing the episode's terminal depth.
+
+**Rationale.**
+- The two mechanisms convey complementary signals. CSC codes answer
+  "when did this happen?"; the CB2 suffix answers "how bad did this
+  episode get overall?". Both questions arise during operator review.
+- Year files are rebuilt at month-close; sim reports are rendered
+  once at end-of-run. Both are stable artifacts the operator may
+  reference years later. The CB2 suffix uses **terminal depth at
+  render time** (not depth at the moment of CB2 entry, which is
+  always (S) trivially), so closed-year files and sim reports show
+  the episode's worst depth at a glance even if the episode spans
+  months.
+- The verbosity cost is small: cascade events are rare in absolute
+  terms (typically 0–2 episodes per year in baseline scenarios), so
+  the annotation lines do not bloat.
+
+**Spec reference.** REPORT_SPEC §5.2, §5.3, §3.3.7 LEGEND.
+
+---
+
+### D-CSC-3: Cascade episode state is a sibling of CB machine state, not nested inside it
+
+**Context.** The fire-once-per-tier-escalation semantics require per-
+episode state. CB2 entry/exit is the natural episode boundary. The
+state could live inside `CBMachine` as nested fields, or as a sibling
+struct.
+
+**Decision.** Sibling struct `CascadeEpisodeState` in `state_model.py`,
+peer to `CBMachine`. Persisted state and `state_snapshot` event payloads
+gain the field at top level.
+
+**Rationale.**
+- The struct's lifecycle is coupled to but distinct from the CB
+  machine's. CB state can be CB2 without any cascade engagement yet
+  (the first cycle of a CB2 episode before its first withdrawal).
+  Keeping them separate makes that "in CB2 but episode_active=true,
+  all engagement flags=false" state explicit and observable.
+- The `withdrawal_capacity_exhausted` flag deliberately stays outside
+  `CascadeEpisodeState` because it has its own §11.2.7 / §11.3.2 clear
+  semantics (auto-clears when capacity returns, possibly mid-episode).
+  Folding it in would create awkward couplings between two distinct
+  lifecycle models.
+- Sibling structs allow the reporter's existing pattern of "read the
+  latest state_snapshot, render its fields" to extend trivially.
+
+**Spec reference.** §7.3.2, §6 state model; `state_model.py`
+(implementation in Session B).

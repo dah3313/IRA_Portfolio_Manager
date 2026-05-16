@@ -441,11 +441,94 @@ monthly_payment_ceiling_bound:
     Cycle ID: {cycle_id}
   sms: "IRAPM: Ph3 withdrawal capped at {binding_ceiling} ceiling. Paid ${amount_paid_dollars} (sched ${scheduled_amount_dollars}). See email."
 
+cascade_engaged_sgov:
+  # Fires once on the first cycle of a CB2 episode where withdrawal
+  # sourcing engages the SGOV buffer (§7.3.2 step 1). This is the
+  # routine cascade entry — every CB2 episode is expected to engage
+  # SGOV. Notice severity; the system is operating as designed.
+  # Fire-once-per-tier-escalation-within-episode semantics per §12.6:
+  # the alert re-fires only after a recovery (REC) clears the episode
+  # and a new CB2 episode begins. The weekly_summary alert re-surfaces
+  # current cascade status every cycle in between.
+  # Placeholders: {timestamp}, {amount_dollars}, {sgov_drawn_dollars},
+  #               {sgov_remaining_dollars}, {sgov_buffer_months_remaining}
+  subject: "IRAPM Notice: Cascade engaged — SGOV buffer in use"
+  body: |
+    The withdrawal cycle at {timestamp} drew from the SGOV cash buffer
+    rather than from the regular portfolio. This is the expected
+    behavior during a CB2 (Circuit Breaker 2) episode — the SGOV
+    buffer exists for exactly this purpose, to fund withdrawals when
+    the portfolio is under stress so that core positions are not sold
+    at depressed prices.
+
+    Withdrawal amount: ${amount_dollars}
+    Drawn from SGOV: ${sgov_drawn_dollars}
+    SGOV remaining: ${sgov_remaining_dollars} (~{sgov_buffer_months_remaining} months of withdrawals)
+
+    No action required. The buffer is being used as designed. You
+    will receive a separate alert if the cascade extends past SGOV
+    into the FI bucket (a more significant signal).
+
+    The weekly summary alert tracks current cascade status while
+    the CB2 episode remains active.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM: Cascade engaged SGOV. ${sgov_drawn_dollars} drawn, ~{sgov_buffer_months_remaining} months remain. See email."
+
+cascade_extended_fi:
+  # Fires once per CB2 episode when cascade extends past SGOV into
+  # the FI bucket for the first time (§7.3.2 step 2). Warning severity
+  # — the buffer is gone and the income engine itself is being consumed
+  # to make withdrawals. Operator should review and plan.
+  # Fire-once-per-tier-escalation-within-episode semantics per §12.6.
+  # Reaching this branch necessarily means SGOV was drawn to residual
+  # on this cycle or a prior cycle, so cascade_engaged_sgov has
+  # already fired in this episode.
+  # Placeholders: {timestamp}, {amount_dollars}, {sgov_at_residual},
+  #               {fi_drawn_dollars}, {fi_remaining_dollars},
+  #               {pyld_remaining_dollars}, {jpie_remaining_dollars}
+  subject: "IRAPM WARNING: Cascade extended into FI — SGOV buffer exhausted"
+  body: |
+    The withdrawal cycle at {timestamp} extended past the SGOV cash
+    buffer (which is now at its residual floor) and drew from the
+    Fixed Income (FI) bucket to complete the withdrawal.
+
+    This is a significantly more serious signal than the routine
+    SGOV engagement. The SGOV buffer exists precisely to prevent
+    this — its depletion means the income engine itself (PYLD,
+    JPIE) is now being consumed to make payments.
+
+    Withdrawal amount: ${amount_dollars}
+    SGOV: at residual floor (effectively exhausted)
+    Drawn from FI: ${fi_drawn_dollars}
+    FI remaining:
+      PYLD: ${pyld_remaining_dollars}
+      JPIE: ${jpie_remaining_dollars}
+      Total: ${fi_remaining_dollars}
+
+    Operator review recommended. Possible considerations:
+    - How long has the CB2 episode been running? Is recovery
+      plausible within the FI runway, or is the trajectory
+      toward Growth-stage cascade (the next tier, Critical)?
+    - Are there external funds available that would restore
+      the SGOV buffer and arrest the cascade?
+    - Is the scheduled monthly withdrawal level appropriate
+      for the current portfolio conditions?
+
+    No automatic action is taken — the system continues to make
+    withdrawals from the deepening cascade. The next escalation
+    (cascade reaching Growth) would be a Critical alert.
+
+    Cycle ID: {cycle_id}
+  sms: "IRAPM WARN: Cascade extended into FI. SGOV exhausted. FI ${fi_remaining_dollars} remains. Review."
+
 cascade_growth_source:
-  # Fires when cascade sourcing reaches Growth stage (§7.3.2 step 3).
-  # Distinct from withdrawal_capacity_exhausted — the withdrawal succeeded
-  # but at the deepest cascade level. Alarming signal that the portfolio
-  # is near absolute floor.
+  # Fires once per CB2 episode when cascade first extends past FI into
+  # Growth (§7.3.2 step 3). Fire-once-per-tier-escalation-within-episode
+  # semantics per §12.6 — re-fires only after REC clears the episode.
+  # Distinct from withdrawal_capacity_exhausted: this one means the
+  # withdrawal succeeded, but at the deepest possible cascade level.
+  # Alarming signal that the portfolio is near absolute floor.
   # Placeholders: {timestamp}, {amount_dollars}, {growth_sold_summary},
   #               {sgov_at_residual}, {fi_at_residual}
   subject: "IRAPM CRITICAL: Withdrawal cascade reached Growth — portfolio near floor"

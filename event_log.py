@@ -1,5 +1,5 @@
 """
-event_log.py — IRAPM event log writer (EVENT_LOG_SPEC §5).
+event_log.py — IRAPM event log writer and readers (EVENT_LOG_SPEC §5, §6).
 
 PURPOSE:
     The event log is IRAPM's system of record. Every operationally
@@ -7,13 +7,16 @@ PURPOSE:
     state-machine transitions, snapshots, alerts — is appended to a
     single events.jsonl file under paths.state_dir.
 
-    This module is the writer. It is the only code in IRAPM that writes
-    to events.jsonl. Readers (reporters, forensic tools, expectation
-    checkers) consume the file directly per the patterns in §6.
+    This module owns both writing AND reading the event log. The
+    writer is the only code in IRAPM that writes to events.jsonl.
+    Readers (reporters, forensic tools, expectation checkers) are
+    expected to use the iter_events* readers below rather than
+    re-implementing JSONL parsing.
 
-DESIGN (EVENT_LOG_SPEC §5):
+DESIGN (EVENT_LOG_SPEC §5, §6):
     - Stateless module. No classes, no module-level state beyond
       constants. Each append() opens the file, writes one line, closes.
+      Each iter_events* call opens the file, streams it, closes.
     - Append-only JSONL. One JSON object per line, LF terminator,
       compact (no indentation). The atomicity bound for append() on
       POSIX is PIPE_BUF (≥ 512 bytes); all event records are designed
@@ -53,6 +56,14 @@ PUBLIC API:
         so call sites in cycle.py, action_layer.py, etc. don't build
         payload dicts inline.
 
+    iter_events(paths) -> Iterator[dict]
+    iter_events_of_type(paths, event_type) -> Iterator[dict]
+    iter_events_in_window(paths, start, end, *, event_type=None)
+        -> Iterator[dict]
+        Reader patterns per §6. Used by report.py and future Phase 4
+        consumers (harness CycleFailureTracker, check_expectations,
+        annual_review CB freeze counter).
+
 FILE LOCATION:
     paths.state_dir / "events.jsonl"
 
@@ -70,7 +81,7 @@ import os
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from uuid import UUID
 
 from persistence import Paths
@@ -567,8 +578,9 @@ def append_cb_transition(
     cycle_id: str,
     from_state: str,
     to_state: str,
-    trigger_lookback_value: Optional[Decimal],
     trigger_reason: str,
+    cb2_entry_conditions_after: list[str],
+    lookback_value_at_trigger: Optional[Decimal] = None,
     now: datetime,
     in_sim_timestamp: Optional[datetime] = None,
 ) -> str:
@@ -578,12 +590,21 @@ def append_cb_transition(
     the existing cb_transitions.jsonl write; both write paths run
     during the migration period (per HANDOFF_2026-05-14, Phase 5
     eventually removes the legacy write).
+
+    `cb2_entry_conditions_after` is the list of CB2 entry-condition
+    values active AFTER this transition (per CBStateTransitionEntry).
+    `lookback_value_at_trigger` is captured when the transition was
+    signal-driven; null for cb1_timer or other non-signal triggers.
     """
     payload = {
         "from_state": from_state,
         "to_state": to_state,
-        "trigger_lookback_value": str(trigger_lookback_value) if trigger_lookback_value is not None else None,
         "trigger_reason": trigger_reason,
+        "cb2_entry_conditions_after": cb2_entry_conditions_after,
+        "lookback_value_at_trigger": (
+            str(lookback_value_at_trigger)
+            if lookback_value_at_trigger is not None else None
+        ),
     }
     return append(
         paths, "cb_transition", payload,
@@ -700,19 +721,28 @@ def append_alert_emitted(
     *,
     cycle_id: Optional[str],
     alert_id: str,
-    alert_template: str,
-    severity: str,
-    message: str,
     context: dict,
+    email_ok: bool,
+    sms_ok: bool,
+    deduped: bool,
+    email_error: Optional[str] = None,
+    sms_error: Optional[str] = None,
     now: datetime,
     in_sim_timestamp: Optional[datetime] = None,
 ) -> str:
     """Emit an alert_emitted event (EVENT_LOG_SPEC §4.13).
 
-    Called from alerter.dispatch() for every alert that fires.
-    Replaces the stdout-only path: alerts are now both displayed
-    AND persisted. The current_status.txt "Recent alerts" section
-    consumes this event type.
+    Called by the caller of `alerter.dispatch()` after dispatch returns
+    a DispatchOutcome. The event records IRAPM's intent to alert plus
+    the per-channel success/failure outcome.
+
+    Payload fields map directly from DispatchOutcome:
+      - `email_ok` / `sms_ok` — channel success booleans
+      - `email_error` / `sms_error` — error strings on failure (null otherwise)
+      - `deduped` — true if the alerter suppressed the dispatch as a
+        recent duplicate (in which case email_ok/sms_ok are reported
+        as true per the existing DedupTracker convention, and the
+        original alert was previously delivered).
 
     `cycle_id` is Optional because alerts can be dispatched outside
     any cycle (e.g., startup health checks, manual operator-triggered
@@ -720,10 +750,12 @@ def append_alert_emitted(
     """
     payload = {
         "alert_id": alert_id,
-        "alert_template": alert_template,
-        "severity": severity,
-        "message": message,
         "context": context,
+        "email_ok": email_ok,
+        "email_error": email_error,
+        "sms_ok": sms_ok,
+        "sms_error": sms_error,
+        "deduped": deduped,
     }
     return append(
         paths, "alert_emitted", payload,
@@ -731,6 +763,185 @@ def append_alert_emitted(
         source_cycle_id=cycle_id,
         in_sim_timestamp=in_sim_timestamp,
     )
+
+
+# ============================================================================
+# READERS (EVENT_LOG_SPEC §6)
+# ============================================================================
+#
+# Three reader patterns sufficient for Phase 2 (the reporter) and the bulk
+# of Phase 4 (filter-based consumers):
+#   - iter_events: stream the entire log
+#   - iter_events_of_type: filter by event_type
+#   - iter_events_in_window: filter by time window (and optional event_type)
+#
+# Two additional readers from EVENT_LOG_SPEC §6 (state_at, iter_events_from)
+# are deferred until a Phase 4 consumer needs them.
+#
+# All readers honor the universal invariants from §6.1:
+#   1. Tolerate a partial trailing line (skip silently).
+#   2. Tolerate records with unknown event_types (skip silently for
+#      forward-compat; readers built today must not crash when newer
+#      schemas add event types).
+#   3. Tolerate records with newer schema_version major numbers (skip
+#      with WARNING). Currently only "1.0" exists.
+#   4. Never modify the file.
+#
+# Performance: linear scan of events.jsonl per call. At our scales
+# (≤15 MB over 30 years), each call completes well under one second.
+# No index, no cache, no persistent state. If profiling later shows
+# this matters, a positional index can be added without changing the
+# reader API.
+
+
+def iter_events(paths: Paths) -> Iterator[dict]:
+    """Yield every event in the log in append order.
+
+    Skips:
+    - A partial trailing line (no LF terminator).
+    - Lines that fail JSON parse (logged at DEBUG).
+    - Records with unknown event_type (silent, forward-compat).
+    - Records with schema_version major newer than 1 (WARNING).
+
+    Yields:
+        Each event as a dict, with the full envelope: schema_version,
+        event_id, event_type, timestamp, emitted_at, source_cycle_id,
+        payload.
+
+    If events.jsonl does not exist, yields nothing (no error).
+    """
+    path = paths.events_log()
+    if not path.exists():
+        return
+
+    with open(path, "rb") as f:
+        for raw_line_no, raw_bytes in enumerate(f, start=1):
+            # A partial trailing line lacks the LF terminator. The bytes
+            # iterator includes the LF in the line, so a complete line
+            # ends with b"\n". A trailing partial line will not.
+            if not raw_bytes.endswith(b"\n"):
+                logger.debug(
+                    "event_log: skipping partial trailing line at line %d",
+                    raw_line_no,
+                )
+                continue
+
+            line = raw_bytes.rstrip(b"\n").decode("utf-8", errors="replace")
+            if not line.strip():
+                continue  # blank line, ignore
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.debug(
+                    "event_log: JSON parse failure at line %d: %s",
+                    raw_line_no, exc,
+                )
+                continue
+
+            # Schema version check (§6.1 invariant 3).
+            sv = event.get("schema_version", "")
+            if not _schema_version_compatible(sv):
+                logger.warning(
+                    "event_log: skipping event with incompatible "
+                    "schema_version=%r at line %d", sv, raw_line_no,
+                )
+                continue
+
+            # Unknown event_type check (§6.1 invariant 2 — forward-compat).
+            et = event.get("event_type", "")
+            if et not in KNOWN_EVENT_TYPES:
+                # Silent skip; this is normal forward-compat behavior.
+                continue
+
+            yield event
+
+
+def iter_events_of_type(paths: Paths, event_type: str) -> Iterator[dict]:
+    """Yield events matching the given event_type, in append order.
+
+    Thin wrapper around iter_events with a type filter. Exists as a
+    separate function for caller readability:
+        iter_events_of_type(paths, "withdrawal_executed")
+    reads better than the equivalent comprehension.
+
+    Args:
+        paths: IRAPM Paths object.
+        event_type: One of KNOWN_EVENT_TYPES. Unknown types yield
+            nothing (no error — supports forward-compat where a caller
+            might filter for a type that doesn't exist in this log).
+
+    Yields:
+        Each matching event as a dict.
+    """
+    for event in iter_events(paths):
+        if event.get("event_type") == event_type:
+            yield event
+
+
+def iter_events_in_window(
+    paths: Paths,
+    start: datetime,
+    end: datetime,
+    *,
+    event_type: Optional[str] = None,
+) -> Iterator[dict]:
+    """Yield events whose timestamp falls in [start, end), optionally
+    filtered to a single event_type.
+
+    The window is half-open: start is inclusive, end is exclusive. This
+    matches Python's standard convention for date/time ranges and makes
+    abutting windows (e.g., month-to-month) non-overlapping by construction.
+
+    Args:
+        paths: IRAPM Paths object.
+        start: Inclusive lower bound. Must be tz-aware.
+        end: Exclusive upper bound. Must be tz-aware.
+        event_type: If provided, additionally filter to this type.
+
+    Yields:
+        Each matching event as a dict.
+
+    Raises:
+        ValueError: start or end is naive.
+    """
+    _require_aware(start, "start")
+    _require_aware(end, "end")
+
+    for event in iter_events(paths):
+        if event_type is not None and event.get("event_type") != event_type:
+            continue
+        ts_str = event.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            # Malformed timestamp — skip silently. The event itself is
+            # still in the log; this iteration just can't place it in time.
+            continue
+        if start <= ts < end:
+            yield event
+
+
+def _schema_version_compatible(sv: str) -> bool:
+    """True if the schema_version is in the 1.x family.
+
+    Per EVENT_LOG_SPEC §3.4: a 1.x reader processes 1.x events. A 2.x
+    event would not be processed by this reader; the caller logs and
+    skips.
+
+    Defensive parsing — an unparseable schema_version is treated as
+    incompatible (skip + warn rather than yield potentially garbled data).
+    """
+    if not isinstance(sv, str) or "." not in sv:
+        return False
+    try:
+        major_str, _ = sv.split(".", 1)
+        major = int(major_str)
+    except (ValueError, AttributeError):
+        return False
+    return major == 1
 
 
 __all__ = [
@@ -750,4 +961,7 @@ __all__ = [
     "append_portfolio_snapshot",
     "append_state_snapshot",
     "append_alert_emitted",
+    "iter_events",
+    "iter_events_of_type",
+    "iter_events_in_window",
 ]

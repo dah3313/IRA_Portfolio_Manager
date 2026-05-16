@@ -197,7 +197,7 @@ lookback_min_bar_coverage_rate: 0.80    # [VALIDATED] §5
 # year's freeze would buy ~$90/month long-term — not worth the
 # infrastructure; the operator can manually pause income in bad years).
 # Operator changes this only if the deployment year slips from the default.
-phase1_trigger_year: 2027               # [SPEC] §3.13, §4.1
+phase1_trigger_year: 2005               # [BACKTEST-HACK 2026-05-16] was 2027 [SPEC]; shifted to sim start so CPI raises apply in 2005-2025 sim. REVERT TO 2027 BEFORE PRODUCTION. See CHANGELOG.
 
 # Starting monthly withdrawal amount in 2027 dollars
 phase1_initial_monthly_dollars: 3000    # [VALIDATED] §4.1
@@ -206,7 +206,7 @@ phase1_initial_monthly_dollars: 3000    # [VALIDATED] §4.1
 # operator's expected Social Security filing date (early 2035). The actual
 # transition cycle runs on the last weekly cycle preceding this date; the
 # new phase's first cycle runs on or after this date (§4.2).
-phase1_to_phase2_transition_date: "2035-01-01"  # [SPEC] §4.1, §4.2
+phase1_to_phase2_transition_date: "2012-01-01"  # [BACKTEST-HACK 2026-05-16] was "2035-01-01" [SPEC]; shifted to mid-sim so Phase 1->2 transition fires before forced Phase 3 latch on 2016-07-15. REVERT TO "2035-01-01" BEFORE PRODUCTION. See CHANGELOG.
 
 
 # -----------------------------------------------------------------------------
@@ -314,7 +314,7 @@ phase3_monthly_payment_ceiling_rate: 0.075  # [SPEC] §4.1.1.2
 # $3000/mo, and indexing from 2027 keeps the cap real-value-stable
 # across the Phase 3 horizon (≈$11,200/mo by 2057).
 phase3_dollar_ceiling_base_dollars: 4000    # [SPEC] §4.1.1.2
-phase3_dollar_ceiling_base_year: 2027       # [SPEC] §4.1.1.2
+phase3_dollar_ceiling_base_year: 2010       # [BACKTEST-HACK 2026-05-16] was 2027 [SPEC]; shifted so dollar cap indexes 15 years to ~$6710 by 2025, exercising both indexing and clamp-vs-scheduled. REVERT TO 2027 BEFORE PRODUCTION. See CHANGELOG.
 
 # -----------------------------------------------------------------------------
 # §7. Target allocation weights (§3.5, §4.1, §7.2)

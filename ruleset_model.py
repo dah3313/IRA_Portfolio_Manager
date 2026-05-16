@@ -214,7 +214,7 @@ class Ruleset(BaseModel):
     # §4. Phase 1 — Income Production (§4.1)
     # -------------------------------------------------------------------------
     phase1_initial_monthly_dollars: Decimal
-    phase1_trigger_year: int = Field(ge=2020, le=2100)
+    phase1_trigger_year: int = Field(ge=1990, le=2100)
     phase1_to_phase2_transition_date: str
 
     # -------------------------------------------------------------------------
@@ -238,7 +238,7 @@ class Ruleset(BaseModel):
     # alert identifying which one bound. (§4.1.1.2)
     phase3_monthly_payment_ceiling_rate: Decimal
     phase3_dollar_ceiling_base_dollars: Decimal
-    phase3_dollar_ceiling_base_year: int = Field(ge=2020, le=2100)
+    phase3_dollar_ceiling_base_year: int = Field(ge=1990, le=2100)
 
     # -------------------------------------------------------------------------
     # §7. Target allocation weights (§3.5, §4.1, §7.2)

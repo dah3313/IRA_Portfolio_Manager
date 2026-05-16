@@ -2485,30 +2485,110 @@ sold for withdrawals during CB1 (I14).
 **Cascade sourcing** (CB2):
 
 Source in this order, draining each stage to its residual floor
-before moving to the next stage:
+before moving to the next stage. The four cascade-tier alerts
+(`cascade_engaged_sgov`, `cascade_extended_fi`, `cascade_growth_source`,
+`withdrawal_capacity_exhausted`) follow fire-once-per-tier-escalation
+semantics per §12.6 — emission is gated by the cycle's
+`cascade_episode_state` flags (defined below).
 
 1. **SGOV buffer.** Sell SGOV shares for the full withdrawal amount,
    clamped at residual floor. If `(SGOV market value −
    position_residual_minimum_dollars) ≥ withdrawal amount`, source
    100% from SGOV, done.
+
+   If this is the first cycle of the current CB2 episode in which
+   SGOV was drawn (i.e., `cascade_episode_state.sgov_engaged` was
+   false entering this cycle), set `sgov_engaged = true` and emit
+   `cascade_engaged_sgov` Notice alert. The alert payload includes
+   the SGOV dollars drawn this cycle and the SGOV remaining after
+   the draw (translated to approximate-months-of-withdrawals via
+   the current scheduled monthly amount, for operator legibility).
 2. **FI buckets.** If SGOV reached residual, source remaining from
    FI buckets proportionally, each clamped at residual floor.
+
+   If this is the first cycle of the current CB2 episode in which
+   FI was drawn (i.e., `cascade_episode_state.fi_engaged` was false
+   entering this cycle), set `fi_engaged = true` and emit
+   `cascade_extended_fi` Warning alert. Reaching this branch
+   necessarily means SGOV was drawn to residual on this cycle or a
+   prior cycle of the episode, so `sgov_engaged` is already true
+   when this branch is taken.
 3. **Growth buckets.** If both SGOV and FI reached residual, source
    remaining from Growth buckets proportionally, each clamped at
    residual floor. This is the deepest cascade level reached while
    still completing the withdrawal — Growth was sold to make up the
-   demand SGOV and FI couldn't cover. Emit `cascade_growth_source`
-   alert (Critical severity). Distinct from cascade exhaustion
-   (step 4): the withdrawal succeeded, but the portfolio is near
-   absolute floor and the operator should review.
+   demand SGOV and FI couldn't cover.
+
+   If this is the first cycle of the current CB2 episode in which
+   Growth was drawn (i.e., `cascade_episode_state.growth_engaged`
+   was false entering this cycle), set `growth_engaged = true` and
+   emit `cascade_growth_source` Critical alert. Distinct from
+   cascade exhaustion (step 4): the withdrawal succeeded, but the
+   portfolio is near absolute floor and the operator should review.
 4. If all three stages have reached residual and demand is not yet
    met, abort cycle. Set `withdrawal_capacity_exhausted: true`
    in state (indefinite halt for withdrawals only, per §11.3.2 and
    §11.2.7). The portfolio has effectively reached its absolute
    floor. Emit `withdrawal_capacity_exhausted` Critical alert.
 
+   The `withdrawal_capacity_exhausted` flag is a sibling state flag
+   per §11.3.2 with its own clear semantics (auto-clears when
+   capacity returns) and is distinct from the
+   `cascade_episode_state` flags below.
+
 The cascade is identical regardless of which CB2 entry path activated
 it (signal-based, Portfolio-low, or FI-low).
+
+**Cascade episode state.** The four-step cascade above references a
+per-episode latch struct `cascade_episode_state`, a sibling of the
+CB machine state with the following fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `episode_active` | bool | True between CB2 entry and the subsequent REC. False otherwise. |
+| `episode_started_at` | date \| null | Date the current episode began (the CB2-entry cycle's date). Null when `episode_active` is false. |
+| `sgov_engaged` | bool | Latched true on the first cycle of the current episode that drew from SGOV. |
+| `fi_engaged` | bool | Latched true on the first cycle of the current episode that drew from FI (necessarily after `sgov_engaged` became true). |
+| `growth_engaged` | bool | Latched true on the first cycle of the current episode that drew from Growth (necessarily after `fi_engaged` became true). |
+
+**Episode lifecycle.**
+
+- On `cb_transition` to CB2 (any entry path), set `episode_active = true`,
+  `episode_started_at = cycle date`, and all three engagement flags to
+  false. This runs in the same transaction as the CB state change.
+- On `cb_transition` to CB_INACTIVE (REC), reset the entire struct:
+  `episode_active = false`, `episode_started_at = null`, all engagement
+  flags to false.
+- The engagement flags are write-once-per-episode (set to true on first
+  engagement, never reset to false except by a REC). A withdrawal that
+  only needs SGOV after a previous one reached FI does NOT clear
+  `fi_engaged`. This matches the operator-stated intent that "the
+  episode reached FI" is a property of the whole episode, not of a
+  single withdrawal within it.
+- The struct is observable in every `state_snapshot` event payload
+  (per EVENT_LOG_SPEC) under `cascade_episode_state`, alongside
+  `cb_machine`.
+
+**Worked example.** A CB2 episode runs for 9 weeks. Monthly withdrawal
+demand is constant at the scheduled amount. SGOV starts at the
+beginning of the episode with several months of headroom.
+
+- Week 1: CB2 entered (signal-based). Monthly withdrawal sources from
+  SGOV. `sgov_engaged` latches true → `cascade_engaged_sgov` fires.
+- Weeks 2–4: subsequent weekly cycles run. Monthly withdrawal sources
+  from SGOV (still above residual). No new engagement; no cascade alerts.
+- Week 5: monthly withdrawal again sources entirely from SGOV. No new
+  engagement; no alerts.
+- Week 12: SGOV reaches residual mid-withdrawal. The remaining demand
+  sources from FI. `fi_engaged` latches true → `cascade_extended_fi`
+  fires.
+- Week 16: Recovery confirmed → REC. `cascade_episode_state` resets:
+  all three engagement flags back to false; `episode_active` back to
+  false.
+- Week 22: New CB2 episode begins. SGOV is being refilled but still
+  partially drained from the prior episode; the first withdrawal of
+  the new episode engages SGOV again → `cascade_engaged_sgov` fires
+  again. (The fire-once latch is per-episode, not per-installation.)
 
 #### 7.3.3 Withdrawal action shape
 
@@ -5415,18 +5495,33 @@ Email + SMS) containing the following structured content:
    - Current CB state (CB_INACTIVE/CB1/CB2)
    - CB1 → CB2 timer transition timer if in CB1 (days accumulated)
    - Any pending CB transitions and their confirmation progress
-3. **Buffer state**
+3. **Cascade status**
+   - Current cascade state, one of:
+     - `Normal` (no active CB2 episode)
+     - `CB2 active, no draw yet` (CB2 entered but no withdrawal has
+       drawn from cascade sources yet in this episode)
+     - `SGOV engaged` (cascade currently uses SGOV buffer only)
+     - `SGOV+FI engaged — ATTENTION` (cascade has extended into FI
+       during this episode)
+     - `SGOV+FI+GROWTH engaged — CRITICAL` (cascade has reached Growth
+       during this episode)
+   - If episode is active, the episode start date (CB2 entry date)
+   - If episode is active, the depth at which the cascade has been
+     operating (the running latch from `cascade_episode_state`, not
+     just the current cycle's draw — an episode that drew FI once
+     stays in `SGOV+FI` even if the current cycle only needed SGOV)
+4. **Buffer state**
    - SGOV buffer market value
    - Buffer target value
    - Buffer condition tag: one of {idle, drawdown, exhausted,
      refilling}
    - Refill status if relevant (next batch amount, target completion
      date)
-4. **Upcoming withdrawal**
+5. **Upcoming withdrawal**
    - Next scheduled withdrawal amount
    - Days until next monthly withdrawal step within the weekly cycle (calendar date)
    - Income state (ACTIVE / PAUSED) at time of summary
-5. **Extraordinary events**
+6. **Extraordinary events**
    - Any state transitions in the past week
    - Any failures that triggered Critical-transient alerts in the
      past week
@@ -5546,9 +5641,34 @@ and exits are signal-based only.
 |---|---|---|---|
 | `withdrawal_executed` | Monthly withdrawal completed successfully | Info | Both |
 | `withdrawal_failed` | SELL or ACH failure during withdrawal cycle | Critical | Both |
+| `cascade_engaged_sgov` | Cascade sourcing engaged SGOV stage on first cycle of CB2 episode drawing SGOV (§7.3.2 step 1) | Notice | Both |
+| `cascade_extended_fi` | Cascade extended past SGOV into FI stage for the first time in episode (§7.3.2 step 2) | Warning | Both |
 | `cascade_growth_source` | Withdrawal cascade reached Growth stage (§7.3.2 step 3) | Critical | Both |
 | `withdrawal_capacity_exhausted` | Cascade exhaustion indefinite halt set (§11.2.7) | Critical | Both |
 | `monthly_payment_ceiling_bound` | Phase 3 monthly payment clamped at portfolio-% or indexed dollar ceiling (§4.1.1.2, §7.3.1) | Notice | Both |
+
+**Cascade alert dedup semantics.** The four cascade-tier alerts
+(`cascade_engaged_sgov`, `cascade_extended_fi`, `cascade_growth_source`,
+`withdrawal_capacity_exhausted`) follow a **fire-once-per-tier-
+escalation-within-episode** policy. A "cascade episode" is the span
+from CB2 entry to the next `cb_transition` to CB_INACTIVE (REC).
+Within one episode:
+
+- Each tier alert fires **once on first entry to that tier** in the
+  episode.
+- Returning to a shallower tier within the episode (a withdrawal that
+  only needed SGOV after a previous one reached FI) does **not** clear
+  the higher-tier latch — the episode is still active.
+- A subsequent withdrawal that re-extends to a previously-reached
+  tier does **not** re-fire that tier's alert.
+- A withdrawal that newly extends to a tier deeper than any previous
+  in the episode fires that tier's alert.
+- On REC, all four tier latches reset. The next CB2 episode starts
+  fresh.
+
+The `weekly_summary` alert (§12.3) re-surfaces current cascade status
+every cycle, so the operator is never blind to an ongoing cascade
+between tier-escalation alerts.
 
 **Cash deployment:**
 

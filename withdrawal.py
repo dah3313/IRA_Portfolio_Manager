@@ -186,6 +186,8 @@ class CeilingResult:
     actual_monthly: Decimal
     bound_by_portfolio_ceiling: bool
     bound_by_dollar_ceiling: bool
+    portfolio_ceiling_dollars: Decimal
+    dollar_ceiling_dollars: Decimal
 
 
 def apply_phase3_ceilings(
@@ -205,7 +207,9 @@ def apply_phase3_ceilings(
     actual            = min(scheduled, portfolio_ceiling, dollar_ceiling)
 
     Reports which ceiling(s) bound (may be both if they coincide
-    within rounding).
+    within rounding), and returns the computed ceiling values so
+    callers (alert dispatch, event log emission) can report them
+    without recomputing.
     """
     portfolio_ceiling = current_portfolio * monthly_payment_ceiling_rate / Decimal("12")
     years_since_base = current_year - dollar_ceiling_base_year
@@ -218,6 +222,8 @@ def apply_phase3_ceilings(
         actual_monthly=actual,
         bound_by_portfolio_ceiling=(actual == portfolio_ceiling and actual < scheduled),
         bound_by_dollar_ceiling=(actual == dollar_ceiling and actual < scheduled),
+        portfolio_ceiling_dollars=portfolio_ceiling,
+        dollar_ceiling_dollars=dollar_ceiling,
     )
 
 
@@ -439,6 +445,8 @@ def decide_withdrawal(
     # 1) Apply Phase 3 ceilings if applicable
     actual_monthly = inputs.scheduled_monthly
     ceiling_alert: Optional[AlertEntry] = None
+    binding_ceiling_spec: Optional[str] = None  # event-log form: guardrail | dollar_cap | both
+    was_capped = False
 
     if inputs.phase == Phase.PHASE_3:
         cres = apply_phase3_ceilings(
@@ -452,17 +460,59 @@ def decide_withdrawal(
         )
         actual_monthly = cres.actual_monthly
         if cres.bound_by_portfolio_ceiling or cres.bound_by_dollar_ceiling:
-            which = []
-            if cres.bound_by_portfolio_ceiling:
-                which.append("portfolio_percentage")
-            if cres.bound_by_dollar_ceiling:
-                which.append("dollar")
+            was_capped = True
+            # WithdrawalEntry carries the SPEC-form binding_ceiling
+            # (EVENT_LOG_SPEC §4.7): "guardrail" | "dollar_cap" | "both".
+            # The alert context uses the TEMPLATE-form below, mapped from
+            # this. Two different vocabularies for two different consumers
+            # (event log → reporter G/C symbols; alert template → operator
+            # SMS/email text). The event log is system-of-record so its
+            # naming is authoritative.
+            if cres.bound_by_portfolio_ceiling and cres.bound_by_dollar_ceiling:
+                binding_ceiling_spec = "both"
+                binding_ceiling_template = "both"
+            elif cres.bound_by_portfolio_ceiling:
+                binding_ceiling_spec = "guardrail"
+                binding_ceiling_template = "portfolio_percent"
+            else:
+                binding_ceiling_spec = "dollar_cap"
+                binding_ceiling_template = "dollar"
+
+            # Build the human-readable ceiling_description per the
+            # template's comment block. Single-ceiling cases name the
+            # binding ceiling with its value; the `both` case names both.
+            portfolio_desc = (
+                f"Guardrail (${cres.portfolio_ceiling_dollars:.2f}, "
+                f"{(inputs.phase3_monthly_payment_ceiling_rate*100):.1f}%/yr "
+                f"of ${inputs.current_portfolio_dollars:.2f})"
+            )
+            dollar_desc = (
+                f"Cap (${cres.dollar_ceiling_dollars:.2f}, "
+                f"${inputs.phase3_dollar_ceiling_base_dollars}/mo base in "
+                f"{inputs.phase3_dollar_ceiling_base_year} indexed to "
+                f"{inputs.current_year})"
+            )
+            if binding_ceiling_template == "both":
+                ceiling_description = f"{portfolio_desc} AND {dollar_desc}"
+            elif binding_ceiling_template == "portfolio_percent":
+                ceiling_description = portfolio_desc
+            else:
+                ceiling_description = dollar_desc
+
+            # Context keys match alert_templates.yaml placeholders
+            # exactly. {timestamp} is supplied by the alerter from
+            # `now` at dispatch time (render_alert).
             ceiling_alert = AlertEntry(
                 alert_id="monthly_payment_ceiling_bound",
                 context={
-                    "scheduled": str(inputs.scheduled_monthly),
-                    "actual": str(actual_monthly),
-                    "bound_by": ",".join(which),
+                    "scheduled_amount_dollars": f"{inputs.scheduled_monthly:.2f}",
+                    "amount_paid_dollars": f"{actual_monthly:.2f}",
+                    "binding_ceiling": binding_ceiling_template,
+                    "portfolio_ceiling_amount_dollars": f"{cres.portfolio_ceiling_dollars:.2f}",
+                    "dollar_ceiling_amount_dollars": f"{cres.dollar_ceiling_dollars:.2f}",
+                    "portfolio_value_dollars": f"{inputs.current_portfolio_dollars:.2f}",
+                    "current_year": str(inputs.current_year),
+                    "ceiling_description": ceiling_description,
                     "cycle_id": cycle_id,
                 },
             )
@@ -485,7 +535,8 @@ def decide_withdrawal(
                 },
             )
 
-    # 3) Build entry
+    # 3) Build entry — carry SPEC-form binding_ceiling so action_layer
+    # can emit the spec-conformant withdrawal_executed event (§4.7).
     entry = WithdrawalEntry(
         total_dollar_amount=actual_monthly,
         sources=sources,
@@ -493,6 +544,9 @@ def decide_withdrawal(
         scheduled_ach_date=inputs.scheduled_ach_date,
         cb_state_at_decision=inputs.cb_state,
         cascade_growth_used=(cascade_growth_alert is not None),
+        binding_ceiling=binding_ceiling_spec,
+        scheduled_amount_dollars=inputs.scheduled_monthly if inputs.phase == Phase.PHASE_3 else None,
+        was_capped=was_capped,
     )
 
     return WithdrawalDecision(

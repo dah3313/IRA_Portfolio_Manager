@@ -7,6 +7,75 @@ statement of what changed. Design-decision rationale lives in
 
 ---
 
+## 2026-05-16 — Cascade-tier alert ladder + reporter rendering (Session A)
+
+Spec authorship session per HANDOFF_PHASE2_SESSION2.md cascade plan
+Session A. No code changes in this commit; implementation lands in
+Session B (alert wiring) and Session C (reporter rendering).
+
+### IRAPM_SPECIFICATION.md
+- §7.3.2: Cascade sourcing block extended to name the new alerts at
+  each step and to describe `cascade_episode_state` (sibling struct
+  to `cb_machine` with episode-active flag, episode_started_at, and
+  three engagement latches). Worked example added.
+- §12.3: Weekly summary content gains a Cascade status item between
+  Circuit breaker state and Buffer state. Numbering shifted.
+- §12.6 Withdrawal alerts table: two new rows added —
+  `cascade_engaged_sgov` (Notice) and `cascade_extended_fi` (Warning).
+  Inserted above the existing `cascade_growth_source` row so the
+  four cascade-related entries read top-to-bottom as the cascade
+  unfolds. New "Cascade alert dedup semantics" paragraph clarifies
+  fire-once-per-tier-escalation-within-episode behavior.
+
+### REPORT_SPEC.md
+- §3.1.2: current_status header gains a Cascade status field with
+  five render variants (Normal / CB2-no-draw-yet / SGOV /
+  SGOV+FI-ATTENTION / SGOV+FI+GROWTH-CRITICAL).
+- §3.2.4: Year-file annual summary gains a Cascade status sub-block
+  (current state + episodes count + deepest tier reached).
+- §3.3.3: Sim report TOTALS gains a Cascade episodes sub-section
+  (counts per tier).
+- §3.3.5: AR annotations suppressed at annual scope (cleanup —
+  AR is monthly-scope). The MONTHLY section continues to render AR.
+- §3.3.6: Note added documenting that cascade visibility in the sim
+  report lives in MONTHLY via annotations, not in ANNUAL.
+- §3.3.7 LEGEND: extended with CSC-S/CSC-F/CSC-G annotation codes
+  and a new CB2-suffix block (S/SF/SFG).
+- §5.2: Three new annotation event codes — CSC-S, CSC-F, CSC-G.
+- §5.3: CB2 suffix grammar added — (S), (SF), (SFG). Suffix shows
+  the episode's terminal depth at rebuild time (so closed-year
+  files are stable; mid-episode rebuilds may update between cycles).
+
+### alert_templates.yaml
+- New entry `cascade_engaged_sgov` (Notice severity, template
+  body explains "this is normal, buffer is doing its job, weekly
+  summary tracks status").
+- New entry `cascade_extended_fi` (Warning severity, template body
+  explains "buffer exhausted, income engine being consumed, review
+  recommended").
+- Existing `cascade_growth_source` entry: header comment tightened
+  to document the fire-once-per-episode semantics. Body unchanged.
+
+### State model implication (deferred to Session B)
+- A new dataclass `CascadeEpisodeState` lands in `state_model.py`
+  next to `CBMachine`. Persisted state file gains the field. The
+  `state_snapshot` event payload (EVENT_LOG_SPEC) gains the field
+  alongside `cb_machine`.
+- The field is NEW — there is no migration concern for backtests
+  because the synthetic state file is rebuilt from scratch per run.
+  For production, a brand-new install starts with the default
+  (`episode_active=false`, all flags false), which is correct for
+  any starting condition.
+
+### Future consolidation (deferred to post-Phase-2)
+- REPORT_SPEC.md is currently a sibling spec. Once the reporter is
+  fully shipped (Phase 2 complete, Workstream 2 done), the contents
+  should fold into IRAPM_SPECIFICATION.md as a new section, with
+  REPORT_SPEC.md retained as a redirect stub for backward links.
+  Tracking this so it doesn't fall off the radar.
+
+---
+
 ## v1.10 — Phase 3 indexed dollar ceiling + D-RY-14 residue purge
 
 Substantive design change: Phase 3 cycle-by-cycle payment is now

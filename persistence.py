@@ -73,6 +73,15 @@ class Paths:
     def logs_dir(self) -> Path:
         return self.state_dir / "logs"
 
+    @property
+    def reports_dir(self) -> Path:
+        """Operator-facing reports directory (REPORT_SPEC §2.2). Lives
+        under state_dir so the reporter outputs ship alongside the
+        event log they were generated from. Contains current_status.txt
+        and per-year {YYYY}.txt files written by report.py.
+        """
+        return self.state_dir / "reports"
+
     def events_log(self) -> Path:
         """The IRAPM event log (EVENT_LOG_SPEC §2). Lives at state_dir
         directly, not under logs/ — it is architecturally distinct from
@@ -100,9 +109,10 @@ class Paths:
         return self.logs_dir / "token_check.jsonl"
 
     def ensure_dirs(self) -> None:
-        """Create state_dir and logs_dir if they don't exist."""
+        """Create state_dir, logs_dir, and reports_dir if they don't exist."""
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
 
 
 # --- JSON encoder for our types --------------------------------------------

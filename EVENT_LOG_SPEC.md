@@ -397,7 +397,12 @@ The payload is the most complex in the catalog because it must serve Concern #3 
     "is_scheduled_withdrawal_day": true,
     "is_annual_review_day": false,
     "is_phase2_reallocation_day": false,
-    "combined_token_state": "phase3_present_stopincome_absent",
+    "combined_token_state": {
+      "phase3_all_removed": false,
+      "stopincome_active_on_both": false,
+      "any_unavailable": false,
+      "counts_match": true
+    },
     "total_aum_dollars": "668500.00",
     "cash_dollars": "4000.00",
     "sgov_buffer_dollars": "72000.00",
@@ -454,7 +459,7 @@ The payload is the most complex in the catalog because it must serve Concern #3 
 | `is_scheduled_withdrawal_day` | boolean | Calendar predicate result. |
 | `is_annual_review_day` | boolean | Calendar predicate result. |
 | `is_phase2_reallocation_day` | boolean | Calendar predicate result. |
-| `combined_token_state` | string | Combined two-box token state value (e.g., `"phase3_present_stopincome_absent"`, `"phase3_absent"`, `"stopincome_present"`, `"unavailable"`). |
+| `combined_token_state` | object or null | Combined two-box token state as four booleans from `tokens.CombinedTokenState`: `phase3_all_removed`, `stopincome_active_on_both`, `any_unavailable`, `counts_match`. Null when no combined observation was available this cycle (peer state file missing or stale). The four booleans are the authoritative representation — `phase3_all_removed && !stopincome_active_on_both && !any_unavailable` is the "phase3 latch fires" condition; readers compute summary strings if needed. |
 | `total_aum_dollars` | string (Decimal) | Total assets under management as seen by `decide()`. |
 | `cash_dollars` | string (Decimal) | Cash balance. |
 | `sgov_buffer_dollars` | string (Decimal) | SGOV buffer value. |
@@ -631,7 +636,7 @@ This is one of three event types with indefinite legal/tax relevance (per §2.5)
 |---|---|---|
 | `withdrawal_dollar_amount` | string (Decimal) | The amount IRAPM intended to send out this withdrawal. |
 | `scheduled_ach_date` | string (ISO date) | The date the broker-side ACH disbursement is scheduled for (typically the 15th of the month). |
-| `binding_ceiling` | string or null | If the withdrawal was capped, identifies which ceiling bound the payment: `"phase1_initial"`, `"phase3_floor"`, `"phase3_ceiling"`, `"recovery_freeze"`, etc. Null if the scheduled amount was paid in full. |
+| `binding_ceiling` | string or null | If the withdrawal was capped, identifies which mechanism bound the payment. Values:<br>• `"guardrail"` — the Phase 3 portfolio-percent clamp: `current_portfolio × phase3_monthly_payment_ceiling_rate / 12`. This is the spec's **Guardrail**, the system's central withdrawal-rate protection (analogous to Guyton-Klinger guardrail concepts). Reporter cash_out symbol: **G**.<br>• `"dollar_cap"` — the Phase 3 inflation-indexed dollar ceiling: `phase3_dollar_ceiling_base_dollars × (1+inflation)^N`. The spec's **Cap** on real-dollar withdrawal growth. Reporter cash_out symbol: **C**.<br>Null if the scheduled amount was paid in full. **Note:** "floor" is not a value here — both mechanisms are maximums (the code applies `min(scheduled, guardrail, dollar_cap)`). |
 | `scheduled_amount_dollars` | string (Decimal) | What the withdrawal would have been before any cap. Equal to `amount_paid_dollars` if not capped. |
 | `amount_paid_dollars` | string (Decimal) | The actual amount paid after applying any binding ceiling. Equal to `withdrawal_dollar_amount`; duplicated for explicit readability. |
 | `was_capped` | boolean | True iff `binding_ceiling` is non-null and `amount_paid_dollars < scheduled_amount_dollars`. |
@@ -656,7 +661,7 @@ The `binding_ceiling` / `was_capped` / `scheduled_amount_dollars` / `amount_paid
 **Consumers:**
 - Reporter: contributes to `cash_flow_out` aggregation (alongside `fill_received` for non-withdrawal transactions); the `flags` column shows `W` for periods containing a `withdrawal_executed` event; capped withdrawals get a more specific flag.
 - Tax-record review: year-end total withdrawn = sum of `amount_paid_dollars` over the year. Form 1099-R reconciliation reads this event.
-- Operational monitoring: a withdrawal capped by `binding_ceiling = "phase3_floor"` (or similar) is a meaningful operational moment that may warrant operator review.
+- Operational monitoring: a withdrawal capped by `binding_ceiling = "guardrail"` (the spec's central Phase 3 withdrawal-rate protection firing) or `"dollar_cap"` (rare; would mean dollar ceiling caught the withdrawal before the guardrail did) is a meaningful operational moment that may warrant operator review.
 - Audit: years later, the operator can verify exactly which positions funded which withdrawal.
 
 ---
@@ -770,8 +775,6 @@ This is one of three event types with indefinite legal/tax relevance (per §2.5)
   "cpi_rate_applied": "0.0244",
   "prior_withdrawal_dollars": "3000.00",
   "computed_new_withdrawal_dollars": "3073.20",
-  "guardrail_floor_dollars": "3000.00",
-  "guardrail_ceiling_dollars": "3500.00",
   "binding_constraint": null,
   "issued_ach_update": true
 }
@@ -786,10 +789,8 @@ This is one of three event types with indefinite legal/tax relevance (per §2.5)
 | `cumulative_cb1_plus_days` | integer | Total CB1-or-worse days across IRAPM's operational life. Long-term operational metric. |
 | `cpi_rate_applied` | string (Decimal) | The CPI rate used in this year's recalculation. Sourced from the ruleset (fixed or override). |
 | `prior_withdrawal_dollars` | string (Decimal) | The monthly withdrawal in effect BEFORE this review. |
-| `computed_new_withdrawal_dollars` | string (Decimal) | The new monthly withdrawal after applying CPI and any guardrails. May equal `prior_withdrawal_dollars` if freeze was in effect. |
-| `guardrail_floor_dollars` | string (Decimal) or null | The lower bound on the new withdrawal under the active guardrail policy. Null in phases/configs where no guardrail floor applies. |
-| `guardrail_ceiling_dollars` | string (Decimal) or null | The upper bound on the new withdrawal under the active guardrail policy. Null where no ceiling applies. |
-| `binding_constraint` | string or null | Identifies which constraint, if any, bound the new withdrawal: `"cb_freeze"`, `"guardrail_floor"`, `"guardrail_ceiling"`, `"phase3_floor"`. Null if the unbounded CPI-adjusted value was used. |
+| `computed_new_withdrawal_dollars` | string (Decimal) | The new monthly withdrawal after applying CPI and any active constraints. May equal `prior_withdrawal_dollars` if the CPI-increase freeze was in effect. |
+| `binding_constraint` | string or null | Identifies which constraint, if any, bound the new withdrawal. **Currently implemented value:** `"cpi_freeze"` (prior-year cumulative CB1+ days exceeded `freeze_evaluation_threshold_days`, so the year's CPI increase was skipped — captured separately in `cb_freeze_in_effect: true`). Null if no constraint applied (the unbounded CPI-adjusted value was used). Reporter symbol for periods containing a `cpi_freeze`: **F**. |
 | `issued_ach_update` | boolean | True iff the review's outcome differed from the prior monthly amount enough to warrant updating the broker-side recurring ACH. |
 
 **Notes on field selection:**
@@ -817,7 +818,6 @@ This event captures the full input set and output of the year's withdrawal recal
 {
   "total_aum_dollars": "3304555.43",
   "cash_dollars": "4250.18",
-  "cash_unsettled_dollars": "0.00",
   "sgov_buffer_dollars": "71500.00",
   "fi_bucket_dollars": "1620000.00",
   "growth_bucket_dollars": "1608805.25",
@@ -862,7 +862,6 @@ This event captures the full input set and output of the year's withdrawal recal
 |---|---|---|
 | `total_aum_dollars` | string (Decimal) | Total assets under management: positions market value + cash. |
 | `cash_dollars` | string (Decimal) | Settled cash balance. |
-| `cash_unsettled_dollars` | string (Decimal) | Unsettled cash from SELL fills awaiting T+1 settlement. |
 | `sgov_buffer_dollars` | string (Decimal) | SGOV position's market value. Tracked separately because the buffer is dollar-targeted, not weight-targeted. |
 | `fi_bucket_dollars` | string (Decimal) | Total fixed-income bucket value (sum of PYLD, JPIE in Phase 1; reallocates in Phase 2+). |
 | `growth_bucket_dollars` | string (Decimal) | Total growth bucket value (FBCG, AVUV). |
@@ -884,7 +883,7 @@ This is the load-bearing event for the reporter's primary value columns (`gross_
 
 Including positions with zero balance is deliberate: it makes the schema stable across phases (PYLD/JPIE drop to zero post-Phase-2; GBIL is zero pre-Phase-2). The reporter renders zero columns as `0.00` rather than blank.
 
-`cash_unsettled_dollars` is captured for forensics. If a fill happens but settlement is pending, the reporter could optionally show "x dollars pending settlement" as a flag. Most operators won't care, but the data is there.
+Note: `cash_dollars` here is the broker's settled cash balance — what's actually available as funds. Unsettled cash from SELL fills awaiting T+1 settlement is NOT carried as a separate field. The information is reconstructable from `fill_received` events (any SELL fill since the most recent ACH disbursement that hasn't itself settled is "unsettled cash"), and no consumer of this event needs it as a top-level field. The cash buffer decision math uses `total_cash_value` (settled + unsettled) directly from the broker per the AccountSummary contract, not from this snapshot.
 
 **Consumers:**
 - Reporter: primary input for the per-row balance columns. The reporter aggregates over snapshots in a period (or samples the latest within the period) to produce the row.
@@ -1011,7 +1010,7 @@ This event replaces the current stdout-only alert log path. In production with a
 {
   "alert_id": "withdrawal_executed",
   "context": {
-    "binding_ceiling": "phase3_ceiling",
+    "binding_ceiling": "guardrail",
     "amount_paid_dollars": "3500.00",
     "scheduled_amount_dollars": "3650.00"
   },

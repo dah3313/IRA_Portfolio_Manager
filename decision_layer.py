@@ -155,6 +155,36 @@ class DecisionInputs:
 # Decision output
 # =============================================================================
 
+@dataclass(frozen=True)
+class CycleSnapshotData:
+    """Bucket-totals and position values computed once per cycle by
+    decide(), surfaced on DecisionOutput so cycle.py can emit the
+    portfolio_snapshot event (EVENT_LOG_SPEC §4.11) without
+    recomputing.
+
+    These are the same quantities used internally by _active_phase_classification,
+    _portfolio_total, _core_fi_value, _buffer_value — collected once
+    here at the cycle's end (in _finalize) and exposed to the cycle
+    driver. Decision-once, use-once.
+
+    Fields mirror EVENT_LOG_SPEC §4.11's payload schema field names
+    (modulo the _dollars suffix convention; the writer adds the suffix
+    when constructing the payload).
+    """
+    total_aum: Decimal           # positions market value + cash
+    cash: Decimal                # settled + unsettled cash (account_summary.total_cash_value)
+    sgov_buffer: Decimal         # SGOV position market value
+    fi_bucket: Decimal           # sum of FI symbols market value
+    growth_bucket: Decimal       # sum of growth symbols market value
+    fi_weight: Decimal           # fi_bucket / total_aum (Decimal("0") if total_aum == 0)
+    growth_weight: Decimal       # growth_bucket / total_aum (Decimal("0") if total_aum == 0)
+    positions: dict[str, dict[str, Decimal]]
+    """Per-symbol: {symbol: {"quantity_shares", "market_price_dollars",
+    "market_value_dollars"}}. Includes every symbol in the broker-
+    reported positions dict — zero positions appear with zero values
+    per §4.11 schema-stability requirement."""
+
+
 @dataclass
 class DecisionOutput:
     """Outcome of decision_layer evaluation."""
@@ -164,6 +194,24 @@ class DecisionOutput:
     # When True, the cycle driver does not execute the plan; it just
     # persists state and dispatches alerts. Used during operational
     # pause, capacity exhaustion, and empty plans.
+
+    cycle_snapshot: Optional[CycleSnapshotData] = None
+    """Per-cycle bucket totals / position values, used by cycle.py to
+    emit portfolio_snapshot events. Populated by _finalize() in every
+    return path. Optional only because dataclass field ordering
+    requires it (defaulted fields must come after non-defaulted);
+    in practice always set on a successful decide() return.
+    """
+
+    annual_review_decision: Optional["AnnualReviewDecision"] = None
+    """The AnnualReviewDecision produced this cycle, or None when the
+    cycle did not trigger annual review (the common case). Surfaced
+    on DecisionOutput so cycle.py can emit the annual_review_completed
+    event (EVENT_LOG_SPEC §4.10) and its associated state_snapshot
+    (§4.12) without recomputing.
+
+    Decision-once, use-once — same pattern as cycle_snapshot.
+    """
 
 
 # =============================================================================
@@ -249,6 +297,7 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
     today = inputs.today
     plan = Plan(cycle_id=inputs.cycle_id, decision_clock=now)
     alerts: list[AlertEntry] = []  # accumulator; appended last
+    annual_review_decision: Optional[AnnualReviewDecision] = None  # set in step 6 if it fires
 
     # -------------------------------------------------------------------
     # Step 1: Pause evaluation
@@ -262,13 +311,13 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
     if pause_result.alert is not None:
         alerts.append(pause_result.alert)
     if not pause_result.should_proceed_with_decisions:
-        # Skip everything; persist state + alerts
-        for a in alerts:
-            plan.add(a)
-        new_state = _bump_cycle_marker(new_state, now, inputs.cycle_id)
-        return DecisionOutput(
-            new_state=new_state, plan=plan, should_skip_action_layer=True,
-        )
+        # Skip everything; persist state + alerts. Route through
+        # _finalize so the cycle_snapshot is computed for the event
+        # log emission. force_skip_action_layer=True preserves the
+        # original behavior: alerts dispatch via cycle.py's alert-only
+        # branch, not via action_layer.
+        return _finalize(new_state, plan, alerts, now, inputs.cycle_id, inputs,
+                         force_skip_action_layer=True)
 
     # -------------------------------------------------------------------
     # Step 2: Capacity-exhausted re-evaluation
@@ -325,7 +374,7 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
             reason="phase1_to_phase2_transition",
         ))
         alerts.append(decision.large_rebalance_alert)
-        return _finalize(new_state, plan, alerts, now, inputs.cycle_id)
+        return _finalize(new_state, plan, alerts, now, inputs.cycle_id, inputs)
 
     if phase_result.latch_fired:
         # Phase 3 latch — but transition plan does NOT run this same cycle.
@@ -338,7 +387,7 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
             alert_id="phase3_activation",
             context={"event": "latch", "transition_plan_next_cycle": "true"},
         ))
-        return _finalize(new_state, plan, alerts, now, inputs.cycle_id)
+        return _finalize(new_state, plan, alerts, now, inputs.cycle_id, inputs)
 
     # I15: Phase 3 latched but not yet transitioned → build transition plan now
     if is_phase3_latched_but_pending(new_state):
@@ -359,7 +408,7 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
         alerts.append(decision.large_rebalance_alert)
         if decision.phase3_activation_alert:
             alerts.append(decision.phase3_activation_alert)
-        return _finalize(new_state, plan, alerts, now, inputs.cycle_id)
+        return _finalize(new_state, plan, alerts, now, inputs.cycle_id, inputs)
 
     # -------------------------------------------------------------------
     # Step 4: CB machine
@@ -434,6 +483,7 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
             sgov_buffer_target_months=ruleset.sgov_buffer_target_months,
             cash_buffer_offset_dollars=ruleset.cash_buffer_offset_dollars,
         )
+        annual_review_decision = ar  # surface via DecisionOutput for cycle.py
         new_state = new_state.model_copy(update={
             "schedule_state": ar.new_schedule_state,
             "buffer_state": ar.new_buffer_state,
@@ -493,7 +543,8 @@ def decide(inputs: DecisionInputs) -> DecisionOutput:
     # -------------------------------------------------------------------
     # Finalize: bump cycle marker, append alerts last
     # -------------------------------------------------------------------
-    return _finalize(new_state, plan, alerts, now, inputs.cycle_id)
+    return _finalize(new_state, plan, alerts, now, inputs.cycle_id, inputs,
+                     annual_review_decision=annual_review_decision)
 
 
 # =============================================================================
@@ -521,15 +572,104 @@ def _finalize(state: OperatingState,
               plan: Plan,
               alerts: list[AlertEntry],
               now: datetime,
-              cycle_id: str) -> DecisionOutput:
-    """Append alerts last and bump the cycle marker on the new state."""
+              cycle_id: str,
+              inputs: DecisionInputs,
+              force_skip_action_layer: bool = False,
+              annual_review_decision: Optional[AnnualReviewDecision] = None,
+              ) -> DecisionOutput:
+    """Append alerts last, bump the cycle marker, and attach the
+    cycle snapshot for the event log emission.
+
+    `inputs` is threaded through so the snapshot is computed once
+    here (using inputs.positions, inputs.account_summary, and the
+    final post-cycle state's phase to pick the right symbol
+    classification). Per EVENT_LOG_SPEC §4.11, the snapshot reflects
+    the END of the cycle — so it uses the post-cycle phase if the
+    phase changed (the bucket symbols differ across phases).
+
+    `force_skip_action_layer` is True only for the pause-skip path,
+    where the plan contains alert entries that should be dispatched
+    by cycle.py's alert-only branch (not by action_layer). All other
+    paths derive should_skip_action_layer from plan.is_empty().
+
+    `annual_review_decision` is the AnnualReviewDecision when this
+    cycle triggered annual review, else None. Surfaced on
+    DecisionOutput so cycle.py can emit annual_review_completed
+    (§4.10) + state_snapshot (§4.12, trigger="annual_review_completed").
+    """
     for a in alerts:
         plan.add(a)
     state = _bump_cycle_marker(state, now, cycle_id)
+    snapshot = _build_cycle_snapshot(state, inputs)
     return DecisionOutput(
         new_state=state,
         plan=plan,
-        should_skip_action_layer=plan.is_empty(),
+        should_skip_action_layer=force_skip_action_layer or plan.is_empty(),
+        cycle_snapshot=snapshot,
+        annual_review_decision=annual_review_decision,
+    )
+
+
+def _build_cycle_snapshot(state: OperatingState,
+                          inputs: DecisionInputs) -> CycleSnapshotData:
+    """Construct the CycleSnapshotData using the same primitives the
+    decision layer uses internally (_active_phase_classification,
+    _portfolio_total, _core_fi_value, _buffer_value, etc.).
+
+    Note on division-by-zero: if total_aum is zero (degenerate
+    scenario: empty portfolio, no cash), weights default to Decimal(0)
+    rather than raising. A real run will never hit this, but the
+    snapshot must be emittable in any state.
+    """
+    growth, fi, weights = _active_phase_classification(state.phase, inputs.ruleset)
+    cash = inputs.account_summary.total_cash_value
+    sgov_buffer = _buffer_value(inputs.positions, "SGOV")
+    fi_bucket = _core_fi_value(inputs.positions, fi)
+    growth_bucket = sum(
+        (inputs.positions[s].market_value
+         for s in growth if s in inputs.positions),
+        start=Decimal("0"),
+    )
+    # total_aum = all securities + cash (positions market values already
+    # include SGOV, so don't double-count).
+    securities_total = _portfolio_total(inputs.positions, "SGOV")
+    total_aum = securities_total + cash
+
+    if total_aum > 0:
+        fi_weight = fi_bucket / total_aum
+        growth_weight = growth_bucket / total_aum
+    else:
+        fi_weight = Decimal("0")
+        growth_weight = Decimal("0")
+
+    # Per-symbol position detail. EVERY broker-reported symbol included,
+    # even zero positions (§4.11 schema-stability: zero positions appear
+    # with zero values).
+    #
+    # Position.quantity is the share count (broker_types.Position §102+).
+    # The CycleSnapshotData.positions dict uses spec-aligned key names
+    # (quantity_shares, market_price_dollars, market_value_dollars) per
+    # EVENT_LOG_SPEC §4.11; only the source attribute differs.
+    positions_detail: dict[str, dict[str, Decimal]] = {}
+    for sym, pos in inputs.positions.items():
+        price = (pos.market_value / pos.quantity
+                 if pos.quantity > 0
+                 else Decimal("0"))
+        positions_detail[sym] = {
+            "quantity_shares": pos.quantity,
+            "market_price_dollars": price,
+            "market_value_dollars": pos.market_value,
+        }
+
+    return CycleSnapshotData(
+        total_aum=total_aum,
+        cash=cash,
+        sgov_buffer=sgov_buffer,
+        fi_bucket=fi_bucket,
+        growth_bucket=growth_bucket,
+        fi_weight=fi_weight,
+        growth_weight=growth_weight,
+        positions=positions_detail,
     )
 
 
@@ -900,5 +1040,6 @@ def _evaluate_rebalance(
 __all__ = [
     "DecisionInputs",
     "DecisionOutput",
+    "CycleSnapshotData",
     "decide",
 ]

@@ -80,6 +80,15 @@ class Clock(Protocol):
         """Return the current ET datetime (tz-aware)."""
         ...
 
+    def now_utc(self) -> datetime:
+        """Return the current UTC datetime (tz-aware).
+
+        Used by the event log per EVENT_LOG_SPEC §3.2 (canonical UTC
+        representation with explicit timezone). The instant is the
+        same one now() and now_et() report, just relabeled in UTC.
+        """
+        ...
+
 
 class SystemClock:
     """
@@ -99,6 +108,17 @@ class SystemClock:
 
     def now_et(self) -> datetime:
         return datetime.now(_ET)
+
+    def now_utc(self) -> datetime:
+        """Production tz-aware UTC. Used by the event log writer.
+
+        datetime.now(timezone.utc) returns the same instant as
+        datetime.now() but tz-tagged as UTC. The legacy now() stays
+        naive to preserve every existing caller's behavior; this
+        method is for new callers that need tz-aware values.
+        """
+        from datetime import timezone
+        return datetime.now(timezone.utc)
 
 
 class FrozenClock:
@@ -136,6 +156,18 @@ class FrozenClock:
         if self._dt.tzinfo is None:
             return self._dt.replace(tzinfo=_ET)
         return self._dt.astimezone(_ET)
+
+    def now_utc(self) -> datetime:
+        """Frozen tz-aware UTC. Used by the event log writer.
+
+        If the frozen datetime is naive, treat it as ET (matching
+        the modeling convention used by now_et) and convert to UTC.
+        If tz-aware, convert in-place.
+        """
+        from datetime import timezone
+        if self._dt.tzinfo is None:
+            return self._dt.replace(tzinfo=_ET).astimezone(timezone.utc)
+        return self._dt.astimezone(timezone.utc)
 
 
 class AdvancingClock:
@@ -177,6 +209,22 @@ class AdvancingClock:
         if self._dt.tzinfo is None:
             return self._dt.replace(tzinfo=_ET)
         return self._dt.astimezone(_ET)
+
+    def now_utc(self) -> datetime:
+        """Simulated tz-aware UTC. Used by the event log writer
+        per EVENT_LOG_SPEC §3.2.
+
+        The simulated clock's naive datetime is treated as ET
+        (same convention as now_et — markets and IBKR are in ET);
+        we then convert to UTC for the event log's canonical
+        representation. The instant is preserved; only the label
+        changes. A 14:00 ET simulated cycle records as 18:00 UTC
+        (or 19:00 UTC depending on DST) in events.jsonl.
+        """
+        from datetime import timezone
+        if self._dt.tzinfo is None:
+            return self._dt.replace(tzinfo=_ET).astimezone(timezone.utc)
+        return self._dt.astimezone(timezone.utc)
 
     # Mutation interface — only AdvancingClock has these.
 
